@@ -1,0 +1,3 @@
+2026-08-19T08:07:38.551402Z  INFO nova_server: Starting NOVA Sovereign Discovery & Ephemeral Relay Server...
+2026-08-19T08:07:39.129217Z  INFO nova_server: Presence Registry & Blind Relay initialized (In-Memory / Zero-Persistent-Storage)
+2026-08-19T08:07:39.242221Z  INFO nova_server: NOVA Server listening on udp://127.0.0.1:18080 (register / lookup / relay signaling)

@@ -1,0 +1,22 @@
+[package]
+name = "nova-transport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+nova-crypto = { path = "../nova-crypto" }
+nova-protocol = { path = "../nova-protocol" }
+tokio.workspace = true
+serde.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+nova-server = { path = "../../server" }

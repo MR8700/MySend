@@ -1,0 +1,25 @@
+[package]
+name = "nova-engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+nova-crypto = { path = "../nova-crypto" }
+nova-protocol = { path = "../nova-protocol" }
+nova-storage = { path = "../nova-storage" }
+nova-transport = { path = "../nova-transport" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+uuid.workspace = true
+ciborium.workspace = true
+chrono.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+nova-server = { path = "../../server" }

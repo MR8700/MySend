@@ -1,0 +1,24 @@
+[package]
+name = "nova-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+nova-crypto = { path = "../nova-crypto" }
+nova-protocol = { path = "../nova-protocol" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ciborium.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+x25519-dalek.workspace = true
