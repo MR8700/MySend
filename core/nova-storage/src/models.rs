@@ -1,4 +1,5 @@
 use nova_crypto::PreKeyBundle;
+use nova_protocol::MessageContentType;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,16 +57,33 @@ pub struct ConversationRecord {
     pub unread_count: u32,
 }
 
+/// Metadata about a message's attachment — everything the UI needs to show a bubble (name, MIME
+/// type, size) WITHOUT loading the (potentially many-megabyte) file bytes themselves. See
+/// `StorageEngine::get_attachment_blob` for fetching the actual bytes, on demand, only when a
+/// specific attachment is actually being displayed/downloaded — the fix for the 2026-08-22
+/// audit's "search decrypts every embedded attachment" finding, and for `get_messages` no longer
+/// needing to decrypt megabytes just to render a conversation list.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentMeta {
+    pub mime_type: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageRecord {
     pub id: String,
     pub conversation_id: String,
     pub sender_id: String,
     pub recipient_id: String,
+    /// The message's text: the full message for `Text`, or a short caption/label for a media
+    /// message — never the attachment's binary data (see `attachment`/`AttachmentMeta`).
     pub text_content: String,
     pub timestamp_utc: i64,
     pub status: DbMessageStatus,
     pub is_outgoing: bool,
+    pub content_type: MessageContentType,
+    pub attachment: Option<AttachmentMeta>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -77,6 +95,11 @@ pub struct OutboxItem {
     pub payload: Vec<u8>,
     pub attempt_count: i32,
     pub next_retry_utc: i64,
+    /// When this message was first enqueued — distinct from `next_retry_utc` (which advances on
+    /// every failed attempt) so the outbox pump can tell "still within the retry window" from
+    /// "has been failing for so long it should give up", regardless of how many attempts that
+    /// took. See `NovaEngine::pump_outbox_once`'s give-up check.
+    pub first_attempt_utc: i64,
 }
 
 /// Personal profile metadata for the local device identity, encrypted at rest.

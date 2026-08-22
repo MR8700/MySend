@@ -25,6 +25,7 @@
 //! forwards opaque bytes — it is not a trusted party, exactly like the discovery DHT above it.
 
 use crate::error::TransportError;
+use crate::udp_fallback::UdpFallbackClient;
 use crate::{P2PTransportMode, TransportSupervisor};
 use futures_util::StreamExt;
 use libp2p::core::multiaddr::Protocol;
@@ -48,18 +49,43 @@ const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(6);
 const SEND_TIMEOUT: Duration = Duration::from_secs(6);
 const PRESENCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// How often to poll the UDP fallback relay (if configured) for anything queued for this node —
+/// see `crate::udp_fallback`. More frequent than the DHT presence heartbeat: this is this node's
+/// only way to receive anything over that path at all (unlike the DHT/QUIC path, nothing pushes
+/// to it), so responsiveness on this path depends entirely on poll frequency.
+const UDP_FALLBACK_DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NovaMessageRequest(Vec<u8>);
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct NovaMessageResponse;
+
+/// Application-level outcome of processing one incoming message, carried back to the sender as
+/// the request/response reply — replaces what used to be an unconditional empty ack sent the
+/// instant raw bytes were received, before `nova-engine` ever attempted to decode them.
+///
+/// This is what lets `nova-engine::pump_outbox_once` tell a genuinely-delivered-and-shown
+/// message apart from one dropped because the recipient blocks the sender (never mark it
+/// "Delivered") or one the recipient's engine simply failed to process at all (keep retrying
+/// instead of losing it silently — see the 2026-08-22 audit's "silent packet drop" finding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeliveryOutcome {
+    /// Decoded, decrypted, and persisted (or was an exact duplicate of an already-persisted
+    /// message, or a handshake this node deliberately yielded on due to a simultaneous-
+    /// initiation collision) — the recipient's engine considers this packet fully handled.
+    Processed,
+    /// Decrypted fine (the Double Ratchet stayed in sync) but dropped because the sender is a
+    /// contact the recipient has blocked.
+    Blocked,
+    /// The recipient's engine could not process this packet at all (malformed, oversized,
+    /// unknown session, or any other decode/protocol failure).
+    Rejected,
+}
 
 #[derive(NetworkBehaviour)]
 struct NovaBehaviour {
     kademlia: kad::Behaviour<MemoryStore>,
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
-    messaging: request_response::cbor::Behaviour<NovaMessageRequest, NovaMessageResponse>,
+    messaging: request_response::cbor::Behaviour<NovaMessageRequest, DeliveryOutcome>,
     /// Lets this node act as a relay for other peers who can't reach each other directly.
     relay: relay::Behaviour,
     /// Lets this node reserve a slot on (and dial through) another peer's relay.
@@ -88,7 +114,14 @@ enum Command {
     SendRequest {
         peer_id: PeerId,
         bytes: Vec<u8>,
-        respond: oneshot::Sender<Result<(), TransportError>>,
+        respond: oneshot::Sender<Result<DeliveryOutcome, TransportError>>,
+    },
+    /// Delivers the [`DeliveryOutcome`] `nova-engine` computed for a previously-received
+    /// [`IncomingMessage`] back to whichever peer sent it, via the pending `ResponseChannel`
+    /// this swarm task is still holding for it (see `pending_incoming_acks`).
+    RespondIncoming {
+        channel: request_response::ResponseChannel<DeliveryOutcome>,
+        outcome: DeliveryOutcome,
     },
     /// Dials a bare multiaddr without knowing the remote peer's `PeerId` in advance — for manual
     /// "first contact" bootstrapping (e.g. a known bootstrap node's address) rather than a DHT
@@ -120,9 +153,56 @@ pub struct P2PNode {
     libp2p_peer_id: PeerId,
     listen_addrs: Vec<Multiaddr>,
     command_tx: mpsc::UnboundedSender<Command>,
-    incoming_rx: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    incoming_rx: Mutex<mpsc::UnboundedReceiver<IncomingMessage>>,
     pub supervisor: Arc<TransportSupervisor>,
     pub tor_manager: Arc<tokio::sync::RwLock<crate::tor::TorManager>>,
+    /// Secondary delivery path for when the DHT + relay-circuit path above cannot reach a peer
+    /// at all — see `crate::udp_fallback`'s module docs. `None` unless `NOVA_UDP_FALLBACK_ADDR`
+    /// is set: this path depends on a specific well-known `nova-server` instance being
+    /// configured, unlike the DHT path which needs no central service at all.
+    udp_fallback: Option<Arc<UdpFallbackClient>>,
+}
+
+/// Where an [`IncomingMessage`] arrived from — determines whether [`IncomingMessage::respond`]
+/// has anyone live to report back to.
+enum IncomingSource {
+    /// A live QUIC request/response round-trip: the sender is actually waiting on the other end
+    /// of `channel` for a [`DeliveryOutcome`].
+    LibP2p {
+        channel: request_response::ResponseChannel<DeliveryOutcome>,
+        command_tx: mpsc::UnboundedSender<Command>,
+    },
+    /// Pulled from `nova-server`'s blind relay via [`crate::udp_fallback::UdpFallbackClient::drain_incoming`]
+    /// — store-and-forward, not a live round-trip, so there is no sender waiting for an outcome.
+    UdpFallback,
+    /// A live connection over `crate::onion_channel`'s Tor SOCKS5 listener: the sender's
+    /// `send_via_onion` call is holding the TCP connection open, waiting on this outcome.
+    OnionDirect(crate::onion_channel::OnionIncoming),
+}
+
+/// One raw wire packet received from a peer, still awaiting an application-level verdict from
+/// `nova-engine` on whether it was actually processed, blocked, or rejected — see
+/// [`DeliveryOutcome`]. The caller MUST eventually call [`IncomingMessage::respond`] exactly
+/// once; for a live libp2p-sourced message, until then the sender's `send_to_peer` call is left
+/// waiting on the wire.
+pub struct IncomingMessage {
+    pub bytes: Vec<u8>,
+    source: IncomingSource,
+}
+
+impl IncomingMessage {
+    /// Reports how `nova-engine` handled this packet back to the peer that sent it, over the
+    /// same request/response round-trip their `send_to_peer` call is awaiting — a no-op for a
+    /// message that arrived via the UDP fallback relay, which has no live sender to report to.
+    pub fn respond(self, outcome: DeliveryOutcome) {
+        match self.source {
+            IncomingSource::LibP2p { channel, command_tx } => {
+                let _ = command_tx.send(Command::RespondIncoming { channel, outcome });
+            }
+            IncomingSource::UdpFallback => {}
+            IncomingSource::OnionDirect(onion_incoming) => onion_incoming.respond(outcome),
+        }
+    }
 }
 
 impl P2PNode {
@@ -272,6 +352,20 @@ impl P2PNode {
         initial_tor_config.onion_address = Some(own_onion_addr);
         let tor_manager = Arc::new(tokio::sync::RwLock::new(crate::tor::TorManager::new(initial_tor_config)));
 
+        // Opt-in secondary delivery path (see `crate::udp_fallback`) for networks where this
+        // node cannot reach the DHT/relay-circuit path at all yet — set by whoever operates a
+        // `nova-server` instance this deployment should fall back to, the same way
+        // `NOVA_BOOTSTRAP_ADDR` names a DHT bootstrap peer.
+        let udp_fallback = std::env::var("NOVA_UDP_FALLBACK_ADDR")
+            .ok()
+            .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+            .map(|addr| Arc::new(UdpFallbackClient::new(addr)));
+        if udp_fallback.is_none() {
+            if let Ok(raw) = std::env::var("NOVA_UDP_FALLBACK_ADDR") {
+                warn!("NOVA_UDP_FALLBACK_ADDR={raw} is not a valid socket address (expected e.g. 203.0.113.9:8080) — fallback relay disabled");
+            }
+        }
+
         let node = Arc::new(Self {
             own_peer_id,
             libp2p_peer_id: local_peer_id,
@@ -279,14 +373,61 @@ impl P2PNode {
             command_tx,
             incoming_rx: Mutex::new(incoming_rx),
             supervisor,
-            tor_manager,
+            tor_manager: tor_manager.clone(),
+            udp_fallback: udp_fallback.clone(),
+        });
+
+        // Onion-channel listener (see `crate::onion_channel`) — the receiving half of the Tor
+        // fallback path. Defaults to loopback-only: this listener applies no authentication of
+        // its own (see the module docs on why), so it must only ever be reachable via a local
+        // Tor process's hidden-service forwarding, never exposed directly to a public interface
+        // by default. Best-effort: a bind failure here (e.g. the port is already in use) does
+        // not prevent the node from starting — it only means this device won't be reachable via
+        // Tor until that's fixed, exactly like a QUIC listen failure elsewhere in this function
+        // would be a harder, non-recoverable error but a missing *optional* path is not.
+        // Defaults to an OS-assigned loopback port, NOT `DEFAULT_ONION_CHANNEL_PORT`: binding a
+        // fixed port automatically on every launch would collide with any other local instance
+        // (including, very concretely, this crate's own test suite starting several nodes in the
+        // same process) and presumptuously claim a system port nobody asked for. An operator who
+        // wants real onion reachability sets `NOVA_ONION_LISTEN_ADDR` explicitly (conventionally
+        // to `127.0.0.1:<DEFAULT_ONION_CHANNEL_PORT>`, matching what contacts dial by default) and
+        // points their Tor hidden-service forwarding at the same port.
+        let onion_listen_addr = std::env::var("NOVA_ONION_LISTEN_ADDR")
+            .ok()
+            .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+            .unwrap_or_else(|| "127.0.0.1:0".parse().expect("hardcoded loopback address is always valid"));
+        let (onion_incoming_tx, mut onion_incoming_rx) = mpsc::unbounded_channel::<crate::onion_channel::OnionIncoming>();
+        tokio::spawn(async move {
+            match crate::onion_channel::bind(onion_listen_addr).await {
+                Ok(listener) => {
+                    let bound = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
+                    info!("Onion-channel listener bound at {bound} (forward a Tor hidden service here to be reachable via .onion)");
+                    crate::onion_channel::serve_forever(listener, onion_incoming_tx).await;
+                }
+                Err(e) => warn!("Onion-channel listener failed to bind {onion_listen_addr}: {e} — this device will not be reachable via Tor"),
+            }
+        });
+        // Bridges the onion listener's own channel into the unified `incoming_tx` stream
+        // `nova-engine::attach_network` reads from, so it has exactly one receive loop to run
+        // regardless of which of the three paths (libp2p, UDP fallback, onion) a packet arrived
+        // on — see `IncomingSource::OnionDirect`.
+        let incoming_tx_for_onion_bridge = incoming_tx.clone();
+        tokio::spawn(async move {
+            while let Some(onion_incoming) = onion_incoming_rx.recv().await {
+                let bytes = onion_incoming.bytes.clone();
+                let msg = IncomingMessage { bytes, source: IncomingSource::OnionDirect(onion_incoming) };
+                if incoming_tx_for_onion_bridge.send(msg).is_err() {
+                    break;
+                }
+            }
         });
 
         // `identity` moves into the background task by value rather than being cloned: it holds
         // zeroized private key material and deliberately does not implement `Clone`. Only the
         // task itself needs it, for signing DHT presence records — the public `P2PNode` handle
         // only ever needs the already-derived, non-secret `own_peer_id`.
-        tokio::spawn(run_swarm_task(swarm, identity, local_peer_id, command_rx, incoming_tx));
+        let command_tx_for_task = node.command_tx.clone();
+        tokio::spawn(run_swarm_task(swarm, identity, local_peer_id, command_rx, command_tx_for_task, incoming_tx, udp_fallback, tor_manager));
 
         Ok(node)
     }
@@ -530,10 +671,38 @@ impl P2PNode {
         }
     }
 
-    /// Sends already-encrypted wire bytes (a serialized `NovaPacket`) to `nova_peer_id`, looking
-    /// the peer up and connecting first (direct or via relay circuit, see `connect_to_peer`) if
-    /// not already connected.
-    pub async fn send_to_peer(&self, nova_peer_id: &str, bytes: Vec<u8>) -> Result<P2PTransportMode, TransportError> {
+    /// Sends already-encrypted wire bytes (a serialized `NovaPacket`) to `nova_peer_id` — the
+    /// single-packet case of [`send_chunks_to_peer`](Self::send_chunks_to_peer); see there for
+    /// the full behavior (this is `send_chunks_to_peer(nova_peer_id, vec![bytes])`).
+    pub async fn send_to_peer(
+        &self,
+        nova_peer_id: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(P2PTransportMode, DeliveryOutcome), TransportError> {
+        self.send_chunks_to_peer(nova_peer_id, vec![bytes]).await
+    }
+
+    /// Sends one or more already-encrypted wire packets (each a serialized `NovaPacket`) to
+    /// `nova_peer_id` over a SINGLE connection — looking the peer up and connecting once (direct
+    /// or via relay circuit, see `connect_to_peer`), then delivering every chunk in order over
+    /// that one connection. Used both for a plain single-packet text message (see
+    /// [`send_to_peer`](Self::send_to_peer)) and for a multi-chunk media message (see
+    /// `nova-engine::send_media`), where all chunks travel together so a partial failure retries
+    /// the whole message rather than needing per-chunk delivery bookkeeping.
+    ///
+    /// The returned [`DeliveryOutcome`] is only meaningful when `mode != Disconnected`: it
+    /// reflects what the *recipient's* `nova-engine` did with the LAST chunk sent (for a media
+    /// message, that's the chunk that actually completes reassembly) — not just whether the
+    /// bytes reached them. When `mode == Disconnected`, the accompanying outcome is a placeholder
+    /// (`Rejected`) and must not be interpreted; the peer was never reached, or a chunk partway
+    /// through the batch failed (in which case the whole batch is reported as undelivered, even
+    /// if earlier chunks were individually accepted — the recipient's engine cannot reassemble a
+    /// media message missing a chunk anyway).
+    pub async fn send_chunks_to_peer(
+        &self,
+        nova_peer_id: &str,
+        chunks: Vec<Vec<u8>>,
+    ) -> Result<(P2PTransportMode, DeliveryOutcome), TransportError> {
         let found = match self.lookup(nova_peer_id).await {
             Ok(found) => found,
             Err(e) => {
@@ -542,7 +711,8 @@ impl P2PNode {
             }
         };
         let Some((peer_id, addrs)) = found else {
-            return Ok(P2PTransportMode::Disconnected);
+            self.spawn_udp_fallback_send_chunks(nova_peer_id, chunks);
+            return Ok((P2PTransportMode::Disconnected, DeliveryOutcome::Rejected));
         };
         let mode = connection_mode_for(&addrs);
 
@@ -550,38 +720,82 @@ impl P2PNode {
             .await
             .is_err()
         {
-            return Ok(P2PTransportMode::Disconnected);
+            self.spawn_udp_fallback_send_chunks(nova_peer_id, chunks);
+            return Ok((P2PTransportMode::Disconnected, DeliveryOutcome::Rejected));
         }
 
-        let (tx, rx) = oneshot::channel();
         let request_started = tokio::time::Instant::now();
-        self.command_tx
-            .send(Command::SendRequest {
-                peer_id,
-                bytes,
-                respond: tx,
-            })
-            .map_err(|_| TransportError::SwarmTaskGone)?;
+        let mut last_outcome = DeliveryOutcome::Rejected;
+        for chunk in chunks {
+            let (tx, rx) = oneshot::channel();
+            self.command_tx
+                .send(Command::SendRequest {
+                    peer_id,
+                    bytes: chunk,
+                    respond: tx,
+                })
+                .map_err(|_| TransportError::SwarmTaskGone)?;
 
-        match tokio::time::timeout(SEND_TIMEOUT, rx).await {
-            Ok(Ok(Ok(()))) => {
-                // The request/response round trip (send → peer's ack) is a more meaningful
-                // "latency" for messaging purposes than connection-establishment time alone: a
-                // connection can be up while the peer is slow or backlogged.
-                let latency_ms = request_started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-                self.supervisor
-                    .update_peer_state(nova_peer_id.to_string(), mode, latency_ms, String::new())
-                    .await;
-                Ok(mode)
+            match tokio::time::timeout(SEND_TIMEOUT, rx).await {
+                Ok(Ok(Ok(outcome))) => last_outcome = outcome,
+                _ => return Ok((P2PTransportMode::Disconnected, DeliveryOutcome::Rejected)),
             }
-            _ => Ok(P2PTransportMode::Disconnected),
         }
+
+        // The request/response round trip (send → peer's ack) is a more meaningful "latency" for
+        // messaging purposes than connection-establishment time alone: a connection can be up
+        // while the peer is slow or backlogged. For a multi-chunk send this is the total time for
+        // every chunk, which is the honest end-to-end figure for how long this message took.
+        let latency_ms = request_started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        self.supervisor
+            .update_peer_state(nova_peer_id.to_string(), mode, latency_ms, String::new())
+            .await;
+        Ok((mode, last_outcome))
+    }
+
+    /// Sends `bytes` to a peer via their `.onion` address directly through the Tor SOCKS5 proxy
+    /// (see `crate::onion_channel`), bypassing the DHT/QUIC path entirely. The caller (`nova-
+    /// engine`, which knows a contact's onion address from their `PreKeyBundle`) decides when to
+    /// use this — as a fallback once `send_to_peer` reports `Disconnected`, or exclusively in
+    /// `TorStrict` mode. `port` should be the recipient's onion-listener port, conventionally the
+    /// same value as their `NOVA_ONION_LISTEN_ADDR`.
+    pub async fn send_via_onion(
+        &self,
+        onion_address: &str,
+        port: u16,
+        bytes: Vec<u8>,
+    ) -> Result<DeliveryOutcome, TransportError> {
+        let mgr = self.tor_manager.read().await;
+        crate::onion_channel::send_via_onion(&mgr, onion_address, port, bytes).await
     }
 
     /// Waits for the next raw packet received from any peer over a direct connection. Returns
-    /// `None` only if the node's background task has stopped.
-    pub async fn recv_next(&self) -> Option<Vec<u8>> {
+    /// `None` only if the node's background task has stopped. The caller MUST call
+    /// [`IncomingMessage::respond`] on the result exactly once, or the sender's `send_to_peer`
+    /// call will hang until its own timeout.
+    pub async fn recv_next(&self) -> Option<IncomingMessage> {
         self.incoming_rx.lock().await.recv().await
+    }
+
+    /// Best-effort, fire-and-forget hand-off of each of `chunks` to the UDP fallback relay (see
+    /// `crate::udp_fallback`) for `nova_peer_id` — called from `send_chunks_to_peer`'s failure
+    /// paths so a peer unreachable through the DHT still gets a second chance. Each chunk is
+    /// relayed independently (out-of-order delivery/reassembly on the receiving end is already
+    /// handled at the Double Ratchet level — see `send_chunks_to_peer`'s docs); relaying one
+    /// chunk failing does not stop the others from being attempted. Spawned rather than awaited:
+    /// this must never add latency to a call that has already decided the primary path failed,
+    /// and a slow/unreachable fallback server must not block it either. A no-op if no fallback
+    /// server is configured.
+    fn spawn_udp_fallback_send_chunks(&self, nova_peer_id: &str, chunks: Vec<Vec<u8>>) {
+        let Some(fallback) = self.udp_fallback.clone() else { return };
+        let nova_peer_id = nova_peer_id.to_string();
+        tokio::spawn(async move {
+            for chunk in chunks {
+                if let Err(e) = fallback.relay_forward(&nova_peer_id, chunk).await {
+                    debug!("UDP fallback relay_forward to {nova_peer_id} failed: {e}");
+                }
+            }
+        });
     }
 }
 
@@ -641,19 +855,45 @@ async fn run_swarm_task(
     identity: DeviceIdentity,
     local_peer_id: PeerId,
     mut command_rx: mpsc::UnboundedReceiver<Command>,
-    incoming_tx: mpsc::UnboundedSender<Vec<u8>>,
+    command_tx: mpsc::UnboundedSender<Command>,
+    incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
+    udp_fallback: Option<Arc<UdpFallbackClient>>,
+    tor_manager: Arc<tokio::sync::RwLock<crate::tor::TorManager>>,
 ) {
     let mut pending_lookups: PendingLookups = HashMap::new();
     let mut pending_dials: HashMap<PeerId, Vec<oneshot::Sender<Result<(), TransportError>>>> = HashMap::new();
-    let mut pending_requests: HashMap<OutboundRequestId, oneshot::Sender<Result<(), TransportError>>> = HashMap::new();
+    let mut pending_requests: HashMap<OutboundRequestId, oneshot::Sender<Result<DeliveryOutcome, TransportError>>> = HashMap::new();
     let mut pending_relay_reservations: VecDeque<oneshot::Sender<Result<Multiaddr, TransportError>>> = VecDeque::new();
     let mut heartbeat = tokio::time::interval(PRESENCE_HEARTBEAT_INTERVAL);
+    // Ticks unconditionally even when `udp_fallback` is `None` (the branch body below just
+    // no-ops in that case) — simpler than threading an `Option<Interval>` through `select!`, at
+    // the cost of one negligible no-op wakeup every UDP_FALLBACK_DRAIN_INTERVAL.
+    let mut udp_fallback_drain = tokio::time::interval(UDP_FALLBACK_DRAIN_INTERVAL);
 
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 if let Err(e) = do_announce(&mut swarm, &identity, local_peer_id) {
                     warn!("Presence heartbeat failed: {e}");
+                }
+            }
+            _ = udp_fallback_drain.tick() => {
+                // Signing is fast/synchronous (no I/O) so it happens inline here; the actual
+                // network round-trip is spawned off so a slow/unreachable fallback server can
+                // never stall this event loop (which also drives the primary DHT/QUIC path).
+                if let Some(fallback) = udp_fallback.clone() {
+                    let drain_request = nova_protocol::SignedDrainRequest::sign(&identity, now_secs());
+                    let incoming_tx = incoming_tx.clone();
+                    tokio::spawn(async move {
+                        match fallback.drain_incoming_signed(drain_request).await {
+                            Ok(items) => {
+                                for bytes in items {
+                                    let _ = incoming_tx.send(IncomingMessage { bytes, source: IncomingSource::UdpFallback });
+                                }
+                            }
+                            Err(e) => debug!("UDP fallback drain failed: {e}"),
+                        }
+                    });
                 }
             }
             maybe_cmd = command_rx.recv() => {
@@ -674,6 +914,22 @@ async fn run_swarm_task(
                         pending_lookups.insert(query_id, (nova_peer_id, respond));
                     }
                     Command::Dial { peer_id, addrs, respond } => {
+                        // Hard gate, not just the advisory pre-filter `P2PNode::dial` already
+                        // applies before ever sending this command: this is the actual point
+                        // `swarm.dial` gets called, so it is the one place a TorStrict violation
+                        // cannot slip through regardless of which caller constructed this
+                        // command. See the 2026-08-22 audit's "TorStrict mode is not actually
+                        // enforced" finding — the pre-filter alone was exactly that weakness.
+                        let addrs: Vec<Multiaddr> = {
+                            let mgr = tor_manager.read().await;
+                            addrs.into_iter().filter(|a| mgr.validate_outbound_dial(&a.to_string()).is_ok()).collect()
+                        };
+                        if addrs.is_empty() {
+                            let _ = respond.send(Err(TransportError::Setup(
+                                "no dialable addresses permitted under the current Tor privacy policy".into(),
+                            )));
+                            continue;
+                        }
                         // `PeerCondition::Always` is load-bearing: Kademlia's own routing-table
                         // maintenance can already have an outbound connection attempt in flight
                         // to this peer_id (e.g. triggered the moment mDNS discovered them and
@@ -725,6 +981,9 @@ async fn run_swarm_task(
                         let addrs = addrs.into_iter().map(|a| a.to_string()).collect();
                         let _ = respond.send(publish_record(&mut swarm, &identity, local_peer_id, addrs));
                     }
+                    Command::RespondIncoming { channel, outcome } => {
+                        let _ = swarm.behaviour_mut().messaging.send_response(channel, outcome);
+                    }
                 }
             }
             event = swarm.select_next_some() => {
@@ -732,6 +991,7 @@ async fn run_swarm_task(
                     event,
                     &mut swarm,
                     &incoming_tx,
+                    &command_tx,
                     &mut pending_lookups,
                     &mut pending_dials,
                     &mut pending_requests,
@@ -783,10 +1043,11 @@ fn publish_record(
 fn handle_event(
     event: SwarmEvent<NovaBehaviourEvent>,
     swarm: &mut Swarm<NovaBehaviour>,
-    incoming_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    incoming_tx: &mpsc::UnboundedSender<IncomingMessage>,
+    command_tx: &mpsc::UnboundedSender<Command>,
     pending_lookups: &mut PendingLookups,
     pending_dials: &mut HashMap<PeerId, Vec<oneshot::Sender<Result<(), TransportError>>>>,
-    pending_requests: &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), TransportError>>>,
+    pending_requests: &mut HashMap<OutboundRequestId, oneshot::Sender<Result<DeliveryOutcome, TransportError>>>,
     pending_relay_reservations: &mut VecDeque<oneshot::Sender<Result<Multiaddr, TransportError>>>,
 ) {
     match event {
@@ -857,12 +1118,29 @@ fn handle_event(
         }
         SwarmEvent::Behaviour(NovaBehaviourEvent::Messaging(request_response::Event::Message { message, .. })) => match message {
             request_response::Message::Request { request, channel, .. } => {
-                let _ = incoming_tx.send(request.0);
-                let _ = swarm.behaviour_mut().messaging.send_response(channel, NovaMessageResponse);
+                // The response is deliberately NOT sent here: it now carries the real
+                // DeliveryOutcome nova-engine computes from actually decoding this packet (see
+                // `IncomingMessage::respond`), not an unconditional "received the bytes" ack.
+                // Sending an ack before that verdict exists is exactly what let a packet the
+                // recipient could never even decrypt still show as "Delivered" to the sender.
+                let incoming = IncomingMessage {
+                    bytes: request.0,
+                    source: IncomingSource::LibP2p { channel, command_tx: command_tx.clone() },
+                };
+                if let Err(unsent) = incoming_tx.send(incoming) {
+                    // nova-engine's receive loop is gone (e.g. network never attached, or the
+                    // engine shut down) — nothing will ever call `.respond()` on this packet, so
+                    // answer here to avoid leaving the sender hanging until SEND_TIMEOUT for a
+                    // packet nobody is actually listening for.
+                    warn!("No receiver attached for incoming packets — rejecting immediately");
+                    if let IncomingSource::LibP2p { channel, .. } = unsent.0.source {
+                        let _ = swarm.behaviour_mut().messaging.send_response(channel, DeliveryOutcome::Rejected);
+                    }
+                }
             }
-            request_response::Message::Response { request_id, .. } => {
+            request_response::Message::Response { request_id, response } => {
                 if let Some(respond) = pending_requests.remove(&request_id) {
-                    let _ = respond.send(Ok(()));
+                    let _ = respond.send(Ok(response));
                 }
             }
         },
@@ -956,17 +1234,117 @@ mod tests {
         bob.announce_presence().await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let mode = alice
+        // Bob's receive side: exactly what nova-engine::attach_network's background loop does in
+        // production — pull the next incoming packet and report how it was "processed" over the
+        // same request/response round-trip Alice's send_to_peer below is waiting on.
+        let bob_recv = bob.clone();
+        let recv_task = tokio::spawn(async move {
+            // A generous window: unlike the original sequential version of this test (send fully
+            // completes, then drain an already-buffered channel), this task now runs concurrently
+            // with send_to_peer below, so it must also cover that call's own DHT-lookup retries
+            // (up to 3 x 500ms) and dial timeout, not just the final channel recv. Bumped from 12s
+            // to 20s: this test is one of the last to run in a full `cargo test --workspace` pass,
+            // where residual CPU/IO contention from every prior crate's tests made the original
+            // 12s budget an intermittent flake (observed panicking with `Elapsed(())` even though
+            // the same test passes reliably in isolation) — this is machine-load headroom, not a
+            // change in what the test actually verifies.
+            let incoming = tokio::time::timeout(Duration::from_secs(20), bob_recv.recv_next())
+                .await
+                .expect("bob should receive the message before the timeout")
+                .expect("incoming channel should not be closed");
+            let bytes = incoming.bytes.clone();
+            incoming.respond(DeliveryOutcome::Processed);
+            bytes
+        });
+
+        let (mode, outcome) = alice
             .send_to_peer(&bob_peer_id, b"hello bob via dht".to_vec())
             .await
             .unwrap();
         assert_eq!(mode, P2PTransportMode::DirectQuic);
+        assert_eq!(outcome, DeliveryOutcome::Processed);
 
-        let received = tokio::time::timeout(Duration::from_secs(3), bob.recv_next())
-            .await
-            .expect("bob should receive the message before the timeout")
-            .expect("incoming channel should not be closed");
+        let received = recv_task.await.expect("bob's receive task must not panic");
         assert_eq!(received, b"hello bob via dht");
+    }
+
+    /// Regression test for the 2026-08-22 audit's "silent packet drop" / false-"Delivered"
+    /// findings: whatever `DeliveryOutcome` the receiving side reports via `IncomingMessage::
+    /// respond` — not just "the bytes arrived" — must be exactly what `send_to_peer` returns to
+    /// the sender. `nova-engine` relies on this to never mark a message "Delivered" when the
+    /// recipient dropped it as blocked, and to keep retrying one it failed to process at all.
+    #[tokio::test]
+    async fn test_delivery_outcome_is_faithfully_reported_to_the_sender() {
+        let alice_id = identity("alice");
+        let bob_id = identity("bob");
+        let bob_peer_id = bob_id.public_id_hex();
+
+        let alice = P2PNode::start(alice_id, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
+        let bob = P2PNode::start(bob_id, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
+
+        alice.bootstrap_dial(bob.listen_addr().clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        bob.announce_presence().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        for outcome in [DeliveryOutcome::Blocked, DeliveryOutcome::Rejected, DeliveryOutcome::Processed] {
+            let bob_recv = bob.clone();
+            let recv_task = tokio::spawn(async move {
+                let incoming = tokio::time::timeout(Duration::from_secs(12), bob_recv.recv_next())
+                    .await
+                    .expect("bob should receive the message before the timeout")
+                    .expect("incoming channel should not be closed");
+                incoming.respond(outcome);
+            });
+
+            let (mode, reported) = alice
+                .send_to_peer(&bob_peer_id, b"probe".to_vec())
+                .await
+                .unwrap();
+            assert_eq!(mode, P2PTransportMode::DirectQuic);
+            assert_eq!(reported, outcome, "sender must see exactly the outcome the recipient reported");
+            recv_task.await.expect("bob's receive task must not panic");
+        }
+    }
+
+    /// Regression test for the 2026-08-22 audit's core "TorStrict does not actually enforce
+    /// anything" finding. Alice successfully resolves Bob's real direct QUIC address via the DHT
+    /// (proving the lookup path works), then enables TorStrict — the dial itself must still be
+    /// refused, because the enforcement now lives at the actual `swarm.dial` call site in
+    /// `run_swarm_task`, not just an advisory pre-filter a caller could bypass.
+    #[tokio::test]
+    async fn test_tor_strict_mode_blocks_direct_dial_at_the_swarm_level() {
+        let alice_id = identity("alice");
+        let bob_id = identity("bob");
+        let bob_peer_id = bob_id.public_id_hex();
+
+        let alice = P2PNode::start(alice_id, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
+        let bob = P2PNode::start(bob_id, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
+
+        alice.bootstrap_dial(bob.listen_addr().clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        bob.announce_presence().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        alice
+            .configure_tor(crate::tor::TorConfig {
+                enabled: true,
+                mode: crate::tor::TorMode::TorStrict,
+                socks_proxy: "127.0.0.1:9050".to_string(),
+                onion_address: None,
+                bridge_type: None,
+            })
+            .await;
+
+        let (mode, _) = alice
+            .send_to_peer(&bob_peer_id, b"should never leave loopback".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            mode,
+            P2PTransportMode::Disconnected,
+            "TorStrict must refuse the direct dial even though Bob's real address was successfully resolved via the DHT"
+        );
     }
 
     /// Looking up a peer nobody has ever announced must resolve to "not found", not hang or
@@ -1018,16 +1396,27 @@ mod tests {
         bob.announce_addresses_only(vec![circuit_addr]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let mode = alice
+        let bob_recv = bob.clone();
+        let recv_task = tokio::spawn(async move {
+            // Extra margin for this path specifically: it also involves relay circuit
+            // reservation/dial, not just a DHT lookup + direct dial.
+            let incoming = tokio::time::timeout(Duration::from_secs(15), bob_recv.recv_next())
+                .await
+                .expect("bob should receive the relayed message before the timeout")
+                .expect("incoming channel should not be closed");
+            let bytes = incoming.bytes.clone();
+            incoming.respond(DeliveryOutcome::Processed);
+            bytes
+        });
+
+        let (mode, outcome) = alice
             .send_to_peer(&bob_peer_id, b"hello bob via relay only".to_vec())
             .await
             .unwrap();
         assert_ne!(mode, P2PTransportMode::Disconnected, "message must actually be delivered through the relay");
+        assert_eq!(outcome, DeliveryOutcome::Processed);
 
-        let received = tokio::time::timeout(Duration::from_secs(5), bob.recv_next())
-            .await
-            .expect("bob should receive the relayed message before the timeout")
-            .expect("incoming channel should not be closed");
+        let received = recv_task.await.expect("bob's receive task must not panic");
         assert_eq!(received, b"hello bob via relay only");
     }
 }

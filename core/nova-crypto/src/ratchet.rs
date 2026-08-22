@@ -2,7 +2,7 @@ use crate::aead::{decrypt_aead, encrypt_aead};
 use crate::error::CryptoError;
 use crate::kdf::{kdf_ck, kdf_rk, Key32};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
@@ -44,6 +44,11 @@ pub struct DoubleRatchetSession {
     nr: u32,
     pn: u32,
     mkskipped: HashMap<([u8; 32], u32), Key32>,
+    /// Insertion order of `mkskipped`'s keys, oldest first — a plain `HashMap` gives no
+    /// iteration-order guarantee at all, so without this, `skip_message_keys`'s eviction (see
+    /// below) was evicting an arbitrary entry while its own comment claimed "oldest". Bounded to
+    /// the same size as `mkskipped` and kept in lockstep with every insert/remove on it.
+    mkskipped_order: VecDeque<([u8; 32], u32)>,
 }
 
 impl Clone for DoubleRatchetSession {
@@ -59,6 +64,7 @@ impl Clone for DoubleRatchetSession {
             nr: self.nr,
             pn: self.pn,
             mkskipped: self.mkskipped.clone(),
+            mkskipped_order: self.mkskipped_order.clone(),
         }
     }
 }
@@ -75,6 +81,7 @@ impl Drop for DoubleRatchetSession {
         for (_, mut key) in self.mkskipped.drain() {
             key.zeroize();
         }
+        self.mkskipped_order.clear();
     }
 }
 
@@ -103,6 +110,7 @@ impl DoubleRatchetSession {
             nr: 0,
             pn: 0,
             mkskipped: HashMap::new(),
+            mkskipped_order: VecDeque::new(),
         })
     }
 
@@ -122,6 +130,7 @@ impl DoubleRatchetSession {
             nr: 0,
             pn: 0,
             mkskipped: HashMap::new(),
+            mkskipped_order: VecDeque::new(),
         }
     }
 
@@ -185,6 +194,9 @@ impl DoubleRatchetSession {
 
         // 1. Check if we already have a skipped message key for this header
         if let Some(mut mk) = self.mkskipped.remove(&(header.dh_pub, header.n)) {
+            if let Some(pos) = self.mkskipped_order.iter().position(|k| *k == (header.dh_pub, header.n)) {
+                self.mkskipped_order.remove(pos);
+            }
             let nonce = derive_nonce(&mk, header.n);
             let plaintext = match decrypt_aead(&mk, &nonce, ciphertext, &full_ad) {
                 Ok(pt) => pt,
@@ -274,15 +286,18 @@ impl DoubleRatchetSession {
                 let (next_ckr, mut mk) = kdf_ck(&ckr)?;
                 ckr = next_ckr;
                 if let Some(dhr) = self.dhr {
-                    // Evict oldest skipped key if cap reached to prevent memory exhaustion
+                    // Evict the genuinely oldest skipped key (by insertion order, tracked in
+                    // `mkskipped_order`) if the cap is reached, to prevent memory exhaustion.
                     if self.mkskipped.len() >= MAX_TOTAL_SKIPPED_KEYS {
-                        if let Some(oldest_key) = self.mkskipped.keys().next().cloned() {
+                        if let Some(oldest_key) = self.mkskipped_order.pop_front() {
                             if let Some(mut old_val) = self.mkskipped.remove(&oldest_key) {
                                 old_val.zeroize();
                             }
                         }
                     }
-                    self.mkskipped.insert((*dhr.as_bytes(), self.nr), mk);
+                    let key = (*dhr.as_bytes(), self.nr);
+                    self.mkskipped.insert(key, mk);
+                    self.mkskipped_order.push_back(key);
                 } else {
                     mk.zeroize();
                 }
@@ -378,5 +393,50 @@ mod tests {
         // Bob finally receives Message 2
         let p2 = bob.ratchet_decrypt(&h2, &c2, b"").unwrap();
         assert_eq!(p2, b"Message 2");
+    }
+
+    /// Regression test for the 2026-08-22 audit finding: `skip_message_keys`' eviction claimed
+    /// to remove the "oldest" skipped key but actually removed whatever a `HashMap` happened to
+    /// iterate first. Bob receives only message n = 204, forcing one `skip_message_keys(204)`
+    /// call that inserts skipped keys for n = 0..=203 (204 keys, 4 past the 200-key cap) before
+    /// message 204 itself is decrypted directly off the live chain (never stored as "skipped").
+    /// Checks that it is genuinely the first 4 inserted (n = 0..=3) that become unreadable,
+    /// while the other 200 (n = 4..=203) remain retained and decryptable.
+    #[test]
+    fn test_skipped_key_eviction_is_true_fifo_oldest_evicted_first() {
+        let shared_key = [7u8; 32];
+        let mut rng = rand::thread_rng();
+        let bob_dhs = StaticSecret::random_from_rng(&mut rng);
+        let bob_dh_pub = *X25519PublicKey::from(&bob_dhs).as_bytes();
+
+        let mut alice = DoubleRatchetSession::init_alice(&shared_key, &bob_dh_pub).unwrap();
+        let mut bob = DoubleRatchetSession::init_bob(&shared_key, bob_dhs);
+
+        // Alice sends 205 messages on the same sending chain (Bob never replies, so Alice never
+        // performs a DH ratchet step). Bob receives only the very last one (n = 204).
+        let messages: Vec<(RatchetHeader, Vec<u8>)> = (0..205u32)
+            .map(|i| alice.ratchet_encrypt(format!("msg {i}").as_bytes(), b"ad").unwrap())
+            .collect();
+
+        let (last_header, last_ciphertext) = messages.last().unwrap().clone();
+        let plaintext = bob.ratchet_decrypt(&last_header, &last_ciphertext, b"ad").unwrap();
+        assert_eq!(plaintext, b"msg 204");
+
+        // The oldest 4 skipped keys (n = 0..=3) must have been evicted to respect the 200-key cap.
+        for i in 0..4u32 {
+            let (h, c) = &messages[i as usize];
+            assert!(
+                bob.ratchet_decrypt(h, c, b"ad").is_err(),
+                "message {i} should have been evicted (it was inserted first) and must not still decrypt"
+            );
+        }
+        // The other 200 (n = 4..=203) must still be retained and decrypt correctly.
+        for i in 4..204u32 {
+            let (h, c) = &messages[i as usize];
+            let pt = bob
+                .ratchet_decrypt(h, c, b"ad")
+                .unwrap_or_else(|e| panic!("message {i} should still be decryptable via its retained skipped key: {e:?}"));
+            assert_eq!(pt, format!("msg {i}").into_bytes());
+        }
     }
 }

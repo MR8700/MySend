@@ -17,6 +17,17 @@ pub const MAX_DATAGRAM_SIZE: usize = 16 * 1024;
 /// (register / lookup / relay). Also spawns the periodic housekeeping task that expires stale
 /// presence entries and relay queues. Returns only if the initial bind fails.
 pub async fn run_server(bind_addr: &str) -> std::io::Result<()> {
+    let (socket, registry, relay) = bind(bind_addr).await?;
+    serve_forever(socket, registry, relay).await;
+    Ok(())
+}
+
+/// Binds the UDP socket and starts the registry/relay housekeeping task without serving yet —
+/// split out from [`run_server`] so a caller that needs the actual bound address (e.g. a test
+/// binding to port 0, or `nova-transport`'s fallback client wiring up a same-process server for
+/// its own integration tests) can read `socket.local_addr()` before handing the socket off to
+/// [`serve_forever`].
+pub async fn bind(bind_addr: &str) -> std::io::Result<(UdpSocket, Arc<PresenceRegistry>, Arc<BlindRelay>)> {
     let registry = Arc::new(PresenceRegistry::new());
     let relay = Arc::new(BlindRelay::new());
     info!("Presence Registry & Blind Relay initialized (In-Memory / Zero-Persistent-Storage)");
@@ -36,13 +47,14 @@ pub async fn run_server(bind_addr: &str) -> std::io::Result<()> {
         error!("Failed to bind UDP socket on {bind_addr}: {e}");
         e
     })?;
-    info!("NOVA Server listening on udp://{bind_addr} (register / lookup / relay signaling)");
+    let bound_addr = socket.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| bind_addr.to_string());
+    info!("NOVA Server listening on udp://{bound_addr} (register / lookup / relay signaling)");
 
-    serve_forever(socket, registry, relay).await;
-    Ok(())
+    Ok((socket, registry, relay))
 }
 
-async fn serve_forever(socket: UdpSocket, registry: Arc<PresenceRegistry>, relay: Arc<BlindRelay>) {
+/// Serves the discovery/signaling protocol forever over an already-bound socket (see [`bind`]).
+pub async fn serve_forever(socket: UdpSocket, registry: Arc<PresenceRegistry>, relay: Arc<BlindRelay>) {
     let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
     loop {
         let (len, src) = match socket.recv_from(&mut buf).await {

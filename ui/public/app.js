@@ -113,6 +113,7 @@ const CLICK_ACTIONS = {
     blockActiveContact: (el) => runPendingAction(el, blockActiveContact),
     unblockActiveContact: (el) => runPendingAction(el, () => unblockActiveContact(el.dataset.peerId)),
     addContact: (el) => runPendingAction(el, addContactReal),
+    retryFailedMessage: (el) => runPendingAction(el, () => retryFailedMessageReal(el.dataset.msgId, el.dataset.convId, el.dataset.recipientId)),
     saveBootstrapAddr: (el) => runPendingAction(el, saveBootstrapAddr),
     openMnemonicAuthModal: () => openMnemonicAuthModal(),
     closeMnemonicAuthModal: () => closeMnemonicAuthModal(),
@@ -697,7 +698,7 @@ const screens = {
                 ` : ''}
             </div>
         </div>
-    `; },
+    `,
 
     // 7. Ajouter un contact
     add_contact: () => `
@@ -777,8 +778,11 @@ const screens = {
 
     // 8. Médias partagés (1-to-1)
     shared_media: () => { if (!state.activeContact) return screens._noActiveContact('conversations'); const conversationId = state.activeContact.conversationId;
-        const images = state.messages.filter(m => m.conversationId === conversationId && m.type === 'image');
+        const media = state.messages.filter(m => m.conversationId === conversationId && (m.type === 'image' || m.type === 'video'));
         const files = state.messages.filter(m => m.conversationId === conversationId && m.type === 'file');
+        // Thumbnails render with whatever url each message already has; anything not loaded yet
+        // is fetched now and this screen re-renders once each one arrives (see ensureAttachmentLoaded).
+        media.filter(m => !m.url).forEach(ensureAttachmentLoaded);
         return `
         <div class="screen-view">
             <header class="app-header">
@@ -789,9 +793,12 @@ const screens = {
 
             <div style="padding: 16px; overflow-y: auto;">
                 <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">Photos & vidéos de cette conversation</div>
-                ${images.length > 0 ? `
+                ${media.length > 0 ? `
                     <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px;">
-                        ${images.map(m => `<div style="aspect-ratio: 1; border-radius: var(--radius-sm); overflow: hidden;"><img src="${escapeHtml(m.url || '')}" style="width: 100%; height: 100%; object-fit: cover;"></div>`).join('')}
+                        ${media.map(m => m.type === 'video'
+                            ? `<div style="aspect-ratio: 1; border-radius: var(--radius-sm); overflow: hidden;"><video src="${escapeHtml(m.url || '')}" style="width: 100%; height: 100%; object-fit: cover;" muted></video></div>`
+                            : `<div style="aspect-ratio: 1; border-radius: var(--radius-sm); overflow: hidden;"><img src="${escapeHtml(m.url || '')}" style="width: 100%; height: 100%; object-fit: cover;"></div>`
+                        ).join('')}
                     </div>
                 ` : `<div style="font-size: 13px; color: var(--text-dim); margin-bottom: 16px;">Aucun média partagé.</div>`}
 
@@ -1106,6 +1113,7 @@ const screens = {
 };
 
 // --- CONTROLLER & NAVIGATION ---
+let conversationsPollInterval = null;
 async function navigateTo(screenKey) {
     closeQrCameraScanner();
     closeMediaPreviewModal();
@@ -1126,8 +1134,18 @@ async function navigateTo(screenKey) {
         } else if (screenKey === 'chat' && state.activeContact) {
             await refreshMessagesFromBackend(state.activeContact.conversationId);
             await refreshDiagnostics(state.activeContact.peerId);
+            // Historical attachments (photos, videos, voice notes) sent/received before this
+            // chat was opened only have an attachmentId, not a fetched url — kick off loading
+            // for all of them now, each re-rendering its own bubble in place once it arrives.
+            state.messages
+                .filter(m => m.conversationId === state.activeContact.conversationId && m.attachmentId && !m.url)
+                .forEach(ensureAttachmentLoaded);
         } else if (screenKey === 'contact_profile' && state.activeContact) {
             await refreshDiagnostics(state.activeContact.peerId);
+        } else if (screenKey === 'shared_media' && state.activeContact) {
+            // Reachable directly (e.g. a deep link) without the chat screen having populated
+            // state.messages for this conversation first.
+            await refreshMessagesFromBackend(state.activeContact.conversationId);
         } else if (screenKey === 'identity') {
             await refreshOwnBundleHex();
             await refreshTorStatusFromBackend();
@@ -1197,6 +1215,26 @@ async function navigateTo(screenKey) {
     } else if (messagePollInterval) {
         clearInterval(messagePollInterval);
         messagePollInterval = null;
+    }
+
+    // Keep the conversations list (unread badges, last-message previews) live while it's the
+    // active screen, so messages arriving in the background over P2P/Tor don't require leaving
+    // and re-entering the screen to show up.
+    if (screenKey === 'conversations') {
+        if (conversationsPollInterval) clearInterval(conversationsPollInterval);
+        if (hasBackend) {
+            conversationsPollInterval = setInterval(async () => {
+                await refreshConversationsFromBackend();
+                updateGlobalUnreadBadges();
+                if (state.currentScreen === 'conversations') {
+                    const container = document.getElementById('screen-container');
+                    if (container) container.innerHTML = screens.conversations();
+                }
+            }, 3000);
+        }
+    } else if (conversationsPollInterval) {
+        clearInterval(conversationsPollInterval);
+        conversationsPollInterval = null;
     }
 }
 
@@ -1404,6 +1442,7 @@ function openChatWith(name, handle) {
         safetyNumber: (contact && contact.safetyNumber) || 'Non disponible',
         isOnline: !!(contact && contact.online),
         p2pMode: (contact && contact.p2pMode) || 'Non connecté',
+        isBlocked: !!(contact && contact.isBlocked),
     };
     // Reset stale diagnostics from whatever contact was previously open — navigateTo('chat')
     // below fetches fresh ones for this contact before rendering.
@@ -1644,19 +1683,15 @@ async function refreshConversationsFromBackend() {
     }
 }
 
-// --- STRUCTURED PAYLOADS OVER THE TEXT PIPELINE ---
-// nova-engine's wire protocol already has a MessageContentType/MediaMetadata schema for
-// images/audio/files, but no binary payload field is wired up end-to-end yet on the storage
-// side (see nova-protocol::packet::MessagePayload) — extending that properly (schema + storage
-// column + chunking for anything bigger than one packet) is real follow-on work. In the
-// meantime, location/photo/file/voice messages below travel as a small JSON envelope inside the
-// *existing*, already-tested text pipeline (X3DH/Double Ratchet encrypted exactly like any other
-// message, real bytes actually sent over nova-transport) — genuinely real and working today, not
-// a mock, just not yet the "proper" schema. `MAX_STRUCTURED_PAYLOAD_BYTES` keeps this well under
-// the single-packet ceiling (see nova_protocol::packet::MAX_PACKET_SIZE) after base64 and
-// JSON overhead; anything bigger needs real chunking.
+// --- LOCATION SHARING (small JSON envelope over the text pipeline) ---
+// A shared location is just a couple of coordinates — small enough to travel as a JSON envelope
+// inside the ordinary text pipeline (X3DH/Double Ratchet encrypted exactly like any other text
+// message) without needing the binary media pipeline below. Real media (image/video/audio/file)
+// used to travel this same way as a base64 blob, but as of the 2026-08-22 audit's J4 fix that
+// goes through send_media/nova_engine::send_media instead — real chunked binary transfer, a
+// dedicated encrypted-at-rest attachment table, and no more decrypting megabytes of embedded
+// media on every search (see MAX_MEDIA_BYTES and sendMediaMessage below).
 const STRUCTURED_MARKER = '__NOVA_STRUCTURED_MSG_V1__:';
-const MAX_STRUCTURED_PAYLOAD_BYTES = 5 * 1024 * 1024; // 5 Mo maximum (bien en-dessous du plafond protocolaire de 8 Mo)
 
 function encodeStructuredMessage(obj) {
     return STRUCTURED_MARKER + JSON.stringify(obj);
@@ -1671,22 +1706,96 @@ function decodeStructuredMessage(text) {
     }
 }
 
+// Overall ceiling on one media message, now that real chunking (nova_protocol::MEDIA_CHUNK_SIZE
+// per packet) removes the old single-packet 5 MB wall — chosen to keep a send/receive bounded to
+// a reasonable amount of time and local storage, not because of any protocol limit.
+const MAX_MEDIA_BYTES = 100 * 1024 * 1024; // 100 Mo
+
+// Maps the Rust engine's real DbMessageStatus (serialized as its variant name — "Sent",
+// "Delivered", "Read", "Failed", ...) onto the small set of visual states the message bubble
+// understands. Incoming messages are always shown as simply "read" (no delivery-tick semantics
+// apply to something already received). "sending" is a purely local/optimistic state set before
+// the backend call resolves — see sendMessage — never something the backend reports.
+function mapUiMessageStatus(m) {
+    if (!m.is_outgoing) return 'read';
+    switch (m.status) {
+        case 'Failed':
+            return 'failed';
+        case 'Delivered':
+        case 'Read':
+            return 'delivered';
+        default:
+            return 'sent';
+    }
+}
+
+// nova_protocol::MessageContentType's variant name (as serialized to JSON) -> the UI's message
+// bubble type. "Audio" maps to 'voice' (a recorded note, this app's only current audio path);
+// "Text"/"SystemNotification" and anything unrecognized fall through to plain text.
+function contentTypeToUiType(contentType) {
+    switch (contentType) {
+        case 'Image': return 'image';
+        case 'Video': return 'video';
+        case 'Audio': return 'voice';
+        case 'File': return 'file';
+        default: return 'text';
+    }
+}
+
 function mapBackendMessage(m, conversationId) {
     const base = {
         id: m.id,
         conversationId,
+        recipientId: m.recipient_id,
         time: formatMessageTime(m.timestamp_utc),
         isOutgoing: m.is_outgoing,
-        status: m.is_outgoing ? 'sent' : 'read',
+        status: mapUiMessageStatus(m),
     };
     const structured = decodeStructuredMessage(m.text_content);
     if (structured && structured.kind === 'location') {
         return { ...base, type: 'location', text: structured.label, meta: 'Précision d\'environ 5 mètres' };
     }
-    if (structured && structured.kind === 'media') {
-        return { ...base, type: structured.mediaType, text: structured.name, meta: structured.metaText, url: structured.dataUrl };
+
+    const uiType = contentTypeToUiType(m.content_type);
+    if (uiType !== 'text' && m.attachment) {
+        return {
+            ...base,
+            type: uiType,
+            text: m.text_content,
+            meta: formatFileSize(m.attachment.size_bytes),
+            attachmentId: m.id,
+            mimeType: m.attachment.mime_type,
+            url: undefined, // filled in lazily — see ensureAttachmentLoaded
+        };
     }
     return { ...base, type: 'text', text: m.text_content };
+}
+
+// Fetches one message's attachment bytes on demand (never eagerly with the rest of the
+// conversation — see nova_engine::NovaEngine::get_attachment_data) and re-renders that one
+// bubble in place once loaded. Safe to call repeatedly: a no-op once `msg.url` is already set.
+async function ensureAttachmentLoaded(msg) {
+    if (!msg.attachmentId || msg.url || !hasBackend) return;
+    try {
+        const dataBase64 = await tauriInvoke('get_attachment_data', { messageId: msg.attachmentId });
+        if (!dataBase64) return;
+        msg.url = `data:${msg.mimeType || 'application/octet-stream'};base64,${dataBase64}`;
+
+        // In the chat view, swap just this one bubble in place (keeps scroll position). On any
+        // other screen showing this same message (e.g. "Médias partagés"), there's no single
+        // bubble to target, so re-render that whole screen instead.
+        const existingRow = document.getElementById(`msg-row-${msg.id}`);
+        if (existingRow) {
+            const rebuilt = document.createElement('div');
+            rebuilt.innerHTML = buildMessageHtml(msg).trim();
+            existingRow.replaceWith(rebuilt.firstElementChild);
+        } else if (state.currentScreen === 'shared_media' || state.currentScreen === 'chat') {
+            const container = document.getElementById('screen-container');
+            if (container) container.innerHTML = screens[state.currentScreen]();
+        }
+    } catch (e) {
+        console.error('Échec du chargement de la pièce jointe', msg.id, e);
+    }
 }
 
 // Fetches the full message history for one conversation from local storage and merges it into
@@ -2056,6 +2165,25 @@ function buildMessageHtml(m) {
                 </div>
             </div>
         `;
+    } else if (m.type === 'video') {
+        // Previously fell through to a plain text bubble — video had a URL but no player at
+        // all. A real, playable <video> now, with the same "not loaded yet" placeholder pattern
+        // as image/voice above while the attachment is being fetched (see ensureAttachmentLoaded).
+        contentHtml = `
+            <div class="msg-photo-card">
+                ${m.url ? `<video src="${escapeHtml(m.url)}" controls preload="metadata" class="msg-image-thumb" style="background:#000;"></video>` : `
+                    <div class="msg-photo-preview">
+                        ${icons.image}
+                        <span style="font-size: 11px; font-weight: 600; color: white;">${safeText || 'Vidéo'}</span>
+                        <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || ''}</span>
+                    </div>
+                `}
+                <div style="padding: 6px 10px; font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-weight: 600; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px;">${safeText}</span>
+                    <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || 'Envoyé'}</span>
+                </div>
+            </div>
+        `;
     } else if (m.type === 'voice') {
         // A real, playable recording (see stopAndSendVoiceRecording) — native <audio controls>
         // rather than a custom-styled player, so playback is guaranteed correct rather than
@@ -2089,7 +2217,7 @@ function buildMessageHtml(m) {
     const safeId = escapeHtml(m.id);
     const statusHtml = m.isOutgoing ? `
         <span id="msg-status-${safeId}" style="display: inline-flex; align-items: center;">
-            ${m.status === 'sending' ? '<span class="status-tick-sending">⏳</span>' : (m.status === 'sent' ? '<span class="status-tick-sent">✓</span>' : `<span class="status-tick-read" title="Lu">${icons.checkCheck}</span>`)}
+            ${messageStatusTickHtml(m)}
         </span>
     ` : '';
 
@@ -2125,9 +2253,28 @@ function appendChatMessageToBody(msg) {
     wrapper.innerHTML = buildMessageHtml(msg).trim();
     chatBody.appendChild(wrapper.firstElementChild);
 
+    if (msg.attachmentId && !msg.url) {
+        ensureAttachmentLoaded(msg); // fire-and-forget — re-renders this bubble once loaded
+    }
+
     setTimeout(() => {
         chatBody.scrollTo({ top: chatBody.scrollHeight, behavior: 'smooth' });
     }, 20);
+}
+
+// Renders the delivery-tick (or failure + retry affordance) for one outgoing message bubble.
+// A "failed" message shows a distinct icon and an inline "Réessayer" button — see
+// retryFailedMessageReal — instead of silently staying stuck at a "sending" tick forever, which
+// is what happened before the outbox had any give-up state to report at all.
+function messageStatusTickHtml(m) {
+    if (m.status === 'sending') return '<span class="status-tick-sending" title="Envoi en cours">⏳</span>';
+    if (m.status === 'failed') {
+        return `<span class="status-tick-failed" title="Échec de l'envoi">⚠</span>
+            <button class="status-retry-btn" data-action="retryFailedMessage"
+                data-msg-id="${escapeHtml(m.id)}" data-conv-id="${escapeHtml(m.conversationId)}" data-recipient-id="${escapeHtml(m.recipientId || '')}">Réessayer</button>`;
+    }
+    if (m.status === 'delivered') return `<span class="status-tick-read" title="Distribué">${icons.checkCheck}</span>`;
+    return '<span class="status-tick-sent" title="Envoyé">✓</span>';
 }
 
 function updateMessageStatus(msgId, status) {
@@ -2135,14 +2282,27 @@ function updateMessageStatus(msgId, status) {
     if (target) target.status = status;
 
     const el = document.getElementById(`msg-status-${msgId}`);
-    if (el) {
-        if (status === 'sending') {
-            el.innerHTML = '<span class="status-tick-sending">⏳</span>';
-        } else if (status === 'sent') {
-            el.innerHTML = '<span class="status-tick-sent">✓</span>';
-        } else {
-            el.innerHTML = `<span class="status-tick-read" title="Lu">${icons.checkCheck}</span>`;
-        }
+    if (el && target) {
+        el.innerHTML = messageStatusTickHtml(target);
+    }
+}
+
+// Re-attempts delivery of a message the outbox already gave up on (status "failed") — resets
+// its bookkeeping in the backend under the same message id and puts it back in "sending" state
+// in the UI while the fresh attempt is in flight.
+async function retryFailedMessageReal(msgId, convId, recipientId) {
+    if (!msgId || !convId || !recipientId || !requireBackend()) return;
+    updateMessageStatus(msgId, 'sending');
+    try {
+        await tauriInvoke('retry_failed_message', {
+            conversationId: convId,
+            recipientPeerId: recipientId,
+            messageId: msgId,
+        });
+        updateMessageStatus(msgId, 'sent');
+    } catch (e) {
+        updateMessageStatus(msgId, 'failed');
+        alert('Le renvoi a échoué : ' + e);
     }
 }
 
@@ -2157,12 +2317,13 @@ function formatFileSize(bytes) {
     return bytes > 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
 }
 
-// Sends a File's actual bytes (as a base64 data URL) through the same encrypted text pipeline as
-// a normal message.
+// Sends a File's actual bytes through the real chunked media pipeline (see
+// nova_engine::NovaEngine::send_media) — split into MEDIA_CHUNK_SIZE wire packets on the Rust
+// side, stored encrypted in their own attachment table, never inline in the message text.
 async function sendFileAsStructuredMessage(file, mediaType, label, metaTextOverride, existingDataUrl) {
     if (!state.activeContact || !requireBackend()) return;
-    if (file.size > MAX_STRUCTURED_PAYLOAD_BYTES) {
-        alert(`Fichier trop volumineux (${formatFileSize(file.size)}). Limite actuelle : ${formatFileSize(MAX_STRUCTURED_PAYLOAD_BYTES)}.`);
+    if (file.size > MAX_MEDIA_BYTES) {
+        alert(`Fichier trop volumineux (${formatFileSize(file.size)}). Limite actuelle : ${formatFileSize(MAX_MEDIA_BYTES)}.`);
         return;
     }
 
@@ -2172,18 +2333,27 @@ async function sendFileAsStructuredMessage(file, mediaType, label, metaTextOverr
         reader.onerror = () => reject(reader.error);
         reader.readAsDataURL(file);
     });
+    const commaIdx = dataUrl.indexOf(',');
+    const dataBase64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
+    // The dataUrl's own mime prefix reflects what was actually encoded (e.g. an image compressed
+    // to JPEG via compressImageIfNeeded, even though `file.type` is still the original PNG) —
+    // trust that first, falling back to the source file's type only when there's no dataUrl mime.
+    const mimeType = (dataUrl.match(/^data:([^;]+);/) || [])[1] || file.type || 'application/octet-stream';
 
     const sizeStr = formatFileSize(file.size);
     const now = new Date();
     const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     const metaText = metaTextOverride || sizeStr;
-    const payload = encodeStructuredMessage({ kind: 'media', mediaType, name: label, metaText, dataUrl });
 
     try {
-        const record = await tauriInvoke('send_message', {
+        const record = await tauriInvoke('send_media', {
             conversationId: state.activeContact.conversationId,
             recipientPeerId: state.activeContact.peerId,
-            text: payload,
+            contentType: mediaType,
+            fileName: label,
+            mimeType,
+            dataBase64,
+            caption: label,
         });
         const newMsg = {
             id: record.id,
@@ -2191,7 +2361,11 @@ async function sendFileAsStructuredMessage(file, mediaType, label, metaTextOverr
             type: mediaType,
             text: label,
             meta: metaText,
+            // Already have the bytes locally (we just uploaded them) — no need to round-trip
+            // through get_attachment_data for our own just-sent message.
             url: (mediaType === 'image' || mediaType === 'voice' || mediaType === 'video') ? dataUrl : undefined,
+            attachmentId: record.id,
+            mimeType,
             time: timeStr,
             isOutgoing: true,
             status: 'sent',
@@ -2320,8 +2494,8 @@ async function handleMediaFileSelect(event) {
     // Auto-compress high-resolution camera photos if image
     if (isImage) {
         const processed = await compressImageIfNeeded(file);
-        if (processed.size > MAX_STRUCTURED_PAYLOAD_BYTES) {
-            alert(`Image trop volumineuse après compression (${formatFileSize(processed.size)}). Limite : ${formatFileSize(MAX_STRUCTURED_PAYLOAD_BYTES)}.`);
+        if (processed.size > MAX_MEDIA_BYTES) {
+            alert(`Image trop volumineuse après compression (${formatFileSize(processed.size)}). Limite : ${formatFileSize(MAX_MEDIA_BYTES)}.`);
             return;
         }
         openMediaPreviewModal({
@@ -2336,8 +2510,8 @@ async function handleMediaFileSelect(event) {
         return;
     }
 
-    if (file.size > MAX_STRUCTURED_PAYLOAD_BYTES) {
-        alert(`Fichier trop volumineux (${formatFileSize(file.size)}). Limite actuelle : ${formatFileSize(MAX_STRUCTURED_PAYLOAD_BYTES)}.`);
+    if (file.size > MAX_MEDIA_BYTES) {
+        alert(`Fichier trop volumineux (${formatFileSize(file.size)}). Limite actuelle : ${formatFileSize(MAX_MEDIA_BYTES)}.`);
         return;
     }
 
@@ -2368,8 +2542,8 @@ function handleDocFileSelect(event) {
     event.target.value = '';
     if (!file) return;
 
-    if (file.size > MAX_STRUCTURED_PAYLOAD_BYTES) {
-        alert(`Document trop volumineux (${formatFileSize(file.size)}). Limite actuelle : ${formatFileSize(MAX_STRUCTURED_PAYLOAD_BYTES)}.`);
+    if (file.size > MAX_MEDIA_BYTES) {
+        alert(`Document trop volumineux (${formatFileSize(file.size)}). Limite actuelle : ${formatFileSize(MAX_MEDIA_BYTES)}.`);
         return;
     }
 
@@ -3005,9 +3179,10 @@ function filterContactsList(query) {
     const container = document.getElementById('contacts-list-container');
     if (!container) return;
 
-    const filtered = state.contacts.filter(c => 
-        c.name.toLowerCase().includes(query.toLowerCase()) || 
-        c.handle.toLowerCase().includes(query.toLowerCase())
+    const filtered = state.contacts.filter(c =>
+        !c.isBlocked &&
+        (c.name.toLowerCase().includes(query.toLowerCase()) ||
+        c.handle.toLowerCase().includes(query.toLowerCase()))
     );
 
     container.innerHTML = filtered.length > 0 ? filtered.map(c => `
@@ -3024,7 +3199,7 @@ function filterContactsList(query) {
     `).join('') : `<div style="text-align: center; color: var(--text-dim); padding: 40px 20px; font-size: 13px;">Aucun contact ne correspond à « ${escapeHtml(query)} ».</div>`;
 }
 
-function handleStrictSearch(query) {
+async function handleStrictSearch(query) {
     const resultsContainer = document.getElementById('search-results-list');
     if (!resultsContainer) return;
 
@@ -3046,7 +3221,23 @@ function handleStrictSearch(query) {
 
     const q = query.toLowerCase();
     const filteredContacts = state.contacts.filter(c => c.name.toLowerCase().includes(q) || c.handle.toLowerCase().includes(q));
-    const filteredMessages = state.messages.filter(m => m.text.toLowerCase().includes(q));
+
+    // Full-text message search runs against the encrypted local database (see
+    // nova_engine::NovaEngine::search_messages), not just whatever conversation happens to be
+    // loaded in state.messages — otherwise a message from any conversation other than the one
+    // currently open would never be found.
+    let searchedMessages = [];
+    if (hasBackend) {
+        try {
+            searchedMessages = await tauriInvoke('search_messages', { query });
+        } catch (e) {
+            console.error('search_messages failed', e);
+        }
+    }
+    // Bail out if the input has moved on to a different query while this awaited (avoids a
+    // slower earlier search clobbering a faster later one's results).
+    const searchInput = document.getElementById('global-search-input');
+    if (searchInput && searchInput.value !== query) return;
 
     resultsContainer.innerHTML = `
         <div style="font-size: 12px; color: var(--text-muted); margin: 0 0 8px 12px; font-weight: 600;">CONTACTS (${filteredContacts.length})</div>
@@ -3060,16 +3251,22 @@ function handleStrictSearch(query) {
             </div>
         `).join('') : '<div style="font-size: 13px; color: var(--text-dim); margin-left: 12px; margin-bottom: 14px;">Aucun contact correspondant.</div>'}
 
-        <div style="font-size: 12px; color: var(--text-muted); margin: 16px 0 8px 12px; font-weight: 600;">MESSAGES (${filteredMessages.length})</div>
-        ${filteredMessages.length > 0 ? filteredMessages.map(m => `
-            <div class="item-card" data-action="navigate" data-screen="chat">
+        <div style="font-size: 12px; color: var(--text-muted); margin: 16px 0 8px 12px; font-weight: 600;">MESSAGES (${searchedMessages.length})</div>
+        ${searchedMessages.length > 0 ? searchedMessages.map(m => {
+            // conversation_id follows nova-engine's `conv_<peer_id>` convention (see the field
+            // comment on state.contacts in openChatWith) — the peer is whichever side of the
+            // message isn't us.
+            const peerId = m.is_outgoing ? m.recipient_id : m.sender_id;
+            const contact = state.contacts.find(c => c.handle === peerId);
+            return `
+            <div class="item-card" data-name="${escapeHtml(contact ? contact.name : '')}" data-handle="${escapeHtml(peerId)}" data-action="openChat">
                 <div class="avatar">${icons.chat}</div>
                 <div class="item-content">
-                    <div class="item-name">${escapeHtml(m.text)}</div>
-                    <div class="item-sub">${escapeHtml(m.time)} • Message local</div>
+                    <div class="item-name">${escapeHtml(contact ? contact.name : peerId)}</div>
+                    <div class="item-sub">${escapeHtml(m.text_content)}</div>
                 </div>
             </div>
-        `).join('') : '<div style="font-size: 13px; color: var(--text-dim); margin-left: 12px;">Aucun message trouvé.</div>'}
+        `; }).join('') : '<div style="font-size: 13px; color: var(--text-dim); margin-left: 12px;">Aucun message trouvé.</div>'}
     `;
 }
 

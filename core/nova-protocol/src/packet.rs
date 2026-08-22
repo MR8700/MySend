@@ -8,8 +8,27 @@ pub const PROTOCOL_VERSION: u8 = 0x01;
 /// Hard ceiling on any single wire packet, enforced before CBOR decoding. Packets arrive
 /// from an untrusted network; without this bound a hostile or corrupted peer could send a
 /// header claiming an enormous payload and force unbounded allocation during deserialization.
-/// 8 MiB comfortably covers a rich chat message, audio note or file-transfer chunk.
-pub const MAX_PACKET_SIZE: usize = 8 * 1024 * 1024;
+///
+/// This must stay comfortably under 1 MiB: every packet travels as one `libp2p-request-response`
+/// *request*, and that crate's `cbor` codec hard-codes `REQUEST_SIZE_MAXIMUM = 1 MiB` with no
+/// public knob to raise it (`libp2p_request_response::cbor::codec`) — the receiving side's
+/// `io.take(REQUEST_SIZE_MAXIMUM).read_to_end(..)` silently truncates anything larger before our
+/// own size check ever runs, so a packet at or above that transport ceiling never arrives at all
+/// (it fails to CBOR-decode on the receiving end and the sender eventually times out waiting for
+/// a response — this is what a naive 6 MiB `MEDIA_CHUNK_SIZE` hit before this was caught during
+/// the 2026-08-22 remediation's final verification pass, appearing only as a "never arrives" test
+/// failure with no error, since the failure happens below this crate).
+pub const MAX_PACKET_SIZE: usize = 900 * 1024;
+
+/// Target size for one media chunk's raw binary payload (see `MessagePayload::chunk_bytes`), set
+/// safely below `MAX_PACKET_SIZE` (which is itself capped by the libp2p transport's 1 MiB request
+/// ceiling — see its doc comment) to leave headroom for the Double Ratchet AEAD tag, the CBOR
+/// envelope, and the outer `NovaPacket` wrapper — none of which are free, and all of which are
+/// applied on top of this payload before it becomes one wire packet. A file larger than this is
+/// split across multiple chunks (see `MediaMetadata::chunk_count`) rather than sent as one
+/// oversized packet — the fix for the 2026-08-22 audit's "video is capped at 5 MB with no
+/// chunking" finding.
+pub const MEDIA_CHUNK_SIZE: usize = 512 * 1024;
 
 #[derive(Error, Debug)]
 pub enum ProtocolError {
@@ -41,6 +60,11 @@ pub enum FrameType {
 pub enum MessageContentType {
     Text,
     Image,
+    /// A recorded/attached video file. Distinct from `Image` and `File` so the UI can render it
+    /// with a video player instead of an `<img>`/generic-file icon — see the 2026-08-22 audit's
+    /// "video is capped at 5 MB with no compression" finding, fixed by chunking (this content
+    /// type just needed to exist for a real video message to be represented at all).
+    Video,
     Audio,
     File,
     SystemNotification,
@@ -56,6 +80,12 @@ pub struct MediaMetadata {
 }
 
 /// Plaintext inner message content before Double Ratchet encryption.
+///
+/// A media message (`content_type` other than `Text`/`SystemNotification`) travels as one
+/// `MessagePayload` PER CHUNK, all sharing the same `message_id` and `content_type` — see
+/// `MEDIA_CHUNK_SIZE`. `chunk_index` 0 carries `media_meta` (the full file's name/mime/size/
+/// checksum/`chunk_count`); every chunk carries its own `chunk_bytes` slice. A `Text` message is
+/// simply the degenerate case of one chunk (`chunk_index: None`, `chunk_bytes: None`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessagePayload {
     pub message_id: String,
@@ -67,6 +97,25 @@ pub struct MessagePayload {
     pub text_content: Option<String>,
     pub media_meta: Option<MediaMetadata>,
     pub reply_to_id: Option<String>,
+    /// Present only on a media chunk: this chunk's 0-based index within `media_meta.chunk_count`
+    /// (as seen on chunk 0's payload) — `None` for a plain text message.
+    #[serde(default)]
+    pub chunk_index: Option<u32>,
+    /// Present only on a media chunk: this chunk's raw binary slice of the file — `None` for a
+    /// plain text message. Never base64-encoded here; base64 is strictly a JS/IPC-boundary
+    /// convenience in `ui/src-tauri`, not part of the wire format.
+    ///
+    /// `#[serde(with = "serde_bytes")]` is load-bearing, not cosmetic: plain `serde::Serialize`
+    /// for `Vec<u8>` encodes it as a CBOR array of one integer item per byte (no built-in
+    /// specialization for `T = u8`), not a compact CBOR byte string. For a `MEDIA_CHUNK_SIZE`
+    /// chunk that alone roughly doubles the size — and compounds again at every later layer this
+    /// plaintext gets wrapped in (`EncryptedFrame::ciphertext`, then `NovaPacket::payload` — see
+    /// their own `serde_bytes` annotations), multiplying into several times the original size and
+    /// blowing straight through `MAX_PACKET_SIZE`. Caught by
+    /// `test_send_and_receive_media_message_multi_chunk_reassembly` during the 2026-08-22 audit's
+    /// J4 implementation.
+    #[serde(default, with = "serde_bytes")]
+    pub chunk_bytes: Option<Vec<u8>>,
 }
 
 impl MessagePayload {
@@ -87,6 +136,36 @@ impl MessagePayload {
             text_content: Some(text),
             media_meta: None,
             reply_to_id: None,
+            chunk_index: None,
+            chunk_bytes: None,
+        }
+    }
+
+    /// Builds one chunk's payload for a media message. `media_meta` must be `Some` on
+    /// `chunk_index == 0` and `None` on every other chunk (the header travels exactly once).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_media_chunk(
+        message_id: String,
+        conversation_id: String,
+        sender_id: String,
+        recipient_id: String,
+        content_type: MessageContentType,
+        media_meta: Option<MediaMetadata>,
+        chunk_index: u32,
+        chunk_bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            message_id,
+            conversation_id,
+            sender_id,
+            recipient_id,
+            timestamp_utc: chrono::Utc::now().timestamp(),
+            content_type,
+            text_content: None,
+            media_meta,
+            reply_to_id: None,
+            chunk_index: Some(chunk_index),
+            chunk_bytes: Some(chunk_bytes),
         }
     }
 
@@ -116,19 +195,29 @@ pub struct AckPayload {
 }
 
 /// Outer encrypted envelope transmitted across QUIC streams or through the Relay.
+///
+/// See `MessagePayload::chunk_bytes`'s doc comment for why `#[serde(with = "serde_bytes")]` on
+/// `ciphertext` is load-bearing, not cosmetic — this is the second of three compounding layers
+/// that finding covers.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncryptedFrame {
     pub header: RatchetHeader,
+    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
 }
 
 /// Universal top-level NOVA packet frame.
+///
+/// See `MessagePayload::chunk_bytes`'s doc comment for why `#[serde(with = "serde_bytes")]` on
+/// `payload` is load-bearing, not cosmetic — this is the third of three compounding layers that
+/// finding covers.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NovaPacket {
     pub magic: [u8; 4],
     pub version: u8,
     pub frame_type: FrameType,
     pub session_id: String,
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
 }
 
@@ -242,6 +331,61 @@ mod tests {
         let cbor = packet.to_cbor().unwrap();
         let decoded = NovaPacket::from_cbor(&cbor).unwrap();
         assert_eq!(packet, decoded);
+    }
+
+    #[test]
+    fn test_media_chunk_payload_cbor_roundtrip() {
+        let header = MessagePayload::new_media_chunk(
+            "msg-media-1".into(),
+            "conv-1".into(),
+            "alice".into(),
+            "bob".into(),
+            MessageContentType::Image,
+            Some(MediaMetadata {
+                file_name: "photo.jpg".into(),
+                mime_type: "image/jpeg".into(),
+                size_bytes: 12_000_000,
+                sha256_checksum: "deadbeef".into(),
+                chunk_count: 2,
+            }),
+            0,
+            vec![1, 2, 3, 4],
+        );
+        let bytes = header.to_bytes().unwrap();
+        let decoded = MessagePayload::from_bytes(&bytes).unwrap();
+        assert_eq!(header, decoded);
+        assert_eq!(decoded.chunk_index, Some(0));
+        assert_eq!(decoded.media_meta.unwrap().chunk_count, 2);
+
+        let tail = MessagePayload::new_media_chunk(
+            "msg-media-1".into(),
+            "conv-1".into(),
+            "alice".into(),
+            "bob".into(),
+            MessageContentType::Image,
+            None,
+            1,
+            vec![5, 6, 7, 8],
+        );
+        let tail_decoded = MessagePayload::from_bytes(&tail.to_bytes().unwrap()).unwrap();
+        assert_eq!(tail_decoded.chunk_index, Some(1));
+        assert!(tail_decoded.media_meta.is_none());
+    }
+
+    /// A plain text `MessagePayload` (built before `chunk_index`/`chunk_bytes` existed) must
+    /// still decode correctly — `#[serde(default)]` on the new fields is what makes that true.
+    #[test]
+    fn test_text_payload_without_chunk_fields_still_decodes() {
+        let payload = MessagePayload::new_text(
+            "msg-1".into(),
+            "conv-1".into(),
+            "alice".into(),
+            "bob".into(),
+            "hello".into(),
+        );
+        let decoded = MessagePayload::from_bytes(&payload.to_bytes().unwrap()).unwrap();
+        assert_eq!(decoded.chunk_index, None);
+        assert_eq!(decoded.chunk_bytes, None);
     }
 
     #[test]

@@ -1,5 +1,25 @@
 # Plan Complet d'Implémentation Technique : NOVA Chat (MySend)
 
+> **Note de mise à jour (2026-08-22)** — Ce document décrit le plan d'origine. L'architecture
+> réseau a depuis migré vers un DHT Kademlia (voir `core/nova-transport/src/dht_node.rs`) : le
+> module `discovery-server` décrit en section 1/3.3 ci-dessous (registre de présence + STUN +
+> relais aveugle, servi par un unique serveur central) n'est **plus le chemin principal**. Le
+> point d'entrée réseau réel est désormais `nova-bootstrap` (un pair libp2p ordinaire, sans
+> privilège particulier — voir son propre README) combiné à la découverte mDNS locale et au
+> relais/traversée NAT natifs de libp2p (`circuit-relay-v2` + DCUtR). `stun.rs`, mentionné en
+> section 1, n'existe pas dans l'implémentation actuelle — la réflexion d'adresse est assurée par
+> le protocole `identify` de libp2p, pas par un serveur STUN dédié.
+>
+> Le crate `server` (`nova-server`) existe toujours et **a été rebranché comme chemin de secours
+> en production** (voir `core/nova-transport/src/udp_fallback.rs`) plutôt que laissé orphelin : un
+> appareil qui ne peut encore joindre aucun pair libp2p (ni LAN via mDNS, ni le bootstrap DHT
+> configuré) peut toujours déposer un paquet chiffré opaque sur un `nova-server` connu
+> (`NOVA_UDP_FALLBACK_ADDR`) pour qu'un pair inatteignable autrement le récupère au sondage
+> suivant. Ce chemin est fire-and-forget (aucune confirmation de livraison en temps réel, à la
+> différence du chemin DHT/QUIC) : `nova-engine` ne le traite jamais comme une preuve de livraison,
+> seulement comme une chance supplémentaire d'acheminement.
+
+
 ## 1. Architecture Globale du Workspace
 
 Le projet est structuré sous forme de monorepo modulaire articulé autour d'un **Core Rust natif** réutilisable et d'une **interface multiplateforme** :

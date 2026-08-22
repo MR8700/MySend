@@ -123,9 +123,31 @@ impl SignedContactInvitation {
 
         Ok(format!("nova://invite?d={}{}", hex::encode(ticket_cbor), onion_suffix))
     }
+}
 
-    /// Parses a URI, link, or hex string into a `SignedContactInvitation`.
-    pub fn from_uri_or_code(input: &str) -> Result<Self, InvitationError> {
+/// Result of parsing a pasted invitation code/URI/link: either a fully signed, time-limited
+/// ticket (the normal path — see [`SignedContactInvitation::create`]), or a bare legacy prekey
+/// bundle with no signature or deadline of its own (the fallback the UI shows when it cannot
+/// mint a signed ticket — see `get_own_prekey_bundle_hex` on the Tauri side).
+///
+/// An earlier version of this parser collapsed both cases into a `SignedContactInvitation` by
+/// wrapping the legacy bundle in one with an empty `signature`. That made the two
+/// indistinguishable once returned, so every caller had to remember to special-case an empty
+/// signature *before* calling `.verify()` — and `NovaEngine::add_contact` didn't, so a perfectly
+/// valid legacy code was rejected every single time with a signature-length error. Two explicit
+/// variants make that mistake impossible to repeat: there is no `.verify()` to forget to skip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParsedInvitation {
+    Signed(SignedContactInvitation),
+    LegacyBundle(PreKeyBundle),
+}
+
+impl ParsedInvitation {
+    /// Parses a URI, link, or bare hex string into either a signed invitation ticket or a
+    /// legacy prekey bundle. Performs no verification — callers MUST call
+    /// [`SignedContactInvitation::verify`] or [`verify_prekey_bundle`] respectively before
+    /// trusting the result.
+    pub fn parse(input: &str) -> Result<Self, InvitationError> {
         let trimmed = input.trim();
         let hex_data = if let Some(idx) = trimmed.find("?d=") {
             let after = &trimmed[idx + 3..];
@@ -146,26 +168,12 @@ impl SignedContactInvitation {
         let bytes = hex::decode(&clean_hex)
             .map_err(|e| InvitationError::MalformedUri(format!("Hex decode error: {e}")))?;
 
-        // Try decoding as SignedContactInvitation
         if let Ok(ticket) = ciborium::from_reader::<SignedContactInvitation, _>(bytes.as_slice()) {
-            return Ok(ticket);
+            return Ok(ParsedInvitation::Signed(ticket));
         }
 
-        // Fallback: if it was raw PreKeyBundle bytes (legacy support), wrap it in a SignedContactInvitation
         if let Ok(bundle) = ciborium::from_reader::<PreKeyBundle, _>(bytes.as_slice()) {
-            let payload = ContactInvitationPayload {
-                version: 0,
-                created_at_utc: chrono::Utc::now().timestamp(),
-                expires_at_utc: i64::MAX, // legacy format has no deadline
-                bundle,
-                rendezvous_addrs: Vec::new(),
-            };
-            let mut payload_cbor = Vec::new();
-            let _ = ciborium::into_writer(&payload, &mut payload_cbor);
-            return Ok(Self {
-                payload_cbor,
-                signature: Vec::new(),
-            });
+            return Ok(ParsedInvitation::LegacyBundle(bundle));
         }
 
         Err(InvitationError::MalformedUri("Données d'invitation non valides".into()))
@@ -208,9 +216,35 @@ mod tests {
         let uri = invitation.to_uri().unwrap();
         assert!(uri.starts_with("nova://invite?d="));
 
-        let parsed = SignedContactInvitation::from_uri_or_code(&uri).unwrap();
-        let verified_parsed = parsed.verify(now).unwrap();
+        let parsed = ParsedInvitation::parse(&uri).unwrap();
+        let ticket = match parsed {
+            ParsedInvitation::Signed(t) => t,
+            ParsedInvitation::LegacyBundle(_) => panic!("expected a signed ticket, got a legacy bundle"),
+        };
+        let verified_parsed = ticket.verify(now).unwrap();
         assert_eq!(verified_parsed, verified);
+    }
+
+    /// The exact bug from the 2026-08-22 audit: the UI's fallback "share code" (a bare hex
+    /// prekey bundle, no `nova://` wrapper) used to be parsed into an unsigned ticket that could
+    /// never pass `.verify()`, so `add_contact` rejected it unconditionally. `ParsedInvitation`
+    /// must surface it as `LegacyBundle` instead, verifiable via `verify_prekey_bundle` directly.
+    #[test]
+    fn test_legacy_bare_hex_bundle_parses_as_legacy_and_verifies() {
+        let (_bob_id, bob_bundle) = test_identity_and_bundle("bob");
+
+        let mut bundle_cbor = Vec::new();
+        ciborium::into_writer(&bob_bundle, &mut bundle_cbor).unwrap();
+        let bare_hex = hex::encode(bundle_cbor);
+
+        let parsed = ParsedInvitation::parse(&bare_hex).unwrap();
+        match parsed {
+            ParsedInvitation::LegacyBundle(bundle) => {
+                assert_eq!(bundle, bob_bundle);
+                verify_prekey_bundle(&bundle).expect("legacy bundle signature must still verify");
+            }
+            ParsedInvitation::Signed(_) => panic!("expected a legacy bundle, got a signed ticket"),
+        }
     }
 
     #[test]

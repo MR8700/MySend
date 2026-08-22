@@ -16,3 +16,9 @@ thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
 igd-next.workspace = true
+
+[dev-dependencies]
+# Only for udp_fallback's integration tests, which run a real nova-server in-process to verify
+# the fallback client against — nova-server has no dependency back on nova-transport, so this
+# creates no cycle.
+nova-server = { path = "../../server" }

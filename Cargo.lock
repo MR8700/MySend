@@ -3489,10 +3489,12 @@ dependencies = [
 name = "nova-desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "libp2p",
  "nova-crypto",
  "nova-engine",
+ "nova-protocol",
  "nova-storage",
  "nova-transport",
  "rand 0.8.7",
@@ -3519,7 +3521,9 @@ dependencies = [
  "nova-transport",
  "rand 0.8.7",
  "serde",
+ "serde_bytes",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -3535,6 +3539,7 @@ dependencies = [
  "hex",
  "nova-crypto",
  "serde",
+ "serde_bytes",
  "serde_json",
  "thiserror 1.0.69",
  "uuid",
@@ -3585,6 +3590,7 @@ dependencies = [
  "libp2p",
  "nova-crypto",
  "nova-protocol",
+ "nova-server",
  "serde",
  "thiserror 1.0.69",
  "tokio",
@@ -4885,6 +4891,16 @@ dependencies = [
  "serde",
  "serde_core",
  "typeid",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

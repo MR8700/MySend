@@ -1,0 +1,45 @@
+# cargo-deny configuration — J0 (audit du 2026-08-22).
+#
+# Fait échouer la CI sur toute dépendance ayant une CVE de sévérité connue non
+# explicitement acceptée ci-dessous, et sur toute licence incompatible avec
+# MIT OR Apache-2.0 (la licence du workspace, voir Cargo.toml).
+#
+# Usage local : `cargo install cargo-deny --locked && cargo deny check`
+
+[graph]
+targets = []
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = [
+    # Aucune CVE acceptée pour le moment. Toute entrée ici DOIT porter un
+    # commentaire expliquant pourquoi elle est sans risque pour NOVA Chat et
+    # une date de réexamen.
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

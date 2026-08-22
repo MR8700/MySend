@@ -285,9 +285,88 @@ fn get_conversations(state: State<'_, AppState>) -> Result<Vec<ConversationRecor
     state.engine.get_conversations().map_err(engine_err)
 }
 
+/// Manually re-attempts delivery of a message the outbox already gave up on (status `Failed`,
+/// after `OUTBOX_GIVE_UP_AFTER_SECS` of failed automatic retries) — the "Réessayer" action next
+/// to a failed message bubble.
+#[tauri::command]
+async fn retry_failed_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    recipient_peer_id: String,
+    message_id: String,
+) -> Result<MessageRecord, String> {
+    state
+        .engine
+        .retry_failed_message(&conversation_id, &recipient_peer_id, &message_id)
+        .await
+        .map_err(engine_err)
+}
+
 #[tauri::command]
 fn get_messages(state: State<'_, AppState>, conversation_id: String) -> Result<Vec<MessageRecord>, String> {
     state.engine.get_messages(&conversation_id).map_err(engine_err)
+}
+
+#[tauri::command]
+fn search_messages(state: State<'_, AppState>, query: String) -> Result<Vec<MessageRecord>, String> {
+    state.engine.search_messages(&query).map_err(engine_err)
+}
+
+/// Sends a media message (image/video/audio/file). `data_base64` is the file's contents base64-
+/// encoded — the frontend already produces this via `FileReader.readAsDataURL` for the preview,
+/// so no extra encoding step is needed there; decoded back to real bytes here before the engine
+/// splits it into wire chunks (see `nova_engine::NovaEngine::send_media`). A plain `Vec<u8>`
+/// argument would let Tauri's JSON IPC serialize it as an array of numbers instead, which for an
+/// 8+ MB file is considerably larger on the wire than base64 — this is a deliberate choice, not
+/// an oversight.
+#[tauri::command]
+async fn send_media(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    recipient_peer_id: String,
+    content_type: String,
+    file_name: String,
+    mime_type: String,
+    data_base64: String,
+    caption: String,
+) -> Result<MessageRecord, String> {
+    let content_type = parse_content_type(&content_type)?;
+    let bytes = base64_decode(&data_base64).map_err(|e| format!("invalid base64 payload: {e}"))?;
+    state
+        .engine
+        .send_media(&conversation_id, &recipient_peer_id, content_type, file_name, mime_type, bytes, caption)
+        .await
+        .map_err(engine_err)
+}
+
+/// Fetches one message's attachment data on demand, base64-encoded for the frontend to turn
+/// directly into a data URL (`data:<mime>;base64,<this>`) — never sent inline with
+/// `get_messages`, so opening/polling a conversation never has to move megabytes of media it
+/// isn't displaying yet.
+#[tauri::command]
+fn get_attachment_data(state: State<'_, AppState>, message_id: String) -> Result<Option<String>, String> {
+    let bytes = state.engine.get_attachment_data(&message_id).map_err(engine_err)?;
+    Ok(bytes.map(|b| base64_encode(&b)))
+}
+
+fn parse_content_type(s: &str) -> Result<nova_protocol::MessageContentType, String> {
+    match s {
+        "image" | "Image" => Ok(nova_protocol::MessageContentType::Image),
+        "video" | "Video" => Ok(nova_protocol::MessageContentType::Video),
+        "audio" | "voice" | "Audio" => Ok(nova_protocol::MessageContentType::Audio),
+        "file" | "File" => Ok(nova_protocol::MessageContentType::File),
+        other => Err(format!("unsupported media content_type: {other}")),
+    }
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Real connection diagnostics for one peer (transport mode, measured latency of the last
@@ -438,8 +517,12 @@ pub fn run() {
             block_contact,
             unblock_contact,
             send_message,
+            send_media,
+            get_attachment_data,
+            retry_failed_message,
             get_conversations,
             get_messages,
+            search_messages,
             get_diagnostics,
             get_own_full_listen_addrs,
             get_bootstrap_addr,

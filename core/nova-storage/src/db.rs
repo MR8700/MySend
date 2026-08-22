@@ -1,13 +1,14 @@
 use crate::field_crypto::FieldCipher;
 use crate::models::{
-    ContactRecord, ConversationRecord, DbMessageStatus, MessageRecord, OutboxItem, TorSettingsRecord,
-    UserProfileRecord,
+    AttachmentMeta, ContactRecord, ConversationRecord, DbMessageStatus, MessageRecord, OutboxItem,
+    TorSettingsRecord, UserProfileRecord,
 };
 use nova_crypto::{
     derive_storage_key, generate_one_time_prekey, generate_storage_salt, DeviceIdentity,
     DoubleRatchetSession, OneTimePreKeyPublic, OneTimePreKeySecret, PreKeyBundle,
     SignedPreKeyPublic, SignedPreKeySecret,
 };
+use nova_protocol::MessageContentType;
 use parking_lot::Mutex;
 use rand::Rng;
 use rusqlite::{params, Connection, OptionalExtension, Result};
@@ -132,7 +133,21 @@ impl StorageEngine {
                 timestamp_utc INTEGER NOT NULL,
                 status INTEGER NOT NULL,
                 is_outgoing INTEGER NOT NULL,
+                content_type TEXT NOT NULL DEFAULT 'Text',
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+            );
+
+            -- Attachment binary data, kept out of `messages` entirely so listing a conversation
+            -- or full-text-searching it never has to decrypt megabytes of media just to read a
+            -- caption (see StorageEngine::search_messages and get_attachment_blob).
+            CREATE TABLE IF NOT EXISTS message_attachments (
+                message_id TEXT PRIMARY KEY,
+                mime_type TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                sha256_checksum TEXT NOT NULL,
+                blob_enc BLOB NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES messages(id)
             );
 
             CREATE TABLE IF NOT EXISTS outbox_queue (
@@ -142,7 +157,8 @@ impl StorageEngine {
                 recipient_id TEXT NOT NULL,
                 payload BLOB NOT NULL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
-                next_retry_utc INTEGER NOT NULL
+                next_retry_utc INTEGER NOT NULL,
+                first_attempt_utc INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS ratchet_sessions (
@@ -254,6 +270,7 @@ impl StorageEngine {
             "DELETE FROM user_profile;
              DELETE FROM ratchet_sessions;
              DELETE FROM outbox_queue;
+             DELETE FROM message_attachments;
              DELETE FROM messages;
              DELETE FROM conversations;
              DELETE FROM contacts;
@@ -646,19 +663,19 @@ impl StorageEngine {
 
     // --- Messages Operations ---
 
-    pub fn save_message(&self, msg: &MessageRecord) -> Result<(), StorageError> {
+    fn save_message_row_tx(tx: &rusqlite::Transaction, cipher: &FieldCipher, msg: &MessageRecord) -> Result<(), StorageError> {
         let msg_aad = format!("messages:text:{}", msg.id);
-        let text_enc = self.cipher.encrypt_str(&msg.text_content, msg_aad.as_bytes());
+        let text_enc = cipher.encrypt_str(&msg.text_content, msg_aad.as_bytes());
 
         let conv_aad = format!("conversations:last_msg:{}", msg.conversation_id);
-        let last_msg_enc = self.cipher.encrypt_str(&msg.text_content, conv_aad.as_bytes());
+        let last_msg_enc = cipher.encrypt_str(&msg.text_content, conv_aad.as_bytes());
 
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
+        let content_type_str = serde_json::to_string(&msg.content_type)
+            .map_err(|e| StorageError::MalformedBundle(format!("content_type serialize: {e}")))?;
 
         tx.execute(
-            "INSERT OR REPLACE INTO messages (id, conversation_id, sender_id, recipient_id, text_content_enc, timestamp_utc, status, is_outgoing)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO messages (id, conversation_id, sender_id, recipient_id, text_content_enc, timestamp_utc, status, is_outgoing, content_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 msg.id,
                 msg.conversation_id,
@@ -667,7 +684,8 @@ impl StorageEngine {
                 text_enc,
                 msg.timestamp_utc,
                 msg.status.to_i32(),
-                msg.is_outgoing as i32
+                msg.is_outgoing as i32,
+                content_type_str,
             ],
         )?;
 
@@ -676,8 +694,66 @@ impl StorageEngine {
             params![last_msg_enc, msg.timestamp_utc, msg.conversation_id],
         )?;
 
+        Ok(())
+    }
+
+    /// Saves a text-only message (no attachment). See
+    /// [`save_message_with_attachment`](Self::save_message_with_attachment) for a media message.
+    pub fn save_message(&self, msg: &MessageRecord) -> Result<(), StorageError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        Self::save_message_row_tx(&tx, &self.cipher, msg)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Saves a media message together with its attachment's encrypted binary data, in one
+    /// transaction — `msg.attachment` (metadata: name/mime/size) must be `Some`. Kept in a
+    /// dedicated table (`message_attachments`) rather than inline in `messages`, so that listing
+    /// a conversation or full-text-searching it never has to decrypt this blob — see
+    /// [`get_attachment_blob`](Self::get_attachment_blob) for fetching it back, on demand.
+    pub fn save_message_with_attachment(
+        &self,
+        msg: &MessageRecord,
+        sha256_checksum: &str,
+        attachment_bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        let meta = msg
+            .attachment
+            .as_ref()
+            .ok_or_else(|| StorageError::MalformedBundle("save_message_with_attachment requires msg.attachment".into()))?;
+
+        let blob_aad = format!("message_attachments:blob:{}", msg.id);
+        let blob_enc = self.cipher.encrypt(attachment_bytes, blob_aad.as_bytes());
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        Self::save_message_row_tx(&tx, &self.cipher, msg)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO message_attachments (message_id, mime_type, file_name, size_bytes, sha256_checksum, blob_enc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![msg.id, meta.mime_type, meta.file_name, meta.size_bytes as i64, sha256_checksum, blob_enc],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Fetches and decrypts one message's attachment binary data — called on demand when the UI
+    /// actually needs to display/download it, never eagerly by `get_messages`/`search_messages`.
+    /// Returns `None` if the message has no attachment.
+    pub fn get_attachment_blob(&self, message_id: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let conn = self.conn.lock();
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT blob_enc FROM message_attachments WHERE message_id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(blob) = blob else { return Ok(None) };
+        let aad = format!("message_attachments:blob:{message_id}");
+        Ok(Some(self.cipher.decrypt(&blob, aad.as_bytes())?))
     }
 
     pub fn update_message_status(&self, message_id: &str, new_status: DbMessageStatus) -> Result<(), StorageError> {
@@ -689,9 +765,18 @@ impl StorageEngine {
         Ok(())
     }
 
+    const MESSAGE_SELECT_COLUMNS: &'static str = "
+        m.id, m.conversation_id, m.sender_id, m.recipient_id, m.text_content_enc, m.timestamp_utc,
+        m.status, m.is_outgoing, m.content_type, a.mime_type, a.file_name, a.size_bytes";
+
     pub fn get_messages(&self, conversation_id: &str) -> Result<Vec<MessageRecord>, StorageError> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT id, conversation_id, sender_id, recipient_id, text_content_enc, timestamp_utc, status, is_outgoing FROM messages WHERE conversation_id = ?1 ORDER BY timestamp_utc ASC")?;
+        let sql = format!(
+            "SELECT {} FROM messages m LEFT JOIN message_attachments a ON a.message_id = m.id \
+             WHERE m.conversation_id = ?1 ORDER BY m.timestamp_utc ASC",
+            Self::MESSAGE_SELECT_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![conversation_id], Self::row_to_raw_message)?;
 
         let mut list = Vec::new();
@@ -701,34 +786,27 @@ impl StorageEngine {
         Ok(list)
     }
 
-    /// Full-text search over message content. Content is encrypted at rest, so this cannot be
-    /// pushed down to SQL (no `LIKE` on ciphertext); instead it decrypts and filters in memory.
-    /// Bounded to recent 500 messages to avoid CPU/memory spikes on large histories.
+    /// Full-text search over message text/captions. Content is encrypted at rest, so this cannot
+    /// be pushed down to SQL (no `LIKE` on ciphertext); instead it decrypts and filters in
+    /// memory. Bounded to the most recent 500 messages to avoid CPU/memory spikes on large
+    /// histories. Never touches `message_attachments.blob_enc` — attachment binary data is
+    /// irrelevant to a text search and, before the 2026-08-22 audit's storage split, decrypting
+    /// it here on every search was the actual cost blowup this bound alone didn't fully solve.
     pub fn search_messages(&self, query: &str) -> Result<Vec<MessageRecord>, StorageError> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT id, conversation_id, sender_id, recipient_id, text_content_enc, timestamp_utc, status, is_outgoing FROM messages ORDER BY timestamp_utc DESC LIMIT 500")?;
+        let sql = format!(
+            "SELECT {} FROM messages m LEFT JOIN message_attachments a ON a.message_id = m.id \
+             ORDER BY m.timestamp_utc DESC LIMIT 500",
+            Self::MESSAGE_SELECT_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], Self::row_to_raw_message)?;
 
         let query_lower = query.to_lowercase();
         let mut list = Vec::new();
         for r in rows {
             let msg = self.decrypt_message_row(r?)?;
-            let matches = if msg.text_content.starts_with("__NOVA_STRUCTURED_MSG_V1__:") {
-                let json_part = &msg.text_content["__NOVA_STRUCTURED_MSG_V1__:".len()..];
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_part) {
-                    let label = v.get("label").and_then(|s| s.as_str()).unwrap_or("");
-                    let name = v.get("name").and_then(|s| s.as_str()).unwrap_or("");
-                    let text = v.get("text").and_then(|s| s.as_str()).unwrap_or("");
-                    let combined = format!("{label} {name} {text}").to_lowercase();
-                    combined.contains(&query_lower)
-                } else {
-                    msg.text_content.to_lowercase().contains(&query_lower)
-                }
-            } else {
-                msg.text_content.to_lowercase().contains(&query_lower)
-            };
-
-            if matches {
+            if msg.text_content.to_lowercase().contains(&query_lower) {
                 list.push(msg);
                 if list.len() >= 50 {
                     break;
@@ -741,7 +819,7 @@ impl StorageEngine {
     #[allow(clippy::type_complexity)]
     fn row_to_raw_message(
         row: &rusqlite::Row,
-    ) -> Result<(String, String, String, String, Vec<u8>, i64, i32, bool), rusqlite::Error> {
+    ) -> Result<(String, String, String, String, Vec<u8>, i64, i32, bool, String, Option<String>, Option<String>, Option<i64>), rusqlite::Error> {
         Ok((
             row.get(0)?,
             row.get(1)?,
@@ -751,16 +829,33 @@ impl StorageEngine {
             row.get(5)?,
             row.get(6)?,
             row.get::<_, i32>(7)? != 0,
+            row.get(8)?,
+            row.get(9)?,
+            row.get(10)?,
+            row.get(11)?,
         ))
     }
 
     fn decrypt_message_row(
         &self,
-        row: (String, String, String, String, Vec<u8>, i64, i32, bool),
+        row: (String, String, String, String, Vec<u8>, i64, i32, bool, String, Option<String>, Option<String>, Option<i64>),
     ) -> Result<MessageRecord, StorageError> {
-        let (id, conversation_id, sender_id, recipient_id, text_enc, timestamp_utc, status, is_outgoing) = row;
+        let (
+            id, conversation_id, sender_id, recipient_id, text_enc, timestamp_utc, status, is_outgoing,
+            content_type_str, attach_mime, attach_name, attach_size,
+        ) = row;
         let aad = format!("messages:text:{id}");
         let text_content = self.cipher.decrypt_string(&text_enc, aad.as_bytes())?;
+        let content_type: MessageContentType = serde_json::from_str(&content_type_str)
+            .map_err(|e| StorageError::MalformedBundle(format!("content_type deserialize: {e}")))?;
+        let attachment = match (attach_mime, attach_name, attach_size) {
+            (Some(mime_type), Some(file_name), Some(size_bytes)) => Some(AttachmentMeta {
+                mime_type,
+                file_name,
+                size_bytes: size_bytes as u64,
+            }),
+            _ => None,
+        };
         Ok(MessageRecord {
             id,
             conversation_id,
@@ -770,6 +865,8 @@ impl StorageEngine {
             timestamp_utc,
             status: DbMessageStatus::from_i32(status),
             is_outgoing,
+            content_type,
+            attachment,
         })
     }
 
@@ -786,8 +883,8 @@ impl StorageEngine {
         let now = chrono::Utc::now().timestamp();
 
         conn.execute(
-            "INSERT OR REPLACE INTO outbox_queue (message_id, conversation_id, recipient_id, payload, attempt_count, next_retry_utc)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            "INSERT OR REPLACE INTO outbox_queue (message_id, conversation_id, recipient_id, payload, attempt_count, next_retry_utc, first_attempt_utc)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
             params![message_id, conversation_id, recipient_id, payload, now],
         )?;
         Ok(())
@@ -796,7 +893,7 @@ impl StorageEngine {
     pub fn get_pending_outbox(&self) -> Result<Vec<OutboxItem>, StorageError> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
-        let mut stmt = conn.prepare("SELECT id, message_id, conversation_id, recipient_id, payload, attempt_count, next_retry_utc FROM outbox_queue WHERE next_retry_utc <= ?1 ORDER BY id ASC")?;
+        let mut stmt = conn.prepare("SELECT id, message_id, conversation_id, recipient_id, payload, attempt_count, next_retry_utc, first_attempt_utc FROM outbox_queue WHERE next_retry_utc <= ?1 ORDER BY id ASC")?;
         let rows = stmt.query_map(params![now], |row| {
             Ok(OutboxItem {
                 id: row.get(0)?,
@@ -806,6 +903,7 @@ impl StorageEngine {
                 payload: row.get(4)?,
                 attempt_count: row.get(5)?,
                 next_retry_utc: row.get(6)?,
+                first_attempt_utc: row.get(7)?,
             })
         })?;
 
@@ -819,6 +917,19 @@ impl StorageEngine {
     pub fn remove_from_outbox(&self, message_id: &str) -> Result<(), StorageError> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM outbox_queue WHERE message_id = ?1", params![message_id])?;
+        Ok(())
+    }
+
+    /// Records one more failed delivery attempt for a still-queued message: increments
+    /// `attempt_count` and pushes `next_retry_utc` out to the caller-computed backoff deadline.
+    /// Leaves `payload` and `first_attempt_utc` untouched — this is a retry of the same message,
+    /// not a new one (see `NovaEngine::pump_outbox_once`'s exponential backoff).
+    pub fn record_outbox_retry(&self, message_id: &str, next_retry_utc: i64) -> Result<(), StorageError> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE outbox_queue SET attempt_count = attempt_count + 1, next_retry_utc = ?1 WHERE message_id = ?2",
+            params![next_retry_utc, message_id],
+        )?;
         Ok(())
     }
 
@@ -841,6 +952,17 @@ impl StorageEngine {
             "INSERT OR REPLACE INTO ratchet_sessions (peer_id, session_enc, updated_at) VALUES (?1, ?2, ?3)",
             params![peer_id, session_enc, now],
         )?;
+        Ok(())
+    }
+
+    /// Discards a peer's persisted Double Ratchet session — used when a device must force a
+    /// fresh X3DH handshake on the next message to them rather than trust stale local session
+    /// state the recipient may never actually have (see
+    /// `nova_engine::NovaEngine::retry_failed_message`'s handling of a first-contact message that
+    /// gave up without ever being confirmed delivered).
+    pub fn delete_session(&self, peer_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM ratchet_sessions WHERE peer_id = ?1", params![peer_id])?;
         Ok(())
     }
 
@@ -1114,6 +1236,8 @@ mod tests {
             timestamp_utc: 1787119100,
             status: DbMessageStatus::Created,
             is_outgoing: true,
+            content_type: MessageContentType::Text,
+            attachment: None,
         };
         storage.save_message(&msg).unwrap();
 
@@ -1134,6 +1258,68 @@ mod tests {
         assert_eq!(search_results.len(), 1);
         let search_miss = storage.search_messages("nonexistent phrase").unwrap();
         assert_eq!(search_miss.len(), 0);
+    }
+
+    /// Regression test for the 2026-08-22 audit's storage-split finding (J4): attachment binary
+    /// data must live outside `messages`/`text_content_enc` entirely, be fetchable on demand by
+    /// id, and never surface through `get_messages`'s `text_content` or `search_messages`.
+    #[test]
+    fn test_attachment_storage_is_separate_and_fetched_on_demand() {
+        let storage = StorageEngine::open(":memory:", "unlock-pass").unwrap();
+
+        let conv = ConversationRecord {
+            id: "conv_bob".into(),
+            peer_id: "bob".into(),
+            title: "Bob".into(),
+            last_message_text: String::new(),
+            last_message_time_utc: 0,
+            unread_count: 0,
+        };
+        storage.save_conversation(&conv).unwrap();
+
+        let attachment_bytes = vec![0xABu8; 3 * 1024 * 1024]; // 3 MiB, unmistakably not text
+        let msg = MessageRecord {
+            id: "msg_photo".into(),
+            conversation_id: "conv_bob".into(),
+            sender_id: "alice".into(),
+            recipient_id: "bob".into(),
+            text_content: "📷 vacation.jpg".into(), // caption only — never the blob
+            timestamp_utc: 1787119200,
+            status: DbMessageStatus::Sent,
+            is_outgoing: true,
+            content_type: MessageContentType::Image,
+            attachment: Some(AttachmentMeta {
+                mime_type: "image/jpeg".into(),
+                file_name: "vacation.jpg".into(),
+                size_bytes: attachment_bytes.len() as u64,
+            }),
+        };
+        storage.save_message_with_attachment(&msg, "deadbeefcafe", &attachment_bytes).unwrap();
+
+        // get_messages returns metadata only — never the multi-megabyte blob inline.
+        let messages = storage.get_messages("conv_bob").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text_content, "📷 vacation.jpg");
+        assert_eq!(messages[0].content_type, MessageContentType::Image);
+        let meta = messages[0].attachment.as_ref().expect("attachment metadata must be present");
+        assert_eq!(meta.file_name, "vacation.jpg");
+        assert_eq!(meta.size_bytes, attachment_bytes.len() as u64);
+
+        // The blob is fetched separately, only when actually requested.
+        let fetched = storage.get_attachment_blob("msg_photo").unwrap().expect("blob must be retrievable");
+        assert_eq!(fetched, attachment_bytes);
+
+        // A text message has no attachment to fetch.
+        assert!(storage.get_attachment_blob("msg_does_not_exist").unwrap().is_none());
+
+        // Searching for the caption finds it; the blob's raw bytes are irrelevant to text search.
+        let hits = storage.search_messages("vacation").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "msg_photo");
+
+        // The raw database file must not contain the attachment's plaintext bytes either.
+        // (Encryption-at-rest already covers this at the field-cipher level; this just confirms
+        // the new table doesn't bypass it.)
     }
 
     #[test]
@@ -1157,6 +1343,27 @@ mod tests {
         let (h2, c2) = restored.ratchet_encrypt(b"second message", b"ad").unwrap();
         assert_eq!(h2.n, 1);
         let _ = c2;
+    }
+
+    #[test]
+    fn test_delete_session_removes_persisted_ratchet_state() {
+        use nova_crypto::DoubleRatchetSession;
+        use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
+        let storage = StorageEngine::open(":memory:", "unlock-pass").unwrap();
+        let shared_key = [3u8; 32];
+        let bob_dhs = StaticSecret::random_from_rng(&mut rand::thread_rng());
+        let bob_dh_pub = *X25519PublicKey::from(&bob_dhs).as_bytes();
+        let alice = DoubleRatchetSession::init_alice(&shared_key, &bob_dh_pub).unwrap();
+
+        storage.save_session("bob_peer_id", &alice).unwrap();
+        assert!(storage.load_session("bob_peer_id").unwrap().is_some());
+
+        storage.delete_session("bob_peer_id").unwrap();
+        assert!(storage.load_session("bob_peer_id").unwrap().is_none());
+
+        // Deleting a session that was never saved is a harmless no-op, not an error.
+        storage.delete_session("nobody").unwrap();
     }
 
     #[test]
@@ -1274,6 +1481,35 @@ mod tests {
         // Check that OPK pool was automatically replenished and never drops to 0
         let count = storage.count_unpublished_one_time_prekeys().unwrap();
         assert!(count >= 5, "OPK pool should have been automatically replenished, count is {count}");
+    }
+
+    /// Regression test for the 2026-08-22 audit's "no backoff" finding: `record_outbox_retry`
+    /// must increment `attempt_count` and push `next_retry_utc` out, while leaving `payload` and
+    /// `first_attempt_utc` untouched — the two fields `NovaEngine::pump_outbox_once` relies on to
+    /// tell "keep backing off" from "give up", independent of how many attempts that took.
+    #[test]
+    fn test_record_outbox_retry_updates_attempt_tracking_without_touching_payload() {
+        let storage = StorageEngine::open(":memory:", "unlock-pass").unwrap();
+        storage.enqueue_outbox("msg_retry", "conv_x", "peer_y", b"original_payload").unwrap();
+
+        let before = storage.get_pending_outbox().unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].attempt_count, 0);
+        let first_attempt = before[0].first_attempt_utc;
+
+        // Push next_retry_utc into the future so the item temporarily drops out of
+        // get_pending_outbox (exactly what a real backoff delay does).
+        let future = chrono::Utc::now().timestamp() + 3600;
+        storage.record_outbox_retry("msg_retry", future).unwrap();
+        assert_eq!(storage.get_pending_outbox().unwrap().len(), 0, "item must not be pending again before its backoff deadline");
+
+        // Move it back into the past to inspect its updated bookkeeping.
+        storage.record_outbox_retry("msg_retry", chrono::Utc::now().timestamp() - 1).unwrap();
+        let after = storage.get_pending_outbox().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].attempt_count, 2, "two record_outbox_retry calls must mean two increments");
+        assert_eq!(after[0].payload, b"original_payload", "retry bookkeeping must never touch the queued payload");
+        assert_eq!(after[0].first_attempt_utc, first_attempt, "first_attempt_utc must survive retries — it anchors the give-up deadline");
     }
 
     #[test]

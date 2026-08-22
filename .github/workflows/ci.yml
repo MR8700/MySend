@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # J0 — audit des dépendances tierces (aucune CVE connue non acceptée, licences autorisées).
+  # Volontairement le premier job à s'exécuter : un problème de dépendance doit bloquer avant
+  # même de dépenser du temps de build sur le reste de la CI.
+  dependency-audit:
+    name: cargo-deny (CVE & licences)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --workspace
+
+  build-and-test:
+    name: build + test (workspace)
+    needs: dependency-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test (workspace)
+        run: cargo test --workspace --all-features
+
+  # J6 — fuzzing best-effort des décodeurs qui parsent des octets non fiables reçus du réseau
+  # (voir fuzz/README.md). Budget de temps fixe, non bloquant : détecte les panics/DoS qu'une
+  # revue manuelle ne peut pas couvrir de façon exhaustive, sans ralentir chaque PR.
+  fuzz-smoke:
+    name: fuzz smoke test (best-effort, non bloquant)
+    needs: dependency-audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz each target for 60s
+        working-directory: fuzz
+        run: |
+          for target in $(cargo fuzz list); do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" -- -max_total_time=60 || exit 1
+            echo "::endgroup::"
+          done

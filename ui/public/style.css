@@ -1213,6 +1213,28 @@ button:disabled,
     filter: drop-shadow(0 0 4px rgba(34, 197, 94, 0.5));
 }
 
+.status-tick-failed {
+    color: var(--status-danger);
+    display: inline-flex;
+    font-size: 12px;
+}
+
+.status-retry-btn {
+    margin-left: 6px;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--status-danger);
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-decoration: underline;
+}
+
+.status-retry-btn:hover {
+    opacity: 0.8;
+}
+
 /* Media Queries for Desktop & Tablet Responsiveness */
 @media (min-width: 768px) {
     .screen-container {

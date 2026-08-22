@@ -1,0 +1,48 @@
+[package]
+name = "nova-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nova-protocol = { path = "../core/nova-protocol" }
+
+# Deliberately its own workspace, separate from the main one at the repo root: cargo-fuzz targets
+# need the nightly toolchain and libFuzzer instrumentation, which the rest of the workspace must
+# never be built with. This is the same layout `cargo fuzz init` generates by default.
+[workspace]
+
+[[bin]]
+name = "nova_packet_from_cbor"
+path = "fuzz_targets/nova_packet_from_cbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_payload_from_bytes"
+path = "fuzz_targets/message_payload_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dht_peer_record_from_bytes"
+path = "fuzz_targets/dht_peer_record_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_request_from_bytes"
+path = "fuzz_targets/server_request_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
