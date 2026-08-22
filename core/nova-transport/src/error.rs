@@ -4,22 +4,24 @@ use thiserror::Error;
 pub enum TransportError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("TLS/QUIC setup error: {0}")]
-    Tls(#[from] crate::quic_config::TlsSetupError),
-    #[error("rendezvous server error: {0}")]
-    Rendezvous(#[from] crate::rendezvous::RendezvousError),
-    #[error("no async runtime available for the QUIC endpoint")]
-    NoAsyncRuntime,
-    #[error("peer address returned by the rendezvous server is invalid")]
-    InvalidPeerAddress,
-    #[error("QUIC connect error: {0}")]
-    Connect(#[from] quinn::ConnectError),
-    #[error("QUIC connection error: {0}")]
-    Connection(#[from] quinn::ConnectionError),
-    #[error("QUIC stream write error: {0}")]
-    Write(#[from] quinn::WriteError),
-    #[error("QUIC stream read error: {0}")]
-    Read(#[from] quinn::ReadToEndError),
-    #[error("QUIC stream close error: {0}")]
-    Closed(#[from] quinn::ClosedStream),
+    #[error("protocol encode/decode error: {0}")]
+    Protocol(#[from] nova_protocol::ProtocolError),
+    #[error("DHT record signature invalid: {0}")]
+    DhtRecord(#[from] nova_protocol::DhtRecordError),
+    #[error("Kademlia DHT operation failed: {0}")]
+    Dht(String),
+    #[error("failed to dial peer: {0}")]
+    Dial(String),
+    #[error("failed to send request to peer: {0}")]
+    Send(String),
+    #[error("the P2P background task is no longer running")]
+    SwarmTaskGone,
+    #[error("operation timed out")]
+    Timeout,
+    #[error("peer is not reachable: no DHT record found")]
+    PeerNotFound,
+    #[error("libp2p transport setup failed: {0}")]
+    Setup(String),
+    #[error("invalid address: {0}")]
+    InvalidAddress(String),
 }

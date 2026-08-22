@@ -4,7 +4,10 @@
   "private": true,
   "description": "Interface Responsive Multiplateforme NOVA Chat (Mobile, Tablette, PC Desktop)",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "tauri": "tauri"
   },
-  "dependencies": {}
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
 }

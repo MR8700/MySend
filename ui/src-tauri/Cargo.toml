@@ -1,0 +1,28 @@
+[package]
+name = "nova-desktop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "nova_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+nova-crypto = { path = "../../core/nova-crypto" }
+nova-engine = { path = "../../core/nova-engine" }
+nova-storage = { path = "../../core/nova-storage" }
+nova-transport = { path = "../../core/nova-transport" }
+libp2p.workspace = true
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

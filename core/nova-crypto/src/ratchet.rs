@@ -46,6 +46,23 @@ pub struct DoubleRatchetSession {
     mkskipped: HashMap<([u8; 32], u32), Key32>,
 }
 
+impl Clone for DoubleRatchetSession {
+    fn clone(&self) -> Self {
+        Self {
+            dhs: StaticSecret::from(self.dhs.to_bytes()),
+            dhs_pub: self.dhs_pub,
+            dhr: self.dhr,
+            rk: self.rk,
+            cks: self.cks,
+            ckr: self.ckr,
+            ns: self.ns,
+            nr: self.nr,
+            pn: self.pn,
+            mkskipped: self.mkskipped.clone(),
+        }
+    }
+}
+
 impl Drop for DoubleRatchetSession {
     fn drop(&mut self) {
         self.rk.zeroize();
@@ -108,6 +125,11 @@ impl DoubleRatchetSession {
         }
     }
 
+    /// Returns true if this session has an initialized sending chain.
+    pub fn can_send(&self) -> bool {
+        self.cks.is_some()
+    }
+
     /// Encrypt an outgoing message using the Double Ratchet.
     pub fn ratchet_encrypt(
         &mut self,
@@ -147,6 +169,10 @@ impl DoubleRatchetSession {
     }
 
     /// Decrypt an incoming message using the Double Ratchet.
+    ///
+    /// Executes all ratchet and chain transformations in a transactional clone.
+    /// If decryption fails (e.g. invalid AEAD tag, tampered ciphertext, transmission error),
+    /// `self` is left completely unmodified so that the session is never corrupted or desynchronized.
     pub fn ratchet_decrypt(
         &mut self,
         header: &RatchetHeader,
@@ -160,36 +186,53 @@ impl DoubleRatchetSession {
         // 1. Check if we already have a skipped message key for this header
         if let Some(mut mk) = self.mkskipped.remove(&(header.dh_pub, header.n)) {
             let nonce = derive_nonce(&mk, header.n);
-            let plaintext = decrypt_aead(&mk, &nonce, ciphertext, &full_ad)?;
+            let plaintext = match decrypt_aead(&mk, &nonce, ciphertext, &full_ad) {
+                Ok(pt) => pt,
+                Err(e) => {
+                    // Put back the skipped key if decryption fails (or wipe it if corrupted)
+                    mk.zeroize();
+                    return Err(e);
+                }
+            };
             mk.zeroize();
             return Ok(plaintext);
         }
 
+        // Transactional clone for state safety
+        let mut tx_session = self.clone();
         let header_dhr = X25519PublicKey::from(header.dh_pub);
 
         // 2. If new ephemeral DH key received, perform DH Ratchet step
-        if self.dhr.as_ref() != Some(&header_dhr) {
-            self.skip_message_keys(header.pn)?;
-            self.dh_ratchet_step(&header_dhr)?;
+        if tx_session.dhr.as_ref() != Some(&header_dhr) {
+            tx_session.skip_message_keys(header.pn)?;
+            tx_session.dh_ratchet_step(&header_dhr)?;
         }
 
         // 3. Skip messages in current receiving chain up to header.n
-        self.skip_message_keys(header.n)?;
+        tx_session.skip_message_keys(header.n)?;
 
         // 4. Perform symmetric ratchet step to get message key
-        let ckr = self
+        let ckr = tx_session
             .ckr
             .as_ref()
             .ok_or_else(|| CryptoError::RatchetError("Receiving chain not initialized".into()))?;
 
         let (next_ckr, mut msg_key) = kdf_ck(ckr)?;
-        self.ckr = Some(next_ckr);
-        self.nr += 1;
+        tx_session.ckr = Some(next_ckr);
+        tx_session.nr += 1;
 
         let nonce = derive_nonce(&msg_key, header.n);
-        let plaintext = decrypt_aead(&msg_key, &nonce, ciphertext, &full_ad)?;
+        let plaintext = match decrypt_aead(&msg_key, &nonce, ciphertext, &full_ad) {
+            Ok(pt) => pt,
+            Err(e) => {
+                msg_key.zeroize();
+                return Err(e);
+            }
+        };
 
         msg_key.zeroize();
+        // Commit the state only after successful AEAD tag verification!
+        *self = tx_session;
         Ok(plaintext)
     }
 
@@ -224,12 +267,24 @@ impl DoubleRatchetSession {
             return Err(CryptoError::MaxSkippedKeysExceeded);
         }
 
+        const MAX_TOTAL_SKIPPED_KEYS: usize = 200;
+
         if let Some(mut ckr) = self.ckr {
             while self.nr < until {
-                let (next_ckr, mk) = kdf_ck(&ckr)?;
+                let (next_ckr, mut mk) = kdf_ck(&ckr)?;
                 ckr = next_ckr;
                 if let Some(dhr) = self.dhr {
+                    // Evict oldest skipped key if cap reached to prevent memory exhaustion
+                    if self.mkskipped.len() >= MAX_TOTAL_SKIPPED_KEYS {
+                        if let Some(oldest_key) = self.mkskipped.keys().next().cloned() {
+                            if let Some(mut old_val) = self.mkskipped.remove(&oldest_key) {
+                                old_val.zeroize();
+                            }
+                        }
+                    }
                     self.mkskipped.insert((*dhr.as_bytes(), self.nr), mk);
+                } else {
+                    mk.zeroize();
                 }
                 self.nr += 1;
             }

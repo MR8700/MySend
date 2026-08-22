@@ -3,4 +3,29 @@
 Cargo.lock.bak
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 node_modules/
+*.log
+
+# Secrets, Keystores & Clés privées
+*.keystore
+*.jks
+*.p12
+*.key
+*.pem
+*identity*.txt
+storage.key
+
+# Binaires & Paquets
+*.apk
+*.aab
+*.idsig
+
+# Dist & caches
+ui/dist/
+ui/node_modules/
+
+# Outils locaux / logs de build
+.claude/
+check_out.txt

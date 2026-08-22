@@ -1,15 +1,12 @@
 pub mod connection;
+pub mod dht_node;
 pub mod error;
-pub mod hole_punch;
-pub mod node;
-pub mod quic_config;
-pub mod rendezvous;
 pub mod supervisor;
+pub mod tor;
 
 pub use connection::*;
+pub use dht_node::*;
 pub use error::*;
-pub use hole_punch::*;
-pub use node::*;
-pub use quic_config::{build_client_config, build_server_config, NOVA_ALPN};
-pub use rendezvous::*;
+pub use libp2p::Multiaddr;
 pub use supervisor::*;
+pub use tor::{TorConfig, TorManager, TorMode, TorStatus};

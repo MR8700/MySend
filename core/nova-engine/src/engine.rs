@@ -31,6 +31,10 @@ pub enum EngineError {
     Protocol(#[from] nova_protocol::ProtocolError),
     #[error("Storage error: {0}")]
     Storage(#[from] StorageError),
+    #[error("Transport error: {0}")]
+    Transport(#[from] nova_transport::TransportError),
+    #[error("Invitation error: {0}")]
+    Invitation(#[from] nova_protocol::InvitationError),
     #[error("No local identity: create or restore an account first")]
     NoIdentity,
     #[error("No session established with peer: {0}")]
@@ -39,6 +43,8 @@ pub enum EngineError {
     NoContact(String),
     #[error("No local prekeys have been provisioned for this device")]
     NoPrekeys,
+    #[error("An identity already exists on this device — log out first to replace it")]
+    IdentityAlreadyExists,
     #[error("X3DH handshake could not be completed: {0}")]
     HandshakeFailed(String),
     #[error("Packet's claimed sender does not match its envelope — possible spoofing")]
@@ -125,13 +131,30 @@ impl NovaEngine {
         };
 
         let pending = self.storage.get_pending_outbox()?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let futures = pending.into_iter().map(|item| {
+            let node = node.clone();
+            async move {
+                let send_res = node.send_to_peer(&item.recipient_id, item.payload.clone()).await;
+                (item, send_res)
+            }
+        });
+
+        let results = futures_util::future::join_all(futures).await;
         let mut delivered = 0;
-        for item in pending {
-            match node.send_to_peer(&item.recipient_id, item.payload.clone()).await {
-                Ok(mode) => {
+        for (item, send_res) in results {
+            match send_res {
+                Ok(nova_transport::P2PTransportMode::DirectQuic) | Ok(nova_transport::P2PTransportMode::RelayedOpaque) => {
                     self.storage.remove_from_outbox(&item.message_id)?;
-                    debug!("Delivered outbox item {} via {:?}", item.message_id, mode);
+                    let _ = self.storage.update_message_status(&item.message_id, DbMessageStatus::Delivered);
+                    debug!("Delivered outbox item {}", item.message_id);
                     delivered += 1;
+                }
+                Ok(nova_transport::P2PTransportMode::Disconnected) => {
+                    debug!("Outbox item {} deferred: peer unreachable", item.message_id);
                 }
                 Err(e) => debug!("Outbox item {} not yet delivered: {e}", item.message_id),
             }
@@ -142,6 +165,13 @@ impl NovaEngine {
     /// Create a new sovereign account with a 12-word mnemonic phrase, provisioning the X3DH
     /// prekeys this device needs before anyone can establish a session with it.
     pub async fn create_account(&self, username: &str) -> Result<(String, String), EngineError> {
+        // Storage's `save_identity` is `INSERT OR REPLACE` (there is only ever one identity row)
+        // — without this guard, creating an account while one already exists would silently
+        // destroy its keys and mnemonic with no way back. `clear_identity` first if that is
+        // genuinely intended.
+        if self.storage.load_identity()?.is_some() {
+            return Err(EngineError::IdentityAlreadyExists);
+        }
         let mnemonic = MnemonicPhrase::generate()?;
         let identity = DeviceIdentity::from_mnemonic(&mnemonic, username)?;
         let pub_hex = identity.public_id_hex();
@@ -162,6 +192,10 @@ impl NovaEngine {
         mnemonic_phrase: &str,
         username: &str,
     ) -> Result<String, EngineError> {
+        // Same `INSERT OR REPLACE` hazard as `create_account` — see the comment there.
+        if self.storage.load_identity()?.is_some() {
+            return Err(EngineError::IdentityAlreadyExists);
+        }
         let mnemonic = MnemonicPhrase::from_phrase(mnemonic_phrase)?;
         let identity = DeviceIdentity::from_mnemonic(&mnemonic, username)?;
         let pub_hex = identity.public_id_hex();
@@ -174,6 +208,46 @@ impl NovaEngine {
         *self.identity.lock().await = Some(identity);
 
         Ok(pub_hex)
+    }
+
+    /// Loads a previously created/restored identity straight from local encrypted storage,
+    /// without needing the mnemonic re-entered — the entire point of persisting it in the first
+    /// place. Returns `Ok(None)` if this device has never created or restored an account (a
+    /// genuine first run), which is a normal outcome, not an error. Returns the mnemonic
+    /// alongside the peer_id/username because the caller typically also needs to start a
+    /// `P2PNode`, which requires an owned `DeviceIdentity` — cheaper to re-derive one from the
+    /// mnemonic (as every other identity-establishing path in this engine already does) than to
+    /// thread a second reference through `self.identity`'s mutex.
+    pub async fn try_resume_session(&self) -> Result<Option<(String, String, String)>, EngineError> {
+        let Some(identity) = self.storage.load_identity()? else {
+            return Ok(None);
+        };
+        let pub_hex = identity.public_id_hex();
+        let username = identity.username.clone();
+        if self.storage.load_active_signed_prekey()?.is_none() {
+            self.provision_prekeys(&identity)?;
+        }
+        *self.identity.lock().await = Some(identity);
+
+        let mnemonic = self
+            .storage
+            .get_identity_mnemonic()?
+            .ok_or(EngineError::NoIdentity)?;
+        Ok(Some((pub_hex, mnemonic, username)))
+    }
+
+    /// Logs this device out: wipes the local identity, its prekeys, and every contact/
+    /// conversation/message tied to it (see `StorageEngine::clear_all_identity_data`), then
+    /// clears the in-memory identity so a following `create_account`/`restore_account` starts
+    /// from a genuinely clean slate instead of `REPLACE`-ing still-needed key material. Detaches
+    /// the engine from any already-running `P2PNode` (see `attach_network`), but does not shut
+    /// that node down — its background tasks simply idle, orphaned, until the app restarts; the
+    /// caller is expected to allow a fresh `attach_network` for the next identity.
+    pub async fn clear_identity(&self) -> Result<(), EngineError> {
+        self.storage.clear_all_identity_data()?;
+        *self.identity.lock().await = None;
+        *self.network.lock().await = None;
+        Ok(())
     }
 
     fn provision_prekeys(&self, identity: &DeviceIdentity) -> Result<(), EngineError> {
@@ -199,18 +273,116 @@ impl NovaEngine {
         Ok(prekey_bundle_to_bytes(&bundle)?)
     }
 
-    /// Adds a new contact from their serialized prekey bundle. The bundle's signed-prekey
-    /// signature is verified against the identity key it claims to belong to *before* it is
-    /// trusted or persisted — a malformed or unsigned bundle is rejected outright rather than
-    /// silently degrading to a null/placeholder key.
+    /// Generates a signed, time-limited contact invitation URI (`nova://invite?d=...`) containing
+    /// this device's X3DH prekey bundle and dialable network rendezvous addresses.
+    pub async fn get_own_invitation_uri(&self, ttl_seconds: Option<i64>) -> Result<String, EngineError> {
+        let id_lock = self.identity.lock().await;
+        let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
+        let bundle = self.storage.get_own_prekey_bundle(identity)?;
+        let ttl = ttl_seconds.unwrap_or(86400); // 24 hours default
+        let addrs = self.own_full_listen_addrs().await;
+        let invitation = nova_protocol::SignedContactInvitation::create(identity, bundle, ttl, addrs)?;
+        Ok(invitation.to_uri()?)
+    }
+
+    /// Returns the deterministic Tor Onion v3 address of this device identity.
+    pub async fn own_onion_address(&self) -> Result<String, EngineError> {
+        let id_lock = self.identity.lock().await;
+        let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
+        Ok(nova_crypto::derive_onion_v3_address(&identity.verifying_key_bytes))
+    }
+
+    /// Queries the live Tor connectivity and circuit status.
+    pub async fn get_tor_status(&self) -> Result<nova_transport::TorStatus, EngineError> {
+        let net_lock = self.network.lock().await;
+        if let Some(node) = net_lock.as_ref() {
+            Ok(node.get_tor_status().await)
+        } else {
+            let saved = self.storage.get_tor_settings()?;
+            let own_onion = self.own_onion_address().await.unwrap_or_default();
+            let mode = match saved.mode.as_str() {
+                "hybrid" => nova_transport::TorMode::Hybrid,
+                "tor_strict" => nova_transport::TorMode::TorStrict,
+                _ => nova_transport::TorMode::DirectOnly,
+            };
+            Ok(nova_transport::TorStatus {
+                enabled: saved.enabled,
+                connected: false,
+                bootstrap_percent: 0,
+                onion_address: own_onion,
+                socks_proxy: saved.socks_proxy,
+                mode,
+                bridge_type: saved.bridge_type,
+            })
+        }
+    }
+
+    /// Configures the Tor privacy mode, proxy endpoint, and bridges, updating storage and active transport.
+    pub async fn configure_tor(
+        &self,
+        enabled: bool,
+        mode_str: &str,
+        socks_proxy: &str,
+        bridge_type: Option<String>,
+    ) -> Result<(), EngineError> {
+        let mode = match mode_str {
+            "hybrid" => nova_transport::TorMode::Hybrid,
+            "tor_strict" => nova_transport::TorMode::TorStrict,
+            _ => nova_transport::TorMode::DirectOnly,
+        };
+
+        let record = nova_storage::TorSettingsRecord {
+            enabled,
+            mode: mode_str.to_string(),
+            socks_proxy: socks_proxy.to_string(),
+            bridge_type: bridge_type.clone(),
+        };
+        self.storage.save_tor_settings(&record)?;
+
+        let net_lock = self.network.lock().await;
+        if let Some(node) = net_lock.as_ref() {
+            let own_onion = self.own_onion_address().await.ok();
+            node.configure_tor(nova_transport::TorConfig {
+                enabled,
+                mode,
+                socks_proxy: socks_proxy.to_string(),
+                onion_address: own_onion,
+                bridge_type,
+            }).await;
+        }
+
+        Ok(())
+    }
+
+    /// Adds a new contact from their invitation URI or serialized prekey bundle.
+    /// The ticket's signature, expiry deadline, and cryptographic bundle are verified
+    /// before adding. Any embedded rendezvous addresses are automatically dialed in the background.
     pub async fn add_contact(
         &self,
         username: &str,
         display_name: &str,
-        bundle_bytes: &[u8],
+        invitation_code_or_bytes: &[u8],
     ) -> Result<ContactRecord, EngineError> {
-        let bundle = prekey_bundle_from_bytes(bundle_bytes)?;
-        verify_prekey_bundle(&bundle)?;
+        let now_utc = chrono::Utc::now().timestamp();
+        let (bundle, rendezvous_addrs) = if let Ok(inv_str) = std::str::from_utf8(invitation_code_or_bytes) {
+            let trimmed = inv_str.trim();
+            if trimmed.starts_with("nova://") || trimmed.starts_with("NOVA:") || trimmed.contains("?d=") {
+                let ticket = nova_protocol::SignedContactInvitation::from_uri_or_code(trimmed)?;
+                let payload = ticket.verify(now_utc)?;
+                (payload.bundle, payload.rendezvous_addrs)
+            } else if let Ok(ticket) = nova_protocol::SignedContactInvitation::from_uri_or_code(trimmed) {
+                let payload = ticket.verify(now_utc)?;
+                (payload.bundle, payload.rendezvous_addrs)
+            } else {
+                let bundle = prekey_bundle_from_bytes(invitation_code_or_bytes)?;
+                verify_prekey_bundle(&bundle)?;
+                (bundle, Vec::new())
+            }
+        } else {
+            let bundle = prekey_bundle_from_bytes(invitation_code_or_bytes)?;
+            verify_prekey_bundle(&bundle)?;
+            (bundle, Vec::new())
+        };
 
         let own_pub = {
             let id_lock = self.identity.lock().await;
@@ -231,19 +403,31 @@ impl NovaEngine {
             safety_number,
             is_online: true,
             is_blocked: false,
-            last_seen_utc: chrono::Utc::now().timestamp(),
+            last_seen_utc: now_utc,
         };
         self.storage.save_contact(&contact)?;
 
-        let conv = ConversationRecord {
-            id: format!("conv_{peer_id}"),
-            peer_id: peer_id.clone(),
-            title: display_name.to_string(),
-            last_message_text: String::new(),
-            last_message_time_utc: chrono::Utc::now().timestamp(),
-            unread_count: 0,
+        let conv_id = format!("conv_{peer_id}");
+        let conv = match self.storage.get_conversations()?.into_iter().find(|c| c.id == conv_id) {
+            Some(mut existing) => {
+                existing.title = display_name.to_string();
+                existing
+            }
+            None => ConversationRecord {
+                id: conv_id,
+                peer_id: peer_id.clone(),
+                title: display_name.to_string(),
+                last_message_text: String::new(),
+                last_message_time_utc: now_utc,
+                unread_count: 0,
+            },
         };
         self.storage.save_conversation(&conv)?;
+
+        // Automatically dial the friend's rendezvous/relay addresses in the background
+        for addr in rendezvous_addrs {
+            let _ = self.bootstrap_dial(&addr).await;
+        }
 
         Ok(contact)
     }
@@ -404,6 +588,29 @@ impl NovaEngine {
 
                 let id_lock = self.identity.lock().await;
                 let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
+                let own_pub = identity.verifying_key_bytes;
+                let peer_pub = handshake.sender_identity_ed25519_pub;
+                let own_id_hex = identity.public_id_hex();
+
+                // Simultaneous handshake collision detection (Double Alice Problem):
+                // If both peers initiated a session concurrently, use deterministic tie-breaking
+                // (lexicographical order of Ed25519 public keys) to pick the authoritative initiator.
+                let mut sessions_lock = self.sessions.lock().await;
+                let has_unacked_initiator_session = match sessions_lock.get(&sender_peer_id) {
+                    Some(s) => s.can_send(),
+                    None => self
+                        .storage
+                        .load_session(&sender_peer_id)?
+                        .map(|s| s.can_send())
+                        .unwrap_or(false),
+                };
+
+                if has_unacked_initiator_session && own_pub < peer_pub {
+                    tracing::info!(
+                        "Handshake collision with {sender_peer_id}: local node is priority initiator, preserving local session."
+                    );
+                    return Ok(None);
+                }
 
                 let (spk_secret, spk_public) = self
                     .storage
@@ -437,11 +644,21 @@ impl NovaEngine {
                     b"NOVA_MSG",
                 )?;
 
+                // If we had an outbound message pending in the outbox that was previously
+                // encrypted with an obsolete initiator session, re-encrypt it on this new session.
+                if let Err(e) = self.reencrypt_pending_outbox_items(&own_id_hex, &sender_peer_id, &mut session) {
+                    tracing::warn!("Failed to re-encrypt pending outbox items for {sender_peer_id}: {e}");
+                }
+
                 self.storage.save_session(&sender_peer_id, &session)?;
-                self.sessions
-                    .lock()
-                    .await
-                    .insert(sender_peer_id.clone(), session);
+                sessions_lock.insert(sender_peer_id.clone(), session);
+                drop(sessions_lock);
+
+                // If contact is blocked, keep ratchet in sync but drop UI persistence
+                if self.storage.is_contact_blocked(&sender_peer_id)? {
+                    tracing::info!("Packet processed for ratchet sync but dropped because peer {} is blocked", sender_peer_id);
+                    return Ok(None);
+                }
 
                 self.persist_incoming_message(&sender_peer_id, &plaintext).await
             }
@@ -464,6 +681,12 @@ impl NovaEngine {
                 sessions_lock.insert(sender_peer_id.clone(), session);
                 drop(sessions_lock);
 
+                // If contact is blocked, keep ratchet in sync but drop UI persistence
+                if self.storage.is_contact_blocked(&sender_peer_id)? {
+                    tracing::info!("Packet processed for ratchet sync but dropped because peer {} is blocked", sender_peer_id);
+                    return Ok(None);
+                }
+
                 self.persist_incoming_message(&sender_peer_id, &plaintext).await
             }
             other => Err(EngineError::UnsupportedFrame(other)),
@@ -477,8 +700,14 @@ impl NovaEngine {
     ) -> Result<Option<MessageRecord>, EngineError> {
         let payload = MessagePayload::from_bytes(plaintext)?;
         let text = payload.text_content.clone().unwrap_or_default();
-
         let conv_id = payload.conversation_id.clone();
+
+        // Check if message was already persisted to avoid duplicate notifications / double unread counts
+        let existing = self.storage.get_messages(&conv_id)?;
+        if existing.iter().any(|m| m.id == payload.message_id) {
+            return Ok(None);
+        }
+
         let mut conv = self
             .storage
             .get_conversations()?
@@ -493,6 +722,8 @@ impl NovaEngine {
                 unread_count: 0,
             });
         conv.unread_count += 1;
+        conv.last_message_text = text.clone();
+        conv.last_message_time_utc = payload.timestamp_utc;
         self.storage.save_conversation(&conv)?;
 
         let msg_record = MessageRecord {
@@ -508,6 +739,45 @@ impl NovaEngine {
         self.storage.save_message(&msg_record)?;
 
         Ok(Some(msg_record))
+    }
+
+    /// When a handshake collision occurs and this node yields to the peer's authoritative
+    /// handshake, any outgoing messages that were pre-encrypted on the obsolete initiator session
+    /// must be re-encrypted using the newly established Double Ratchet session so they can be
+    /// cleanly delivered.
+    fn reencrypt_pending_outbox_items(
+        &self,
+        sender_id: &str,
+        recipient_peer_id: &str,
+        session: &mut DoubleRatchetSession,
+    ) -> Result<(), EngineError> {
+        let pending = self.storage.get_pending_outbox()?;
+        let conv_id = format!("conv_{recipient_peer_id}");
+        for item in pending {
+            if item.recipient_id == recipient_peer_id {
+                let messages = self.storage.get_messages(&conv_id)?;
+                if let Some(msg) = messages.iter().find(|m| m.id == item.message_id) {
+                    let payload = MessagePayload::new_text(
+                        msg.id.clone(),
+                        conv_id.clone(),
+                        sender_id.to_string(),
+                        recipient_peer_id.to_string(),
+                        msg.text_content.clone(),
+                    );
+                    let payload_bytes = payload.to_bytes()?;
+                    let (header, ciphertext) = session.ratchet_encrypt(&payload_bytes, b"NOVA_MSG")?;
+                    let frame = EncryptedFrame { header, ciphertext };
+                    let mut buf = Vec::new();
+                    ciborium::into_writer(&frame, &mut buf)
+                        .map_err(|e| nova_protocol::ProtocolError::SerializationFailed(e.to_string()))?;
+                    let packet = NovaPacket::new(FrameType::EncryptedMessage, sender_id.to_string(), buf);
+                    let packet_cbor = packet.to_cbor()?;
+                    self.storage.enqueue_outbox(&msg.id, &conv_id, recipient_peer_id, &packet_cbor)?;
+                    tracing::info!("Re-encrypted outbox message {} on established session", msg.id);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Retrieve all conversations for the main UI screen.
@@ -528,6 +798,66 @@ impl NovaEngine {
             return node.supervisor.get_peer_info(peer_id).await;
         }
         self.transport.get_peer_info(peer_id).await
+    }
+
+    /// Every one of this device's own reachable multiaddrs (`.../p2p/<peer-id>`), if the network
+    /// is attached — typically one IPv4 and, when the host has a usable IPv6 stack, one IPv6.
+    /// Only meaningful to share with other devices as a bootstrap address when this device is
+    /// actually dialable from outside its own network: the IPv4 one needs its listen port fixed
+    /// via `NOVA_LISTEN_ADDR` and forwarded on its router (or opened automatically via UPnP); the
+    /// IPv6 one, when present, usually needs neither, since IPv6 has no NAT to traverse.
+    /// Otherwise these are just this device's local addresses — harmless to display, not useful
+    /// to anyone else. Empty (not `None`) until the network is attached.
+    pub async fn own_full_listen_addrs(&self) -> Vec<String> {
+        let Some(node) = self.network.lock().await.clone() else {
+            return Vec::new();
+        };
+        node.full_listen_addrs().iter().map(|a| a.to_string()).collect()
+    }
+
+    /// Connects directly to a remote bootstrap/rendezvous node if network is attached.
+    pub async fn bootstrap_dial(&self, addr: &str) -> Result<(), EngineError> {
+        let Some(node) = self.network.lock().await.clone() else {
+            return Ok(());
+        };
+        let parsed: nova_transport::Multiaddr = addr
+            .parse()
+            .map_err(|e| nova_transport::TransportError::InvalidAddress(format!("{e}")))?;
+        node.bootstrap_dial(parsed).await?;
+        Ok(())
+    }
+
+    /// Retrieves the local user profile metadata.
+    pub fn get_user_profile(&self) -> Result<Option<nova_storage::UserProfileRecord>, EngineError> {
+        Ok(self.storage.get_user_profile()?)
+    }
+
+    /// Blocks a contact so that incoming messages from them are dropped.
+    pub fn block_contact(&self, peer_id: &str) -> Result<(), EngineError> {
+        self.storage.block_contact(peer_id)?;
+        Ok(())
+    }
+
+    /// Unblocks a previously blocked contact.
+    pub fn unblock_contact(&self, peer_id: &str) -> Result<(), EngineError> {
+        self.storage.unblock_contact(peer_id)?;
+        Ok(())
+    }
+
+    /// Checks if a contact is currently blocked.
+    pub fn is_contact_blocked(&self, peer_id: &str) -> Result<bool, EngineError> {
+        Ok(self.storage.is_contact_blocked(peer_id)?)
+    }
+
+    /// Retrieves all saved contacts.
+    pub fn get_contacts(&self) -> Result<Vec<ContactRecord>, EngineError> {
+        Ok(self.storage.get_contacts()?)
+    }
+
+    /// Saves or updates the local user profile metadata.
+    pub fn save_user_profile(&self, profile: &nova_storage::UserProfileRecord) -> Result<(), EngineError> {
+        self.storage.save_user_profile(profile)?;
+        Ok(())
     }
 }
 
@@ -651,17 +981,52 @@ mod tests {
         assert!(matches!(result, Err(EngineError::NoContact(_))));
     }
 
+    /// A device closing and reopening the app (a new `NovaEngine` instance over the same
+    /// on-disk database) must not have to re-enter its mnemonic to keep using its identity —
+    /// that is the entire point of `try_resume_session`. Uses a real temp file rather than
+    /// `:memory:` since the whole scenario under test is "a second, independent open of the same
+    /// persisted database."
+    #[tokio::test]
+    async fn test_try_resume_session_restores_identity_without_the_mnemonic() {
+        let db_path = std::env::temp_dir().join(format!("nova_resume_test_{}.db", uuid::Uuid::new_v4()));
+        let db_path_str = db_path.to_str().unwrap();
+
+        let (original_peer_id, mnemonic) = {
+            let engine = NovaEngine::new(db_path_str, "resume-test-pass").unwrap();
+            let (peer_id, mnemonic) = engine.create_account("alex").await.unwrap();
+            (peer_id, mnemonic)
+        };
+
+        // A fresh engine instance, as a real app relaunch would create — no mnemonic supplied.
+        let reopened = NovaEngine::new(db_path_str, "resume-test-pass").unwrap();
+        let resumed = reopened.try_resume_session().await.unwrap();
+        let (resumed_peer_id, resumed_mnemonic, resumed_username) =
+            resumed.expect("a previously created identity must be found on reopen");
+
+        assert_eq!(resumed_peer_id, original_peer_id);
+        assert_eq!(resumed_mnemonic, mnemonic);
+        assert_eq!(resumed_username, "alex");
+        assert!(reopened.identity.lock().await.is_some());
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn test_try_resume_session_returns_none_on_first_run() {
+        let engine = NovaEngine::new(":memory:", "fresh-pass").unwrap();
+        let resumed = engine.try_resume_session().await.unwrap();
+        assert!(resumed.is_none());
+    }
+
     /// The literal claim behind "how can a user in Ouagadougou talk to a user in
     /// Bobo-Dioulasso": two fully independent `NovaEngine` instances — separate identities,
-    /// separate encrypted databases, separate `P2PNode`s bound to their own OS sockets, tied
-    /// together only by a shared rendezvous server neither of them trusts with anything but an
-    /// address and an opaque, already-encrypted blob — exchange a real message over the real
-    /// network stack (UDP sockets, QUIC handshake, X3DH, Double Ratchet), with no bytes shared
-    /// in-process. Nothing here is a mock: a passing run is the network layer actually working.
+    /// separate encrypted databases, separate `P2PNode`s bound to their own OS sockets — find
+    /// each other purely through the distributed Kademlia DHT (not a hardcoded address or a
+    /// single trusted server) and exchange a real message over the real network stack (QUIC
+    /// handshake, X3DH, Double Ratchet), with no bytes shared in-process. Nothing here is a
+    /// mock: a passing run is the network layer actually working.
     #[tokio::test]
     async fn test_two_independent_engines_exchange_a_message_over_a_real_network() {
-        let rendezvous_addr = start_test_rendezvous_server().await;
-
         // `DeviceIdentity` deliberately does not implement `Clone` (it holds zeroized private
         // key material) — since it is deterministically derived from its mnemonic, each side
         // that needs its own independent instance just re-derives it from the same phrase,
@@ -673,13 +1038,22 @@ mod tests {
         let bob_peer_id = bob_identity.public_id_hex();
         let alice_peer_id = alice_identity.public_id_hex();
 
-        let alice_node = nova_transport::P2PNode::start(alice_identity, "127.0.0.1:0", rendezvous_addr)
+        let alice_node = nova_transport::P2PNode::start(alice_identity, "/ip4/127.0.0.1/udp/0/quic-v1")
             .await
             .unwrap();
-        let bob_node = nova_transport::P2PNode::start(bob_identity, "127.0.0.1:0", rendezvous_addr)
+        let bob_node = nova_transport::P2PNode::start(bob_identity, "/ip4/127.0.0.1/udp/0/quic-v1")
             .await
             .unwrap();
+
+        // In production, first contact between peers who don't already know each other's
+        // current address goes through mDNS (same LAN) or a small list of well-known DHT
+        // bootstrap peers. This test stands in for that with one explicit, known address
+        // (deterministic, so it doesn't depend on this machine's mDNS/multicast setup) — after
+        // this single dial, all further discovery goes through the real DHT, not this bootstrap.
+        alice_node.bootstrap_dial(bob_node.listen_addr().clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
         bob_node.announce_presence().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let alice = Arc::new(NovaEngine::new(":memory:", "alice-storage-pass").unwrap());
         let bob = Arc::new(NovaEngine::new(":memory:", "bob-storage-pass").unwrap());
@@ -724,15 +1098,199 @@ mod tests {
         }
     }
 
-    async fn start_test_rendezvous_server() -> std::net::SocketAddr {
-        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-        let bind_addr = addr.to_string();
-        tokio::spawn(async move {
-            let _ = nova_server::run_server(&bind_addr).await;
-        });
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        addr
+    #[tokio::test]
+    async fn test_add_contact_with_signed_invitation_and_expired_ticket_rejection() {
+        let alice = NovaEngine::new(":memory:", "alice-pass").unwrap();
+        let bob = NovaEngine::new(":memory:", "bob-pass").unwrap();
+
+        let (_alice_id, _) = alice.create_account("alice").await.unwrap();
+        let (_bob_id, bob_mnemonic) = bob.create_account("bob").await.unwrap();
+
+        // 1. Valid invitation ticket with 24h deadline
+        let valid_uri = bob.get_own_invitation_uri(Some(86400)).await.unwrap();
+        assert!(valid_uri.starts_with("nova://invite?d="));
+
+        let contact = alice.add_contact("bob", "Bob", valid_uri.as_bytes()).await.unwrap();
+        assert_eq!(contact.display_name, "Bob");
+
+        // 2. Expired invitation ticket (-10s TTL)
+        let mnemonic = MnemonicPhrase::from_phrase(&bob_mnemonic).unwrap();
+        let bob_identity = nova_crypto::DeviceIdentity::from_mnemonic(&mnemonic, "bob").unwrap();
+        let bundle = bob.storage.get_own_prekey_bundle(&bob_identity).unwrap();
+        let expired_inv = nova_protocol::SignedContactInvitation::create(&bob_identity, bundle, -10, vec![]).unwrap();
+        let expired_uri = expired_inv.to_uri().unwrap();
+
+        let err = alice.add_contact("bob_expired", "Bob Expired", expired_uri.as_bytes()).await.unwrap_err();
+        assert!(format!("{err}").contains("expiré") || format!("{err}").contains("Expired"));
+    }
+
+    #[tokio::test]
+    async fn test_blocked_contact_messages_are_dropped() {
+        let alice = NovaEngine::new(":memory:", "alice-pass").unwrap();
+        let bob = NovaEngine::new(":memory:", "bob-pass").unwrap();
+
+        let (alice_pub, _) = alice.create_account("alice").await.unwrap();
+        let (bob_pub, _) = bob.create_account("bob").await.unwrap();
+
+        let bob_bundle = bob.get_own_prekey_bundle_bytes().await.unwrap();
+        alice.add_contact("bob", "Bob", &bob_bundle).await.unwrap();
+
+        let alice_bundle = alice.get_own_prekey_bundle_bytes().await.unwrap();
+        bob.add_contact("alice", "Alice", &alice_bundle).await.unwrap();
+
+        // Bob blocks Alice
+        bob.block_contact(&alice_pub).unwrap();
+        assert!(bob.is_contact_blocked(&alice_pub).unwrap());
+
+        // Alice sends a message to Bob
+        let conv_id = format!("conv_{bob_pub}");
+        let _sent = alice.send_message(&conv_id, &bob_pub, "Message de test non desiré").await.unwrap();
+
+        let pending = alice.storage.get_pending_outbox().unwrap();
+        assert_eq!(pending.len(), 1);
+        let wire_bytes = pending[0].payload.clone();
+
+        // Bob receives packet: should return Ok(None) and NOT save anything
+        let received = bob.receive_packet(&wire_bytes).await.unwrap();
+        assert!(received.is_none());
+
+        let bob_conv_id = format!("conv_{alice_pub}");
+        let bob_messages = bob.get_messages(&bob_conv_id).unwrap();
+        assert_eq!(bob_messages.len(), 0);
+
+        // Bob unblocks Alice
+        bob.unblock_contact(&alice_pub).unwrap();
+        assert!(!bob.is_contact_blocked(&alice_pub).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_readding_contact_preserves_conversation_history() {
+        let alice = NovaEngine::new(":memory:", "alice-pass").unwrap();
+        let bob = NovaEngine::new(":memory:", "bob-pass").unwrap();
+
+        let (_alice_pub, _) = alice.create_account("alice").await.unwrap();
+        let (bob_pub, _) = bob.create_account("bob").await.unwrap();
+
+        let bob_bundle = bob.get_own_prekey_bundle_bytes().await.unwrap();
+        alice.add_contact("bob", "Bob", &bob_bundle).await.unwrap();
+
+        let conv_id = format!("conv_{bob_pub}");
+        alice.send_message(&conv_id, &bob_pub, "Premier message").await.unwrap();
+
+        let convs_before = alice.get_conversations().unwrap();
+        assert_eq!(convs_before[0].last_message_text, "Premier message");
+
+        // Re-add Bob with an updated bundle/ticket
+        let bob_new_ticket = bob.get_own_invitation_uri(Some(86400)).await.unwrap();
+        alice.add_contact("bob", "Bob Renommé", bob_new_ticket.as_bytes()).await.unwrap();
+
+        let convs_after = alice.get_conversations().unwrap();
+        assert_eq!(convs_after[0].title, "Bob Renommé");
+        assert_eq!(convs_after[0].last_message_text, "Premier message");
+    }
+
+    #[tokio::test]
+    async fn test_unblocking_contact_preserves_double_ratchet_sync() {
+        let alice = NovaEngine::new(":memory:", "alice-pass").unwrap();
+        let bob = NovaEngine::new(":memory:", "bob-pass").unwrap();
+
+        let (alice_pub, _) = alice.create_account("alice").await.unwrap();
+        let (bob_pub, _) = bob.create_account("bob").await.unwrap();
+
+        let bob_bundle = bob.get_own_prekey_bundle_bytes().await.unwrap();
+        alice.add_contact("bob", "Bob", &bob_bundle).await.unwrap();
+
+        let alice_bundle = alice.get_own_prekey_bundle_bytes().await.unwrap();
+        bob.add_contact("alice", "Alice", &alice_bundle).await.unwrap();
+
+        // 1. Establish initial session
+        let conv_alice = format!("conv_{bob_pub}");
+        let _conv_bob = format!("conv_{alice_pub}");
+        let msg1 = alice.send_message(&conv_alice, &bob_pub, "Message 1 avant blocage").await.unwrap();
+        let p1 = alice.storage.get_pending_outbox().unwrap()[0].payload.clone();
+        let r1 = bob.receive_packet(&p1).await.unwrap().unwrap();
+        assert_eq!(r1.text_content, "Message 1 avant blocage");
+
+        // 2. Bob blocks Alice
+        bob.block_contact(&alice_pub).unwrap();
+
+        // 3. Alice sends 3 messages while blocked
+        let _msg2 = alice.send_message(&conv_alice, &bob_pub, "Message 2 pendant blocage").await.unwrap();
+        let p2 = alice.storage.get_pending_outbox().unwrap().iter().find(|i| i.message_id != msg1.id).unwrap().payload.clone();
+        let r2 = bob.receive_packet(&p2).await.unwrap();
+        assert!(r2.is_none(), "Message while blocked must not be returned to UI");
+
+        let _msg3 = alice.send_message(&conv_alice, &bob_pub, "Message 3 pendant blocage").await.unwrap();
+        let p3 = alice.storage.get_pending_outbox().unwrap().last().unwrap().payload.clone();
+        let r3 = bob.receive_packet(&p3).await.unwrap();
+        assert!(r3.is_none());
+
+        // 4. Bob unblocks Alice
+        bob.unblock_contact(&alice_pub).unwrap();
+
+        // 5. Alice sends Message 4 after unblocking -> must decrypt seamlessly!
+        let _msg4 = alice.send_message(&conv_alice, &bob_pub, "Message 4 apres deblocage").await.unwrap();
+        let p4 = alice.storage.get_pending_outbox().unwrap().last().unwrap().payload.clone();
+        let r4 = bob.receive_packet(&p4).await.unwrap().expect("Message 4 must decrypt cleanly after unblocking");
+        assert_eq!(r4.text_content, "Message 4 apres deblocage");
+        assert_eq!(r4.sender_id, alice_pub);
+    }
+
+    #[tokio::test]
+    async fn test_simultaneous_handshake_init_collision_resolution() {
+        let alice = NovaEngine::new(":memory:", "alice-pass").unwrap();
+        let bob = NovaEngine::new(":memory:", "bob-pass").unwrap();
+
+        let (alice_pub, _) = alice.create_account("alice").await.unwrap();
+        let (bob_pub, _) = bob.create_account("bob").await.unwrap();
+
+        let bob_bundle = bob.get_own_prekey_bundle_bytes().await.unwrap();
+        alice.add_contact("bob", "Bob", &bob_bundle).await.unwrap();
+
+        let alice_bundle = alice.get_own_prekey_bundle_bytes().await.unwrap();
+        bob.add_contact("alice", "Alice", &alice_bundle).await.unwrap();
+
+        // Alice and Bob both send a message simultaneously (both create HandshakeInit)
+        let conv_alice = format!("conv_{bob_pub}");
+        let conv_bob = format!("conv_{alice_pub}");
+
+        let _msg_alice = alice.send_message(&conv_alice, &bob_pub, "Message initial Alice").await.unwrap();
+        let _msg_bob = bob.send_message(&conv_bob, &alice_pub, "Message initial Bob").await.unwrap();
+
+        let alice_packet = alice.storage.get_pending_outbox().unwrap()[0].payload.clone();
+        let bob_packet = bob.storage.get_pending_outbox().unwrap()[0].payload.clone();
+
+        // Both deliver their packets to each other concurrently
+        let r_bob = bob.receive_packet(&alice_packet).await.unwrap();
+        let r_alice = alice.receive_packet(&bob_packet).await.unwrap();
+
+        // One of the handshakes is processed as authoritative according to lexicographical order
+        assert!(r_bob.is_some() || r_alice.is_some());
+
+        // The subordinate peer has re-encrypted its outbound message on the newly established session.
+        // Deliver the re-encrypted message to the priority peer:
+        if alice_pub < bob_pub {
+            // Alice was priority initiator; Bob yielded and re-encrypted his outbox message.
+            let bob_pending = bob.storage.get_pending_outbox().unwrap();
+            for item in bob_pending {
+                if let Some(msg) = alice.receive_packet(&item.payload).await.unwrap() {
+                    assert_eq!(msg.text_content, "Message initial Bob");
+                }
+            }
+        } else {
+            // Bob was priority initiator; Alice yielded and re-encrypted her outbox message.
+            let alice_pending = alice.storage.get_pending_outbox().unwrap();
+            for item in alice_pending {
+                if let Some(msg) = bob.receive_packet(&item.payload).await.unwrap() {
+                    assert_eq!(msg.text_content, "Message initial Alice");
+                }
+            }
+        }
+
+        // Alice replies on the established session
+        let reply = alice.send_message(&conv_alice, &bob_pub, "Reponse Alice apres collision resolue").await.unwrap();
+        let reply_packet = alice.storage.get_pending_outbox().unwrap().iter().find(|i| i.message_id == reply.id).unwrap().payload.clone();
+        let bob_received_reply = bob.receive_packet(&reply_packet).await.unwrap().unwrap();
+        assert_eq!(bob_received_reply.text_content, "Reponse Alice apres collision resolue");
     }
 }

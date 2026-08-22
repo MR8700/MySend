@@ -92,6 +92,18 @@ pub struct PreKeyBundle {
     pub identity_x25519_pub: [u8; 32],
     pub signed_prekey: SignedPreKeyPublic,
     pub one_time_prekey: Option<OneTimePreKeyPublic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onion_address: Option<String>,
+}
+
+impl PreKeyBundle {
+    /// Returns the Tor Onion v3 address derived from the Ed25519 identity key,
+    /// or the explicitly advertised onion address if set.
+    pub fn onion_address(&self) -> String {
+        self.onion_address
+            .clone()
+            .unwrap_or_else(|| crate::onion::derive_onion_v3_address(&self.identity_ed25519_pub))
+    }
 }
 
 /// Generates a fresh signed prekey, signed by the device's long-term Ed25519 identity key.
@@ -282,6 +294,7 @@ mod tests {
             identity_x25519_pub: bob.dh_public_bytes,
             signed_prekey: spk_public,
             one_time_prekey: Some(opk_public),
+            onion_address: None,
         };
 
         verify_prekey_bundle(&bundle).expect("bundle signature must verify");
@@ -314,6 +327,7 @@ mod tests {
             identity_x25519_pub: bob.dh_public_bytes,
             signed_prekey: spk_public,
             one_time_prekey: None,
+            onion_address: None,
         };
 
         verify_prekey_bundle(&bundle).unwrap();
@@ -335,6 +349,7 @@ mod tests {
             identity_x25519_pub: bob.dh_public_bytes,
             signed_prekey: spk_public,
             one_time_prekey: None,
+            onion_address: None,
         };
 
         assert!(verify_prekey_bundle(&bundle).is_err());
@@ -351,6 +366,7 @@ mod tests {
             identity_x25519_pub: bob.dh_public_bytes,
             signed_prekey: spk_public,
             one_time_prekey: None,
+            onion_address: None,
         };
 
         let init1 = x3dh_initiate(&alice, &bundle).unwrap();

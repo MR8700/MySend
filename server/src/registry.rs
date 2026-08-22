@@ -10,7 +10,7 @@ const DEFAULT_TTL_SECONDS: u64 = 60;
 /// A registration's signed timestamp must fall within this many seconds of "now" (either
 /// direction) to be accepted — bounds how long a captured registration could be replayed to
 /// resurrect a stale presence entry after the real peer has moved or gone offline.
-const REGISTRATION_FRESHNESS_WINDOW_SECS: u64 = 30;
+const REGISTRATION_FRESHNESS_WINDOW_SECS: u64 = 120;
 /// Hard cap on distinct peer_ids tracked at once, independent of the per-entry TTL, so a flood
 /// of registrations under many fabricated identities cannot grow this table without bound
 /// between housekeeping sweeps.

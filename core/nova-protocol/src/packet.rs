@@ -8,9 +8,8 @@ pub const PROTOCOL_VERSION: u8 = 0x01;
 /// Hard ceiling on any single wire packet, enforced before CBOR decoding. Packets arrive
 /// from an untrusted network; without this bound a hostile or corrupted peer could send a
 /// header claiming an enormous payload and force unbounded allocation during deserialization.
-/// 4 MiB comfortably covers a chat message or one file-transfer chunk (large media is expected
-/// to be split into chunks by the caller, not sent as a single frame).
-pub const MAX_PACKET_SIZE: usize = 4 * 1024 * 1024;
+/// 8 MiB comfortably covers a rich chat message, audio note or file-transfer chunk.
+pub const MAX_PACKET_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Error, Debug)]
 pub enum ProtocolError {

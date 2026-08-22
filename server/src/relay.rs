@@ -82,11 +82,27 @@ impl BlindRelay {
         Ok(())
     }
 
-    /// Retrieves and IMMEDIATELY PURGES all queued encrypted packets for the peer.
+    /// Retrieves a bounded batch of encrypted packets for the peer that fits safely in UDP datagram limits.
+    /// Remaining packets are preserved in memory for subsequent drain requests.
     pub async fn drain_for_peer(&self, target_peer_id: &str) -> Vec<Vec<u8>> {
         let mut lock = self.queues.write().await;
-        if let Some(queue) = lock.remove(target_peer_id) {
-            queue.into_iter().map(|p| p.payload).collect()
+        if let Some(queue) = lock.get_mut(target_peer_id) {
+            let mut batch = Vec::new();
+            let mut total_bytes = 0;
+            const MAX_BATCH_BYTES: usize = 12 * 1024; // 12 KB safe datagram ceiling
+            while let Some(front) = queue.front() {
+                if !batch.is_empty() && total_bytes + front.payload.len() > MAX_BATCH_BYTES {
+                    break;
+                }
+                if let Some(packet) = queue.pop_front() {
+                    total_bytes += packet.payload.len();
+                    batch.push(packet.payload);
+                }
+            }
+            if queue.is_empty() {
+                lock.remove(target_peer_id);
+            }
+            batch
         } else {
             Vec::new()
         }

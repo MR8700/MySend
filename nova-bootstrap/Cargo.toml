@@ -1,0 +1,14 @@
+[package]
+name = "nova-bootstrap"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+nova-crypto = { path = "../core/nova-crypto" }
+nova-transport = { path = "../core/nova-transport" }
+tokio.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

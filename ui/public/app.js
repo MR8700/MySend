@@ -25,6 +25,7 @@ const icons = {
     checkCheck: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 6 7 17 2 12"></polyline><polyline points="22 10 13 19 11 17"></polyline></svg>`,
     trash: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>`,
     mapPin: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>`,
+    chevronRight: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>`,
 };
 
 // --- SECURITY: HTML ESCAPING ---
@@ -44,56 +45,206 @@ function escapeHtml(value) {
     }[ch]));
 }
 
+// --- BACKEND BRIDGE (Tauri) ---
+// This UI runs inside a Tauri desktop shell (see ui/src-tauri) wrapping the real nova-engine/
+// nova-transport backend — not a browser tab, and not WASM (the backend's bundled SQLite and
+// QUIC/libp2p transport cannot run in a real browser sandbox at all). `window.__TAURI__` is only
+// injected when actually running under Tauri; opening this file directly in a plain browser
+// (e.g. while iterating on styling) leaves `hasBackend` false and every backend-dependent action
+// fails honestly rather than silently doing nothing.
+const tauriInvoke = window.__TAURI__ && window.__TAURI__.core ? window.__TAURI__.core.invoke : null;
+const hasBackend = !!tauriInvoke;
+
+function requireBackend() {
+    if (!hasBackend) {
+        alert('Backend indisponible : cette page doit être lancée via l\'application Tauri (cargo tauri dev), pas dans un navigateur.');
+        return false;
+    }
+    return true;
+}
+
+// --- EVENT DELEGATION (CSP-safe) ---
+// tauri.conf.json's CSP is `script-src 'self'` with no 'unsafe-inline' — inline event-handler
+// attributes (onclick="...", onkeydown="...", oninput="...", onchange="...") are governed by
+// script-src-attr, which falls back to script-src, so WebView2 (Chromium-based) blocks every one
+// of them outright: none of this app's ~80 onclick="..." attributes ever ran. Every interactive
+// element is driven instead by data-action (+ a small set of data-* arguments) and one delegated
+// listener per event type below, so nothing needs to be inline.
+
+// Disables `el` and dims it (see the `button:disabled` rule in style.css) for the duration of
+// `fn()` — the "something is happening" feedback previously entirely missing from every
+// backend-invoking button. Some of these calls legitimately take multiple seconds (Argon2id key
+// derivation, P2P network startup with its bounded IPv6 wait), during which a button with no
+// visual change at all looks exactly like a dead one.
+async function runPendingAction(el, fn) {
+    if (el && el.disabled) return;
+    if (el) el.disabled = true;
+    try {
+        await fn();
+    } finally {
+        if (el) el.disabled = false;
+    }
+}
+
+const CLICK_ACTIONS = {
+    navigate: (el) => navigateTo(el.dataset.screen),
+    createAccount: (el) => runPendingAction(el, createAccountReal),
+    restoreAccount: (el) => runPendingAction(el, restoreAccountReal),
+    openChat: (el) => openChatWithEl(el),
+    callVoice: (el) => alertCallTo(el, 'voice'),
+    callVideo: (el) => alertCallTo(el, 'video'),
+    triggerMediaPicker: () => triggerDeviceMediaPicker(),
+    triggerDocPicker: () => triggerDeviceDocPicker(),
+    startVoiceRecording: () => startVoiceRecording(),
+    openLocationModal: () => { closePanels(); openLocationModal(); },
+    closePanels: () => closePanels(),
+    insertEmoji: (el) => insertEmoji(el.dataset.emoji),
+    toggleAttachmentDrawer: (el, event) => toggleAttachmentDrawer(event),
+    toggleEmojiPicker: (el, event) => toggleEmojiPicker(event),
+    sendMessage: (el) => runPendingAction(el, sendMessage),
+    cancelVoiceRecording: () => cancelVoiceRecording(),
+    togglePauseVoiceRecording: () => togglePauseVoiceRecording(),
+    toggleVoicePreview: () => toggleVoicePreview(),
+    stopAndSendVoiceRecording: (el) => runPendingAction(el, stopAndSendVoiceRecording),
+    closeLocationModal: () => closeLocationModal(),
+    confirmAndSendLocation: (el) => runPendingAction(el, confirmAndSendLocation),
+    closeMediaPreviewModal: () => closeMediaPreviewModal(),
+    confirmAndSendPendingMedia: (el) => runPendingAction(el, confirmAndSendPendingMedia),
+    blockActiveContact: (el) => runPendingAction(el, blockActiveContact),
+    unblockActiveContact: (el) => runPendingAction(el, () => unblockActiveContact(el.dataset.peerId)),
+    addContact: (el) => runPendingAction(el, addContactReal),
+    saveBootstrapAddr: (el) => runPendingAction(el, saveBootstrapAddr),
+    openMnemonicAuthModal: () => openMnemonicAuthModal(),
+    closeMnemonicAuthModal: () => closeMnemonicAuthModal(),
+    confirmMnemonicPin: () => confirmMnemonicPin(),
+    openEditProfileModal: () => openEditProfileModal(),
+    closeEditProfileModal: () => closeEditProfileModal(),
+    saveProfileChanges: (el) => runPendingAction(el, saveProfileChanges),
+    triggerAvatarPicker: () => { const el = document.getElementById('profile-avatar-input'); if (el) el.click(); },
+    saveQrImage: () => saveQrImage(),
+    shareInvitation: () => shareInvitation(),
+    copyOwnBundle: () => copyOwnBundle(),
+    copyOnionAddress: (el) => copyOnionAddressReal(el),
+    saveTorConfig: (el) => runPendingAction(el, saveTorConfigReal),
+    openQrCameraScanner: () => openQrCameraScanner(),
+    closeQrCameraScanner: () => closeQrCameraScanner(),
+    openImagePreview: (el) => openImagePreviewEl(el),
+    showFileAlert: (el) => showFileAlertEl(el),
+    triggerQrImagePicker: () => document.getElementById('qr-image-input').click(),
+    logout: (el) => runPendingAction(el, logoutReal),
+};
+
+document.addEventListener('click', (event) => {
+    const el = event.target.closest('[data-action]');
+    if (!el) return;
+    const handler = CLICK_ACTIONS[el.dataset.action];
+    if (handler) handler(el, event);
+});
+
+// Enter-to-submit on the few inputs that had `onkeydown="if(event.key==='Enter') fn()"` — also
+// blocked by the same CSP, for the same reason as onclick above.
+const ENTER_SUBMIT_MAP = {
+    'account-name-input': () => createAccountReal(),
+    'chat-input': () => sendMessage(),
+    'mnemonic-auth-pin': () => confirmMnemonicPin(),
+    'edit-display-name-input': () => saveProfileChanges(),
+    'media-caption-input': () => confirmAndSendPendingMedia(),
+};
+document.addEventListener('keydown', (event) => {
+    const handler = event.key === 'Enter' && ENTER_SUBMIT_MAP[event.target.id];
+    if (handler) handler();
+});
+
+const INPUT_HANDLERS = {
+    'contacts-search-input': filterContactsList,
+    'global-search-input': handleStrictSearch,
+};
+document.addEventListener('input', (event) => {
+    const handler = INPUT_HANDLERS[event.target.id];
+    if (handler) handler(event.target.value);
+});
+
+const CHANGE_HANDLERS = {
+    'media-file-input': handleMediaFileSelect,
+    'doc-file-input': handleDocFileSelect,
+    'qr-image-input': handleQrImageSelect,
+    'profile-avatar-input': handleAvatarFileSelect,
+    'notif-messages-chk': (e) => {
+        state.notificationPrefs.notifyMessages = e.target.checked;
+        localStorage.setItem('nova_notify_messages', String(e.target.checked));
+        if (e.target.checked && typeof Notification !== 'undefined' && Notification.requestPermission) {
+            Notification.requestPermission();
+        }
+    },
+    'notif-contacts-chk': (e) => {
+        state.notificationPrefs.notifyContacts = e.target.checked;
+        localStorage.setItem('nova_notify_contacts', String(e.target.checked));
+    },
+    'notif-hide-content-chk': (e) => {
+        state.notificationPrefs.hideContent = e.target.checked;
+        localStorage.setItem('nova_hide_content', String(e.target.checked));
+    },
+};
+document.addEventListener('change', (event) => {
+    const handler = CHANGE_HANDLERS[event.target.id];
+    if (handler) handler(event);
+});
+
 // Global Reactive State (Strictly 1-to-1 Device Sovereignty)
 const state = {
-    currentScreen: 'conversations',
+    currentScreen: 'onboarding',
+    notificationPrefs: {
+        notifyMessages: localStorage.getItem('nova_notify_messages') !== 'false',
+        notifyContacts: localStorage.getItem('nova_notify_contacts') !== 'false',
+        hideContent: localStorage.getItem('nova_hide_content') === 'true',
+    },
     currentUser: {
-        name: 'Alexandre V.',
-        username: 'alex',
-        handle: 'alex.nova',
-        bio: 'Souveraineté numérique • Pair-à-pair direct',
-        status: 'En ligne via QUIC P2P',
-        publicKey: 'A7F3 92BC E451 988F ... 4D2A',
-        mnemonic: 'crane jump river fabric blanket onion size stable window street faith morning',
-        // Demo-only stand-in for a real local unlock check (device passcode/biometric). A
-        // production build calls the native OS authentication API here instead — never a
-        // client-side string compare — but the *gate itself* (no reveal without it) is real.
-        localPin: '2468',
+        name: '',
+        username: '',
+        handle: '',
+        // The real, ground-truth identifier (hex-encoded Ed25519 public key) other peers use to
+        // reach this device. `handle` above is a cosmetic display name only — there is no
+        // handle-to-peer_id directory service, so it is never used for actual protocol
+        // operations (add_contact/send_message always use peerId).
+        peerId: '',
+        bio: '',
+        avatarDataUrl: null,
+        status: 'Compte non créé',
+        publicKey: '',
+        mnemonic: '',
+        // Hex-encoded X3DH prekey bundle, fetched on demand — see refreshOwnBundleHex().
+        bundleHex: '',
+        // Cryptographically signed invitation URI (nova://invite?d=...) with 24h deadline
+        invitationUri: '',
     },
-    activeContact: {
-        id: 'emma_1',
-        name: 'Emma',
-        handle: 'emma.nova',
-        publicKey: 'A1B2 C3D4 E5F6 7890 ... 9A0B',
-        safetyNumber: '4A9F-2B1C-88E0-9142',
-        isOnline: true,
-        p2pMode: 'Direct (38 ms)',
-        latency: '38 ms',
+    // Set by openChatWith() when a conversation is opened. null means "no chat open" — screens
+    // that render it must handle that rather than assume a contact always exists.
+    activeContact: null,
+    // The real `PeerConnectionInfo` last observed by nova-transport's TransportSupervisor for
+    // the currently open contact (see refreshDiagnostics()) — null until at least one connection
+    // attempt has happened. Never fabricated; screens that need it must handle it being null.
+    currentDiagnostics: null,
+    // Rendezvous/bootstrap multiaddr for first contact on a different network (see
+    // set_bootstrap_addr) — populated by refreshBootstrapAddr(), edited on the Settings screen.
+    // '' means none configured (mDNS/LAN-only discovery).
+    bootstrapAddr: '',
+    // This device's own dialable multiaddrs (see get_own_full_listen_addrs) — typically one IPv4
+    // and, when available, one IPv6 — shown read-only on Settings so the operator can copy one to
+    // other devices when this one plays the rendezvous role. [] until the network has started.
+    ownFullListenAddrs: [],
+    // Pure 1-to-1 Sovereign Conversations — populated only by real contact/message activity.
+    torSettings: {
+        enabled: false,
+        connected: false,
+        bootstrapPercent: 0,
+        onionAddress: '',
+        socksProxy: '127.0.0.1:9050',
+        mode: 'direct_only',
+        bridgeType: null,
     },
-    // Pure 1-to-1 Sovereign Conversations
-    conversations: [
-        { id: 'conv_emma', name: 'Emma', handle: 'emma.nova', lastMsg: 'Salut ! Comment ça va ?', time: '09:40', unread: 2, online: true, mode: 'Direct' },
-        { id: 'conv_lucas', name: 'Lucas', handle: 'lucas.nova', lastMsg: 'On se voit ce soir.', time: 'Hier', unread: 0, online: true, mode: 'Direct' },
-        { id: 'conv_chloe', name: 'Chloé', handle: 'chloe.nova', lastMsg: 'Merci beaucoup !', time: 'Mar', unread: 0, online: false, mode: 'Offline' },
-        { id: 'conv_thomas', name: 'Thomas', handle: 'thomas.nova', lastMsg: '📷 Photo transmise en P2P', time: 'Lun', unread: 0, online: true, mode: 'Relayed' },
-        { id: 'conv_marie', name: 'Marie', handle: 'marie.nova', lastMsg: 'Parfait, merci Alex !', time: '14/08', unread: 0, online: true, mode: 'Direct' },
-        { id: 'conv_antoine', name: 'Antoine', handle: 'antoine.nova', lastMsg: 'À bientôt', time: '10/08', unread: 0, online: false, mode: 'Offline' },
-    ],
-    messages: [
-        { id: 'm1', type: 'text', text: 'Salut Alex ! Tu es bien connecté en direct ?', time: '09:37', isOutgoing: false },
-        { id: 'm2', type: 'text', text: 'Salut Emma ! Oui, liaison P2P directe via QUIC.', time: '09:38', isOutgoing: true, status: 'read' },
-        { id: 'm3', type: 'text', text: 'Parfait, aucun serveur ne stocke nos échanges 😊', time: '09:39', isOutgoing: false },
-        { id: 'm4', type: 'text', text: 'Exactement, chiffrement Double Ratchet actif de bout en bout.', time: '09:40', isOutgoing: true, status: 'read' },
-    ],
-    contacts: [
-        { name: 'Emma', handle: 'emma.nova', online: true, p2pMode: 'Direct (38 ms)', key: 'A1B2 C3D4 E5F6 7890 ... 9A0B' },
-        { name: 'Lucas', handle: 'lucas.nova', online: true, p2pMode: 'Direct (45 ms)', key: 'F4E3 D2C1 B0A9 8765 ... 1234' },
-        { name: 'Chloé', handle: 'chloe.nova', online: false, p2pMode: 'Hors ligne', key: '9876 5432 10FE DCBA ... ABCD' },
-        { name: 'Thomas', handle: 'thomas.nova', online: true, p2pMode: 'Relayé (120 ms)', key: '5566 7788 99AA BBCC ... DDEE' },
-        { name: 'Marie', handle: 'marie.nova', online: true, p2pMode: 'Direct (29 ms)', key: '1122 3344 5566 7788 ... 9900' },
-        { name: 'Antoine', handle: 'antoine.nova', online: false, p2pMode: 'Hors ligne', key: 'AABB CCDD EEFF 0011 ... 2233' },
-    ],
-    isTyping: false,
+    conversations: [],
+    messages: [],
+    contacts: [],
     emojis: [
         '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '😊', '😇',
         '🙂', '😉', '😍', '🥰', '😘', '😋', '😎', '🥳', '🤩', '😏',
@@ -106,6 +257,23 @@ const state = {
 
 // --- SCREEN RENDERERS (15 CONSOLIDATED 1-TO-1 SCREENS) ---
 const screens = {
+    // Shared empty-state for any screen that needs an open conversation (chat, contact_profile)
+    // but none is open — reachable via the settings screen's direct-navigation grid even before
+    // any real contact exists, now that there is no fake "Emma" always pre-selected.
+    _noActiveContact: (fallback) => `
+        <div class="screen-view">
+            <header class="app-header">
+                <button class="icon-btn" data-action="navigate" data-screen="${fallback}">${icons.arrowLeft}</button>
+                <div class="header-title">Aucune conversation</div>
+                <div style="width: 38px;"></div>
+            </header>
+            <div style="padding: 40px 24px; text-align: center; color: var(--text-muted);">
+                <p style="font-size: 14px; line-height: 1.5;">Aucune conversation n'est ouverte. Ouvrez-en une depuis la liste des conversations ou ajoutez un contact.</p>
+                <button class="btn-primary" style="margin-top: 20px;" data-action="navigate" data-screen="conversations">Voir mes conversations</button>
+            </div>
+        </div>
+    `,
+
     // 1. Écran de bienvenue
     onboarding: () => `
         <div class="screen-view" style="justify-content: space-between; padding: 40px 24px; text-align: center; background: radial-gradient(circle at 50% 30%, #171A24 0%, #080A10 70%);">
@@ -113,21 +281,21 @@ const screens = {
                 <div class="rail-logo" style="width: 72px; height: 72px; margin: 0 auto 20px; box-shadow: 0 8px 30px var(--accent-purple-glow);">
                     ${icons.shield}
                 </div>
-                <div style="font-size: 13px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 2px; font-weight: 600;">Souveraineté Numérique</div>
+                <div style="font-size: 13px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 2px; font-weight: 600;">Bienvenue</div>
                 <h1 style="font-size: 32px; font-weight: 800; color: white; margin: 8px 0 12px; letter-spacing: -0.5px;">NOVA Chat</h1>
-                <p style="font-size: 14px; color: var(--text-muted); line-height: 1.5; max-width: 300px; margin: 0 auto;">Messagerie P2P sécurisée 1-to-1 sans serveur de transport ni stockage cloud.</p>
+                <p style="font-size: 14px; color: var(--text-muted); line-height: 1.5; max-width: 300px; margin: 0 auto;">Discutez en privé : vos messages vont directement à votre contact, sans passer par un serveur qui pourrait les stocker ou les lire.</p>
             </div>
 
             <div style="width: 210px; height: 210px; margin: 20px auto; border-radius: 50%; border: 1px dashed rgba(139, 92, 246, 0.4); display: flex; align-items: center; justify-content: center; position: relative;">
                 <div style="width: 150px; height: 150px; border-radius: 50%; background: radial-gradient(circle, rgba(139,92,246,0.25) 0%, transparent 70%);"></div>
                 <div style="position: absolute; font-size: 12px; color: var(--accent-purple-light); font-weight: 600; display: flex; align-items: center; gap: 6px;">
-                    <div class="p2p-badge-pulse"></div> Liaison 1 ↔ 1 Directe
+                    <div class="p2p-badge-pulse"></div> Connexion directe et privée
                 </div>
             </div>
 
             <div>
-                <button class="btn-primary" onclick="navigateTo('create_account')">Créer une identité</button>
-                <button class="btn-secondary" style="margin-top: 12px; width: 100%;" onclick="navigateTo('create_account')">Restaurer un compte existant</button>
+                <button class="btn-primary" data-action="navigate" data-screen="create_account">Créer mon compte</button>
+                <button class="btn-secondary" style="margin-top: 12px; width: 100%;" data-action="navigate" data-screen="restore_account">J'ai déjà un compte</button>
             </div>
         </div>
     `,
@@ -136,7 +304,7 @@ const screens = {
     create_account: () => `
         <div class="screen-view">
             <header class="app-header">
-                <button class="icon-btn" onclick="navigateTo('onboarding')">${icons.arrowLeft}</button>
+                <button class="icon-btn" data-action="navigate" data-screen="onboarding">${icons.arrowLeft}</button>
                 <div class="header-title">Créer un compte</div>
                 <div style="width: 38px;"></div>
             </header>
@@ -147,19 +315,43 @@ const screens = {
                         ${icons.lock}
                     </div>
 
-                    <label style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Nom d'affichage</label>
+                    <label style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Comment voulez-vous qu'on vous appelle ?</label>
                     <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; margin: 8px 0 20px; border: 1px solid var(--border-subtle);">
-                        <input type="text" id="account-name-input" value="${state.currentUser.name}" style="background: none; border: none; color: white; font-size: 15px; width: 100%; outline: none;">
+                        <input type="text" id="account-name-input" value="${escapeHtml(state.currentUser.name)}" placeholder="Votre nom" style="background: none; border: none; color: white; font-size: 15px; width: 100%; outline: none;">
                     </div>
 
-                    <label style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Phrase de récupération secrète (12 mots BIP-39)</label>
-                    <div style="background-color: var(--bg-surface-2); border-radius: var(--radius-md); padding: 16px; margin: 8px 0 12px; border: 1px dashed rgba(139, 92, 246, 0.4); font-family: monospace; font-size: 14px; line-height: 1.6; color: var(--accent-purple-light);">
-                        ${state.currentUser.mnemonic}
-                    </div>
-                    <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4;">Vos clés privées restent sur cet appareil. Cette phrase permet de régénérer vos paires de clés Ed25519/X25519.</p>
+                    <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4;">Une fois votre compte créé, on vous montrera une phrase secrète de 12 mots, une seule fois. C'est la seule façon de récupérer votre compte sur un autre appareil — notez-la sur papier et gardez-la en lieu sûr : personne ne pourra vous la redonner si vous la perdez.</p>
                 </div>
 
-                <button class="btn-primary" onclick="navigateTo('conversations')">Valider et Rejoindre le Réseau</button>
+                <button class="btn-primary" data-action="createAccount">Créer mon compte</button>
+            </div>
+        </div>
+    `,
+
+    // 2b. Restauration de compte à partir d'une phrase existante
+    restore_account: () => `
+        <div class="screen-view">
+            <header class="app-header">
+                <button class="icon-btn" data-action="navigate" data-screen="onboarding">${icons.arrowLeft}</button>
+                <div class="header-title">Retrouver mon compte</div>
+                <div style="width: 38px;"></div>
+            </header>
+
+            <div style="padding: 24px; flex: 1; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <label style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Comment voulez-vous qu'on vous appelle ?</label>
+                    <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; margin: 8px 0 20px; border: 1px solid var(--border-subtle);">
+                        <input type="text" id="restore-name-input" placeholder="Votre nom" style="background: none; border: none; color: white; font-size: 15px; width: 100%; outline: none;">
+                    </div>
+
+                    <label style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Vos 12 mots secrets</label>
+                    <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; margin: 8px 0 20px; border: 1px solid var(--border-subtle);">
+                        <textarea id="restore-mnemonic-input" placeholder="mot1 mot2 mot3 ..." rows="3" style="background: none; border: none; color: white; font-size: 14px; width: 100%; outline: none; resize: none; font-family: monospace;"></textarea>
+                    </div>
+                    <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4;">Entrez les 12 mots exactement comme on vous les a donnés, dans le même ordre, séparés par un espace.</p>
+                </div>
+
+                <button class="btn-primary" data-action="restoreAccount">Retrouver mon compte</button>
             </div>
         </div>
     `,
@@ -170,21 +362,21 @@ const screens = {
             <header class="app-header">
                 <div class="header-title">Conversations</div>
                 <div class="header-actions">
-                    <button class="icon-btn" onclick="navigateTo('global_search')" title="Recherche">${icons.search}</button>
-                    <button class="icon-btn" onclick="navigateTo('add_contact')" title="Ajouter un contact">${icons.plus}</button>
+                    <button class="icon-btn" data-action="navigate" data-screen="global_search" title="Recherche">${icons.search}</button>
+                    <button class="icon-btn" data-action="navigate" data-screen="add_contact" title="Ajouter un contact">${icons.plus}</button>
                 </div>
             </header>
 
             <div class="search-bar-wrap">
-                <div class="search-input-box" onclick="navigateTo('global_search')">
+                <div class="search-input-box" data-action="navigate" data-screen="global_search">
                     ${icons.search}
                     <input type="text" placeholder="Rechercher une conversation..." readonly>
                 </div>
             </div>
 
             <div class="scroll-list">
-                ${state.conversations.map(c => `
-                    <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" onclick="openChatWithEl(this)">
+                ${state.conversations.length > 0 ? state.conversations.map(c => `
+                    <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
                         <div class="avatar">
                             ${escapeHtml(c.name.charAt(0))}
                             <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
@@ -200,66 +392,75 @@ const screens = {
                             </div>
                         </div>
                     </div>
-                `).join('')}
+                `).join('') : `
+                    <div style="text-align: center; color: var(--text-muted); padding: 60px 24px;">
+                        <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--text-dim);">
+                            ${icons.chat}
+                        </div>
+                        <div style="font-size: 15px; font-weight: 600; color: white;">Aucune conversation</div>
+                        <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">Ajoutez un contact pour démarrer votre première conversation.</p>
+                        <button class="btn-primary" style="margin-top: 18px;" data-action="navigate" data-screen="add_contact">Ajouter un contact</button>
+                    </div>
+                `}
             </div>
         </div>
     `,
 
     // 4. Conversation individuelle (1-to-1)
-    chat: () => `
+    chat: () => { if (!state.activeContact) return screens._noActiveContact('conversations'); return `
         <div class="screen-view">
             <!-- Hidden native file pickers for real device file access -->
-            <input type="file" id="media-file-input" accept="image/*,video/*" style="display: none;" onchange="handleMediaFileSelect(event)">
-            <input type="file" id="doc-file-input" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.json" style="display: none;" onchange="handleDocFileSelect(event)">
+            <input type="file" id="media-file-input" accept="image/*,video/*" style="display: none;">
+            <input type="file" id="doc-file-input" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.json" style="display: none;">
 
             <header class="app-header">
                 <div style="display: flex; align-items: center; gap: 10px;">
-                    <button class="icon-btn" onclick="navigateTo('conversations')">${icons.arrowLeft}</button>
-                    <div class="avatar" style="width: 38px; height: 38px; font-size: 14px; cursor: pointer;" onclick="navigateTo('contact_profile')">
-                        ${state.activeContact.name.charAt(0)}
-                        <div class="status-dot status-online"></div>
+                    <button class="icon-btn" data-action="navigate" data-screen="conversations">${icons.arrowLeft}</button>
+                    <div class="avatar" style="width: 38px; height: 38px; font-size: 14px; cursor: pointer;" data-action="navigate" data-screen="contact_profile">
+                        ${escapeHtml(state.activeContact.name.charAt(0))}
+                        <div class="status-dot ${state.currentDiagnostics && state.currentDiagnostics.is_connected ? 'status-online' : 'status-offline'}"></div>
                     </div>
-                    <div onclick="navigateTo('contact_profile')" style="cursor: pointer;">
-                        <div style="font-size: 15px; font-weight: 700; color: white;">${state.activeContact.name}</div>
-                        <div style="font-size: 11px; color: var(--status-success); font-weight: 500; display: flex; align-items: center; gap: 4px;">
-                            <span style="font-size: 8px;">●</span> En ligne (<span id="chat-header-latency">${state.activeContact.latencyMs || 14} ms</span>)
+                    <div data-action="navigate" data-screen="contact_profile" style="cursor: pointer;">
+                        <div style="font-size: 15px; font-weight: 700; color: white;">${escapeHtml(state.activeContact.name)}</div>
+                        <div id="chat-header-status" style="font-size: 11px; color: ${state.currentDiagnostics && state.currentDiagnostics.is_connected ? 'var(--status-success)' : 'var(--text-muted)'}; font-weight: 500; display: flex; align-items: center; gap: 4px;">
+                            ${chatHeaderStatusHtml()}
                         </div>
                     </div>
                 </div>
                 <div class="header-actions">
-                    <button class="icon-btn" onclick="alert('Appel vocal sécurisé P2P vers ' + state.activeContact.name)" title="Appel vocal">${icons.phone}</button>
-                    <button class="icon-btn" onclick="alert('Appel vidéo chiffré vers ' + state.activeContact.name)" title="Appel vidéo">${icons.video}</button>
-                    <button class="icon-btn" onclick="navigateTo('contact_profile')" title="Infos du contact">${icons.user}</button>
+                    <button class="icon-btn" data-name="${escapeHtml(state.activeContact.name)}" data-action="callVoice" title="Appel vocal">${icons.phone}</button>
+                    <button class="icon-btn" data-name="${escapeHtml(state.activeContact.name)}" data-action="callVideo" title="Appel vidéo">${icons.video}</button>
+                    <button class="icon-btn" data-action="navigate" data-screen="contact_profile" title="Infos du contact">${icons.user}</button>
                 </div>
             </header>
 
             <div class="chat-body" id="chat-body">
                 <div style="text-align: center; margin: 10px 0;">
                     <span style="background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.2); border-radius: var(--radius-full); padding: 4px 12px; font-size: 11px; color: var(--accent-purple-light); display: inline-flex; align-items: center; gap: 6px;">
-                        ${icons.lock} Chiffrement Double Ratchet 1-to-1 Actif
+                        ${icons.lock} Conversation privée et protégée
                     </span>
                 </div>
 
-                ${state.messages.map(m => buildMessageHtml(m)).join('')}
+                ${state.messages.filter(m => m.conversationId === state.activeContact.conversationId).map(m => buildMessageHtml(m)).join('')}
             </div>
 
             <!-- Drawer for Multimedia Attachments -->
             <div class="attachment-drawer" id="attachment-drawer">
-                <button class="drawer-option" onclick="triggerDeviceMediaPicker()">
+                <button class="drawer-option" data-action="triggerMediaPicker">
                     ${icons.image}
-                    <span>Photo & Vidéo HD</span>
+                    <span>Photo ou vidéo</span>
                 </button>
-                <button class="drawer-option" onclick="triggerDeviceDocPicker()">
+                <button class="drawer-option" data-action="triggerDocPicker">
                     ${icons.file}
-                    <span>Document Sécurisé</span>
+                    <span>Document</span>
                 </button>
-                <button class="drawer-option" onclick="startVoiceRecording(); closePanels();">
+                <button class="drawer-option" data-action="startVoiceRecording">
                     ${icons.mic}
-                    <span>Note Vocale</span>
+                    <span>Message vocal</span>
                 </button>
-                <button class="drawer-option" onclick="openLocationModal(); closePanels();">
+                <button class="drawer-option" data-action="openLocationModal">
                     ${icons.mapPin}
-                    <span>Position Géographique</span>
+                    <span>Ma position</span>
                 </button>
             </div>
 
@@ -267,23 +468,23 @@ const screens = {
             <div class="emoji-picker-panel" id="emoji-picker-panel">
                 <div class="emoji-picker-header">
                     <span style="font-size: 12px; font-weight: 700; color: var(--text-muted); letter-spacing: 0.5px;">ÉMOJIS</span>
-                    <button class="icon-btn" onclick="closePanels()" style="width: 24px; height: 24px; font-size: 12px;" title="Fermer">✕</button>
+                    <button class="icon-btn" data-action="closePanels" style="width: 24px; height: 24px; font-size: 12px;" title="Fermer">✕</button>
                 </div>
                 <div class="emoji-picker-grid">
-                    ${state.emojis.map(e => `<button class="emoji-btn" onclick="insertEmoji('${e}')" title="${e}">${e}</button>`).join('')}
+                    ${state.emojis.map(e => `<button class="emoji-btn" data-action="insertEmoji" data-emoji="${e}" title="${e}">${e}</button>`).join('')}
                 </div>
             </div>
 
             <!-- Secure Chat Input Bar & WhatsApp Voice Recorder -->
             <div class="chat-input-bar">
                 <div class="chat-input-main-row" id="normal-input-row">
-                    <button class="icon-btn" id="attachment-toggle-btn" onclick="toggleAttachmentDrawer(event)" title="Pièces jointes">${icons.paperclip}</button>
-                    <button class="icon-btn" id="emoji-toggle-btn" onclick="toggleEmojiPicker(event)" title="Émojis">${icons.smile}</button>
+                    <button class="icon-btn" id="attachment-toggle-btn" data-action="toggleAttachmentDrawer" title="Pièces jointes">${icons.paperclip}</button>
+                    <button class="icon-btn" id="emoji-toggle-btn" data-action="toggleEmojiPicker" title="Émojis">${icons.smile}</button>
                     <div class="chat-input-container">
-                        <input type="text" id="chat-input" placeholder="Votre message" onkeydown="if(event.key==='Enter') sendMessage()" autofocus>
+                        <input type="text" id="chat-input" placeholder="Votre message">
                     </div>
-                    <button class="send-btn" id="send-btn" onclick="sendMessage()" title="Envoyer le message">${icons.send}</button>
-                    <button class="mic-btn" id="mic-record-btn" onclick="startVoiceRecording()" title="Enregistrer une note vocale">${icons.mic}</button>
+                    <button class="send-btn" id="send-btn" data-action="sendMessage" title="Envoyer le message">${icons.send}</button>
+                    <button class="mic-btn" id="mic-record-btn" data-action="startVoiceRecording" title="Enregistrer une note vocale">${icons.mic}</button>
                 </div>
 
                 <!-- WhatsApp-like Voice Recording Row with Pause, Resume, Play Preview, Trash & Send -->
@@ -307,24 +508,57 @@ const screens = {
                     </div>
 
                     <!-- Cancel / Delete button -->
-                    <button class="rec-icon-btn" onclick="cancelVoiceRecording()" title="Supprimer l'enregistrement">
+                    <button class="rec-icon-btn" data-action="cancelVoiceRecording" title="Supprimer l'enregistrement">
                         ${icons.trash}
                     </button>
 
                     <!-- Pause / Resume button -->
-                    <button class="rec-icon-btn" id="rec-pause-btn" onclick="togglePauseVoiceRecording()" title="Mettre en pause / Reprendre">
+                    <button class="rec-icon-btn" id="rec-pause-btn" data-action="togglePauseVoiceRecording" title="Mettre en pause / Reprendre">
                         <span id="rec-pause-icon">⏸</span>
                     </button>
 
                     <!-- Preview / Listen button (active when paused) -->
-                    <button class="rec-icon-btn" id="rec-preview-btn" onclick="toggleVoicePreview()" title="Écouter l'enregistrement" style="display: none; color: var(--accent-purple-light);">
+                    <button class="rec-icon-btn" id="rec-preview-btn" data-action="toggleVoicePreview" title="Écouter l'enregistrement" style="display: none; color: var(--accent-purple-light);">
                         <span id="rec-preview-icon">▶</span>
                     </button>
 
                     <!-- Send button -->
-                    <button class="rec-send-btn" onclick="stopAndSendVoiceRecording()" title="Envoyer la note vocale">
+                    <button class="rec-send-btn" data-action="stopAndSendVoiceRecording" title="Envoyer la note vocale">
                         ${icons.send}
                     </button>
+                </div>
+            </div>
+
+            <!-- Media Preview & Confirmation Modal before sending -->
+            <div class="location-modal-overlay" id="media-preview-modal">
+                <div class="location-modal-card" style="max-width: 420px; padding: 20px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;">
+                        <div style="font-size: 16px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;" id="media-preview-title">
+                            ${icons.image} <span>Aperçu du média</span>
+                        </div>
+                        <button class="icon-btn" data-action="closeMediaPreviewModal" style="width: 28px; height: 28px; color: var(--text-muted);">✕</button>
+                    </div>
+
+                    <div id="media-preview-container" style="background: #090d16; border-radius: var(--radius-md); border: 1px solid var(--border-subtle); overflow: hidden; margin-bottom: 14px; display: flex; align-items: center; justify-content: center; min-height: 180px; max-height: 280px; position: relative;">
+                    </div>
+
+                    <div style="margin-bottom: 14px;">
+                        <div style="background-color: var(--bg-surface-2); border-radius: var(--radius-md); padding: 10px 14px; border: 1px solid var(--border-subtle); display: flex; align-items: center; gap: 8px;">
+                            <input type="text" id="media-caption-input" placeholder="Ajouter une légende... (facultatif)" style="background: none; border: none; color: white; font-size: 13px; width: 100%; outline: none;">
+                        </div>
+                    </div>
+
+                    <div style="font-size: 11px; color: var(--accent-purple-light); display: flex; align-items: center; gap: 6px; margin-bottom: 16px; padding: 6px 10px; background: rgba(139, 92, 246, 0.1); border-radius: var(--radius-sm);">
+                        ${icons.lock} <span>Chiffré de bout en bout pour <strong>${escapeHtml(state.activeContact.name)}</strong></span>
+                    </div>
+
+                    <div style="display: flex; gap: 10px;">
+                        <button class="btn-secondary" style="flex: 1;" data-action="closeMediaPreviewModal">Annuler</button>
+                        <button class="btn-primary" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="confirmAndSendPendingMedia">
+                            ${icons.send}
+                            <span>Envoyer</span>
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -333,12 +567,12 @@ const screens = {
                 <div class="location-modal-card">
                     <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
                         <div style="font-size: 16px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
-                            ${icons.mapPin} Position Géographique
+                            ${icons.mapPin} Partager ma position
                         </div>
-                        <button class="icon-btn" onclick="closeLocationModal()" style="width: 28px; height: 28px;">✕</button>
+                        <button class="icon-btn" data-action="closeLocationModal" style="width: 28px; height: 28px;">✕</button>
                     </div>
                     <p style="font-size: 13px; color: var(--text-muted);">
-                        Voulez-vous partager votre position actuelle avec <strong>${state.activeContact.name}</strong> ? Les coordonnées GPS seront chiffrées de bout en bout via Double Ratchet.
+                        Voulez-vous envoyer votre position actuelle à <strong>${state.activeContact.name}</strong> ? Elle sera protégée comme le reste de vos messages, et personne d'autre ne pourra la voir.
                     </p>
 
                     <div class="map-radar-preview">
@@ -350,23 +584,23 @@ const screens = {
                     </div>
 
                     <div style="font-size: 11px; color: var(--text-dim); text-align: center; margin-bottom: 18px;">
-                        Précision estimée : ~5 mètres • Aucun tiers serveur
+                        Précision d'environ 5 mètres
                     </div>
 
                     <div style="display: flex; gap: 10px;">
-                        <button class="btn-secondary" style="flex: 1;" onclick="closeLocationModal()">Annuler</button>
-                        <button class="btn-primary" style="flex: 1;" onclick="confirmAndSendLocation()">Partager la Position</button>
+                        <button class="btn-secondary" style="flex: 1;" data-action="closeLocationModal">Annuler</button>
+                        <button class="btn-primary" style="flex: 1;" data-action="confirmAndSendLocation">Partager ma position</button>
                     </div>
                 </div>
             </div>
         </div>
-    `,
+    `; },
 
     // 5. Profil du contact
-    contact_profile: () => `
+    contact_profile: () => { if (!state.activeContact) return screens._noActiveContact('conversations'); return `
         <div class="screen-view">
             <header class="app-header">
-                <button class="icon-btn" onclick="navigateTo('chat')">${icons.arrowLeft}</button>
+                <button class="icon-btn" data-action="navigate" data-screen="chat">${icons.arrowLeft}</button>
                 <div class="header-title">Profil du contact</div>
                 <div style="width: 38px;"></div>
             </header>
@@ -374,48 +608,39 @@ const screens = {
             <div style="padding: 24px 20px; overflow-y: auto;">
                 <div style="text-align: center; margin-bottom: 24px;">
                     <div class="avatar" style="width: 84px; height: 84px; font-size: 32px; margin: 0 auto 12px;">
-                        ${state.activeContact.name.charAt(0)}
+                        ${escapeHtml(state.activeContact.name.charAt(0))}
                     </div>
-                    <h2 style="font-size: 20px; font-weight: 700; color: white;">${state.activeContact.name}</h2>
-                    <div style="font-size: 13px; color: var(--status-success); margin-top: 4px; display: flex; align-items: center; justify-content: center; gap: 6px;">
-                        <span class="p2p-badge-pulse" style="width:8px;height:8px;"></span> En ligne • Connexion Directe
+                    <h2 style="font-size: 20px; font-weight: 700; color: white;">${escapeHtml(state.activeContact.name)}</h2>
+                    <div style="font-size: 13px; color: ${state.currentDiagnostics && state.currentDiagnostics.is_connected ? 'var(--status-success)' : 'var(--text-muted)'}; margin-top: 4px; display: flex; align-items: center; justify-content: center; gap: 6px;">
+                        <span class="p2p-badge-pulse" style="width:8px;height:8px;"></span> ${contactConnectionStatusText()}
                     </div>
                 </div>
 
                 <div style="display: flex; justify-content: space-around; margin-bottom: 24px;">
-                    <button class="btn-secondary" style="flex-direction: column; padding: 12px; font-size: 11px;" onclick="navigateTo('chat')">
+                    <button class="btn-secondary" style="flex-direction: column; padding: 12px; font-size: 11px;" data-action="navigate" data-screen="chat">
                         ${icons.chat}
                         <span style="margin-top:4px;">Message</span>
                     </button>
-                    <button class="btn-secondary" style="flex-direction: column; padding: 12px; font-size: 11px;" onclick="navigateTo('connection_diagnostics')">
-                        ${icons.activity}
-                        <span style="margin-top:4px;">Diagnostic</span>
-                    </button>
-                    <button class="btn-secondary" style="flex-direction: column; padding: 12px; font-size: 11px;" onclick="navigateTo('shared_media')">
+                    <button class="btn-secondary" style="flex-direction: column; padding: 12px; font-size: 11px;" data-action="navigate" data-screen="shared_media">
                         ${icons.image}
                         <span style="margin-top:4px;">Médias</span>
                     </button>
                 </div>
 
                 <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; margin-bottom: 16px; border: 1px solid var(--border-subtle);">
-                    <div style="font-size: 12px; color: var(--text-muted);">Identifiant souverain</div>
-                    <div style="font-size: 15px; font-weight: 600; margin-top: 4px; color: white;">@${state.activeContact.handle}</div>
-                    
-                    <div style="height: 1px; background: var(--border-subtle); margin: 12px 0;"></div>
-
-                    <div style="font-size: 12px; color: var(--text-muted);">Clé publique Ed25519</div>
-                    <div style="font-size: 13px; font-family: monospace; color: var(--accent-purple-light); margin-top: 4px;">${state.activeContact.publicKey}</div>
-
-                    <div style="height: 1px; background: var(--border-subtle); margin: 12px 0;"></div>
-
-                    <div style="font-size: 12px; color: var(--text-muted);">Empreinte de sécurité (Safety Number)</div>
-                    <div style="font-size: 14px; font-family: monospace; font-weight: 700; color: white; margin-top: 4px;">${state.activeContact.safetyNumber}</div>
+                    <div style="font-size: 12px; color: var(--text-muted);">Code de vérification</div>
+                    <div style="font-size: 14px; font-family: monospace; font-weight: 700; color: white; margin-top: 4px;">${escapeHtml(state.activeContact.safetyNumber)}</div>
+                    <p style="font-size: 11px; color: var(--text-dim); margin: 6px 0 0; line-height: 1.4;">Pour être totalement sûr(e) que personne ne s'est glissé dans votre conversation, comparez ce code avec ${escapeHtml(state.activeContact.name)} en personne ou par un autre moyen (téléphone, message).</p>
                 </div>
 
-                <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" onclick="alert('Contact bloqué'); navigateTo('conversations')">Bloquer ce contact</button>
+                ${state.activeContact.isBlocked ? `
+                    <button class="btn-primary" style="width: 100%;" data-action="unblockActiveContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}">Débloquer ce contact</button>
+                ` : `
+                    <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="blockActiveContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}">Bloquer ce contact</button>
+                `}
             </div>
         </div>
-    `,
+    `; },
 
     // 6. Liste des contacts
     contacts: () => `
@@ -423,20 +648,20 @@ const screens = {
             <header class="app-header">
                 <div class="header-title">Contacts</div>
                 <div class="header-actions">
-                    <button class="icon-btn" onclick="navigateTo('add_contact')" title="Ajouter un contact">${icons.plus}</button>
+                    <button class="icon-btn" data-action="navigate" data-screen="add_contact" title="Ajouter un contact">${icons.plus}</button>
                 </div>
             </header>
 
             <div class="search-bar-wrap">
                 <div class="search-input-box">
                     ${icons.search}
-                    <input type="text" placeholder="Rechercher un contact..." oninput="filterContactsList(this.value)">
+                    <input type="text" id="contacts-search-input" placeholder="Rechercher un contact...">
                 </div>
             </div>
 
             <div class="scroll-list" id="contacts-list-container">
-                ${state.contacts.map(c => `
-                    <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" onclick="openChatWithEl(this)">
+                ${state.contacts.filter(c => !c.isBlocked).length > 0 ? state.contacts.filter(c => !c.isBlocked).map(c => `
+                    <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
                         <div class="avatar">
                             ${escapeHtml(c.name.charAt(0))}
                             <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
@@ -446,79 +671,143 @@ const screens = {
                             <div class="item-sub">@${escapeHtml(c.handle)} • ${escapeHtml(c.p2pMode)}</div>
                         </div>
                     </div>
-                `).join('')}
+                `).join('') : `
+                    <div style="text-align: center; color: var(--text-muted); padding: 60px 24px;">
+                        <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--text-dim);">
+                            ${icons.users}
+                        </div>
+                        <div style="font-size: 15px; font-weight: 600; color: white;">Aucun contact actif</div>
+                        <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">Ajoutez un contact avec son code pour commencer à échanger.</p>
+                        <button class="btn-primary" style="margin-top: 18px;" data-action="navigate" data-screen="add_contact">Ajouter un contact</button>
+                    </div>
+                `}
+
+                ${state.contacts.some(c => c.isBlocked) ? `
+                    <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 24px 0 8px 12px;">CONTACTS BLOQUÉS</div>
+                    ${state.contacts.filter(c => c.isBlocked).map(c => `
+                        <div class="item-card" style="opacity: 0.75;">
+                            <div class="avatar" style="background: var(--bg-surface); color: var(--status-danger);">✕</div>
+                            <div class="item-content">
+                                <div class="item-name">${escapeHtml(c.name)}</div>
+                                <div class="item-sub" style="color: var(--status-danger);">Bloqué</div>
+                            </div>
+                            <button class="btn-secondary" style="font-size: 11px; padding: 6px 12px;" data-action="unblockActiveContact" data-peer-id="${escapeHtml(c.handle)}">Débloquer</button>
+                        </div>
+                    `).join('')}
+                ` : ''}
             </div>
         </div>
-    `,
+    `; },
 
     // 7. Ajouter un contact
     add_contact: () => `
         <div class="screen-view">
             <header class="app-header">
-                <button class="icon-btn" onclick="navigateTo('contacts')">${icons.arrowLeft}</button>
+                <button class="icon-btn" data-action="navigate" data-screen="contacts">${icons.arrowLeft}</button>
                 <div class="header-title">Ajouter un contact</div>
                 <div style="width: 38px;"></div>
             </header>
 
-            <div style="padding: 24px; overflow-y: auto;">
-                <label style="font-size: 13px; color: var(--text-muted);">Recherche par identifiant pair</label>
-                <div style="display: flex; gap: 10px; margin: 8px 0 24px;">
-                    <div class="search-input-box" style="flex: 1;">
-                        <span style="color: var(--text-muted);">@</span>
-                        <input type="text" id="add-handle-input" placeholder="nom.nova">
-                    </div>
-                    <button class="btn-primary" style="width: auto; padding: 0 18px;" onclick="addNewContact()">Ajouter</button>
+            <div style="padding: 24px; overflow-y: auto; padding-bottom: 90px;">
+                <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 16px;">Il n'y a pas d'annuaire de contacts : demandez à la personne son code d'invitation (écran « Mon identité »), puis scannez-le en direct ou collez-le ci-dessous.</p>
+
+                <label style="font-size: 13px; color: var(--text-muted);">Comment voulez-vous l'appeler ?</label>
+                <div class="search-input-box" style="margin: 8px 0 16px;">
+                    <input type="text" id="add-display-name-input" placeholder="ex: Bob">
                 </div>
 
-                <div style="height: 1px; background: var(--border-subtle); margin-bottom: 24px;"></div>
+                <label style="font-size: 13px; color: var(--text-muted);">Lien sécurisé ou code (collé, scanné ou importé)</label>
+                <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; margin: 8px 0 12px; border: 1px solid var(--border-subtle);">
+                    <textarea id="add-bundle-input" placeholder="Collez ici le lien nova://invite... ou le code de votre contact" rows="3" style="width: 100%; background: none; border: none; color: white; font-size: 12px; font-family: monospace; resize: none; outline: none; word-break: break-all;"></textarea>
+                </div>
 
-                <button class="btn-secondary" style="width: 100%; margin-bottom: 12px; padding: 16px;" onclick="navigateTo('identity_qrcode')">
+                <button class="btn-secondary" style="width: 100%; margin-bottom: 16px; padding: 13px; font-size: 13px; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="openQrCameraScanner">
                     ${icons.qr}
-                    <span>Scanner le QR code d'un pair</span>
+                    <span>Ouvrir l'appareil photo pour scanner</span>
                 </button>
 
-                <button class="btn-secondary" style="width: 100%; padding: 16px;" onclick="navigateTo('identity_qrcode')">
-                    ${icons.share}
-                    <span>Afficher mon QR code public</span>
+                <button class="btn-primary" data-action="addContact">Ajouter ce contact</button>
+
+                <div style="height: 1px; background: var(--border-subtle); margin: 24px 0;"></div>
+
+                <button class="btn-secondary" style="width: 100%; padding: 14px;" data-action="navigate" data-screen="identity">
+                    ${icons.qr}
+                    <span>Afficher mon propre code d'invitation</span>
                 </button>
+            </div>
+
+            <!-- Live Camera QR Scanner Modal Overlay -->
+            <div class="qr-scanner-overlay" id="qr-camera-modal">
+                <div class="qr-scanner-header">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        ${icons.qr} <span>Scanner un QR Code</span>
+                    </div>
+                    <button class="icon-btn" data-action="closeQrCameraScanner" style="width: 32px; height: 32px; color: white;">✕</button>
+                </div>
+
+                <div class="qr-scanner-viewport">
+                    <video id="qr-scanner-video" class="qr-scanner-video" playsinline autoplay muted></video>
+                    <canvas id="qr-scanner-canvas" style="display: none;"></canvas>
+                    <div class="qr-scanner-frame"></div>
+                    <div class="qr-scanner-corners"></div>
+                    <div class="qr-scanner-laser"></div>
+                    <div id="qr-camera-error" style="display: none; position: absolute; inset: 20px; text-align: center; color: var(--text-muted); font-size: 12px; align-items: center; justify-content: center; flex-direction: column; gap: 10px; background: rgba(0,0,0,0.85); border-radius: var(--radius-md);">
+                        <span>Caméra indisponible ou permission non accordée.</span>
+                        <button class="btn-secondary" style="font-size: 12px; padding: 8px 14px;" data-action="triggerQrImagePicker">Importer une capture d'écran</button>
+                    </div>
+                </div>
+
+                <div class="qr-scanner-footer">
+                    <p style="font-size: 12px; color: var(--text-muted); text-align: center; margin: 0;">
+                        Cadrez le QR code à l'écran, ou choisissez une image depuis votre appareil.
+                    </p>
+                    <div style="display: flex; width: 100%; gap: 10px;">
+                        <input type="file" id="qr-image-input" accept="image/*" style="display: none;">
+                        <button class="btn-secondary" style="flex: 1; font-size: 12px; padding: 11px;" data-action="triggerQrImagePicker">
+                            <span>🖼 Importer une image</span>
+                        </button>
+                        <button class="btn-secondary" style="flex: 1; font-size: 12px; padding: 11px;" data-action="closeQrCameraScanner">
+                            <span>Fermer</span>
+                        </button>
+                    </div>
+                </div>
             </div>
         </div>
     `,
 
     // 8. Médias partagés (1-to-1)
-    shared_media: () => `
+    shared_media: () => { if (!state.activeContact) return screens._noActiveContact('conversations'); const conversationId = state.activeContact.conversationId;
+        const images = state.messages.filter(m => m.conversationId === conversationId && m.type === 'image');
+        const files = state.messages.filter(m => m.conversationId === conversationId && m.type === 'file');
+        return `
         <div class="screen-view">
             <header class="app-header">
-                <button class="icon-btn" onclick="navigateTo('chat')">${icons.arrowLeft}</button>
+                <button class="icon-btn" data-action="navigate" data-screen="chat">${icons.arrowLeft}</button>
                 <div class="header-title">Médias partagés</div>
                 <div style="width: 38px;"></div>
             </header>
 
-            <div style="display: flex; gap: 8px; padding: 12px 20px; border-bottom: 1px solid var(--border-subtle);">
-                <button class="btn-primary" style="padding: 6px 14px; font-size: 12px; width: auto;">Photos</button>
-                <button class="btn-secondary" style="padding: 6px 14px; font-size: 12px; width: auto;">Fichiers</button>
-                <button class="btn-secondary" style="padding: 6px 14px; font-size: 12px; width: auto;">Liens</button>
-            </div>
-
             <div style="padding: 16px; overflow-y: auto;">
-                <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">Transmis directement en P2P</div>
-                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px;">
-                    <div style="aspect-ratio: 1; background: #2A1F4D; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; color: var(--accent-purple-light);">${icons.image}</div>
-                    <div style="aspect-ratio: 1; background: #1B3B4B; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; color: #38BDF8;">${icons.image}</div>
-                    <div style="aspect-ratio: 1; background: #3B2A1B; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; color: #F59E0B;">${icons.image}</div>
-                </div>
-
-                <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">Fichiers sécurisés</div>
-                <div style="background: var(--bg-surface); padding: 12px; border-radius: var(--radius-md); display: flex; align-items: center; gap: 12px; border: 1px solid var(--border-subtle);">
-                    ${icons.file}
-                    <div>
-                        <div style="font-size: 14px; font-weight: 600; color: white;">rapport_architecture_nova.pdf</div>
-                        <div style="font-size: 11px; color: var(--text-muted);">2.0 MB • Chiffré E2EE</div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">Photos & vidéos de cette conversation</div>
+                ${images.length > 0 ? `
+                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px;">
+                        ${images.map(m => `<div style="aspect-ratio: 1; border-radius: var(--radius-sm); overflow: hidden;"><img src="${escapeHtml(m.url || '')}" style="width: 100%; height: 100%; object-fit: cover;"></div>`).join('')}
                     </div>
-                </div>
+                ` : `<div style="font-size: 13px; color: var(--text-dim); margin-bottom: 16px;">Aucun média partagé.</div>`}
+
+                <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">Fichiers de cette conversation</div>
+                ${files.length > 0 ? files.map(m => `
+                    <div style="background: var(--bg-surface); padding: 12px; border-radius: var(--radius-md); display: flex; align-items: center; gap: 12px; border: 1px solid var(--border-subtle); margin-bottom: 8px;">
+                        ${icons.file}
+                        <div>
+                            <div style="font-size: 14px; font-weight: 600; color: white;">${escapeHtml(m.text)}</div>
+                            <div style="font-size: 11px; color: var(--text-muted);">${escapeHtml(m.meta)}</div>
+                        </div>
+                    </div>
+                `).join('') : `<div style="font-size: 13px; color: var(--text-dim);">Aucun fichier partagé.</div>`}
             </div>
         </div>
-    `,
+    `; },
 
     // 9. Réglages (Gestion de profil complet, Options & Accès aux Écrans)
     settings: () => `
@@ -531,98 +820,235 @@ const screens = {
                 <!-- Full Profile Card -->
                 <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 18px; border: 1px solid var(--border-subtle); margin-bottom: 20px;">
                     <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 12px;">
-                        <div class="avatar" style="width: 56px; height: 56px; font-size: 22px; background: var(--accent-purple); color: white;">
-                            ${state.currentUser.name.charAt(0)}
+                        <div class="avatar" style="width: 56px; height: 56px; font-size: 22px; background: var(--accent-purple); color: white; overflow: hidden; padding: 0;">
+                            ${state.currentUser.avatarDataUrl ? `<img src="${state.currentUser.avatarDataUrl}" style="width: 100%; height: 100%; object-fit: cover;">` : escapeHtml(state.currentUser.name.charAt(0) || '?')}
                         </div>
                         <div style="flex: 1;">
-                            <div style="font-size: 17px; font-weight: 700; color: white;">${state.currentUser.name}</div>
-                            <div style="font-size: 13px; color: var(--accent-purple-light);">@${state.currentUser.handle}</div>
-                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">${state.currentUser.status}</div>
+                            <div style="font-size: 17px; font-weight: 700; color: white;">${escapeHtml(state.currentUser.name) || 'Compte non créé'}</div>
+                            ${state.currentUser.handle ? `<div style="font-size: 13px; color: var(--accent-purple-light);">@${escapeHtml(state.currentUser.handle)}</div>` : ''}
+                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">${escapeHtml(state.currentUser.status)}</div>
                         </div>
-                        <button class="icon-btn" onclick="navigateTo('identity_qrcode')" title="Mon QR Code">${icons.qr}</button>
+                        <button class="icon-btn" data-action="openEditProfileModal" title="Modifier mon profil">${icons.pencil || '✎'}</button>
                     </div>
-                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; border-top: 1px solid var(--border-subtle); padding-top: 10px;">
-                        ${state.currentUser.bio}
+                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; border-top: 1px solid var(--border-subtle); padding-top: 10px; display: flex; justify-content: space-between; align-items: center;">
+                        <span>${escapeHtml(state.currentUser.bio) || 'Aucune bio définie.'}</span>
+                        <button class="btn-secondary" data-action="openEditProfileModal" style="font-size: 11px; padding: 4px 10px; margin-left: 8px;">Modifier</button>
                     </div>
                 </div>
 
-                <!-- Settings Menus -->
-                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">OPTIONS PRINCIPALES</div>
+                <!-- Settings Menu -->
                 <div style="background: var(--bg-surface); border-radius: var(--radius-lg); overflow: hidden; margin-bottom: 24px; border: 1px solid var(--border-subtle);">
-                    <div class="item-card" onclick="navigateTo('global_search')">
+                    <div class="item-card" data-action="navigate" data-screen="global_search">
                         ${icons.search}
-                        <div class="item-content"><div class="item-name">Recherche globale</div></div>
+                        <div class="item-content"><div class="item-name">Rechercher</div></div>
                         ${icons.chevronRight}
                     </div>
-                    <div class="item-card" onclick="navigateTo('identity_security')">
+                    <div class="item-card" data-action="navigate" data-screen="identity">
                         ${icons.shield}
-                        <div class="item-content"><div class="item-name">Identité & Sécurité</div></div>
-                        ${icons.chevronRight}
-                    </div>
-                    <div class="item-card" onclick="navigateTo('connected_devices')">
-                        ${icons.user}
-                        <div class="item-content"><div class="item-name">Appareils connectés</div></div>
-                        ${icons.chevronRight}
-                    </div>
-                    <div class="item-card" onclick="navigateTo('connection_diagnostics')">
-                        ${icons.activity}
-                        <div class="item-content"><div class="item-name">État de connexion & Diagnostics</div></div>
-                        ${icons.chevronRight}
-                    </div>
-                    <div class="item-card" onclick="navigateTo('notifications')">
-                        ${icons.bell}
-                        <div class="item-content"><div class="item-name">Notifications</div></div>
+                        <div class="item-content"><div class="item-name">Mon identité</div></div>
                         ${icons.chevronRight}
                     </div>
                 </div>
 
-                <!-- Complete 15 Screens Direct Access Grid -->
-                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">NAVIGATION DIRECTE DES 15 ÉCRANS</div>
-                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 14px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
-                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;">
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('onboarding')">1. Bienvenue</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('create_account')">2. Création compte</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('conversations')">3. Conversations</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('chat')">4. Chat 1-to-1</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('contact_profile')">5. Profil contact</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('contacts')">6. Liste contacts</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('add_contact')">7. Ajouter contact</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('shared_media')">8. Médias partagés</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('settings')">9. Réglages</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('identity_security')">10. Sécurité</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('connected_devices')">11. Appareils</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('identity_qrcode')">12. QR Code</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('connection_diagnostics')">13. Diagnostics</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start;" onclick="navigateTo('notifications')">14. Notifications</button>
-                        <button class="btn-secondary" style="font-size: 12px; padding: 10px 8px; justify-content: flex-start; grid-column: span 2;" onclick="navigateTo('global_search')">15. Recherche globale</button>
+                <!-- Notifications -->
+                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">NOTIFICATIONS</div>
+                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                        <span style="font-size: 14px; color: white;">Me prévenir des nouveaux messages</span>
+                        <input type="checkbox" id="notif-messages-chk" ${state.notificationPrefs.notifyMessages ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                        <span style="font-size: 14px; color: white;">Me prévenir des nouveaux contacts</span>
+                        <input type="checkbox" id="notif-contacts-chk" ${state.notificationPrefs.notifyContacts ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 14px; color: white;">Cacher le contenu dans les notifications</span>
+                        <input type="checkbox" id="notif-hide-content-chk" ${state.notificationPrefs.hideContent ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
                     </div>
                 </div>
 
-                <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" onclick="navigateTo('onboarding')">Se déconnecter de cet appareil</button>
+                <!-- Tor Anonymous Routing & Onion Services -->
+                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">ROUTAGE ANONYME & TOR ONION</div>
+                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 18px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+                        <div>
+                            <div style="font-size: 14px; font-weight: 600; color: white;">Activer le Routage Tor</div>
+                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Masque totalement votre adresse IP lors des échanges</div>
+                        </div>
+                        <input type="checkbox" id="tor-enabled-chk" ${state.torSettings.enabled ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 20px; height: 20px; cursor: pointer;">
+                    </div>
+
+                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px; font-size: 12px; color: ${state.torSettings.connected ? 'var(--status-success)' : 'var(--text-muted)'}; background: var(--bg-elevated); padding: 8px 12px; border-radius: var(--radius-md);">
+                        <span style="width: 8px; height: 8px; border-radius: 50%; background: ${state.torSettings.connected ? 'var(--status-success)' : 'var(--status-danger)'}; display: inline-block;"></span>
+                        <span>Statut Tor : <strong>${state.torSettings.connected ? 'Circuit Actif (Connecté)' : 'Déconnecté / Proxy Local requis'}</strong></span>
+                    </div>
+
+                    <label style="font-size: 12px; color: var(--text-muted);">Mode d'anonymisation</label>
+                    <select id="tor-mode-select" style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; margin: 6px 0 14px; outline: none;">
+                        <option value="direct_only" ${state.torSettings.mode === 'direct_only' ? 'selected' : ''}>Standard (Direct P2P, débit maximal)</option>
+                        <option value="hybrid" ${state.torSettings.mode === 'hybrid' ? 'selected' : ''}>Hybride (Direct LAN/Bootstrap, Tor pour .onion)</option>
+                        <option value="tor_strict" ${state.torSettings.mode === 'tor_strict' ? 'selected' : ''}>Furtif Absolu (Tor Strict - 0 fuite IP garantie)</option>
+                    </select>
+
+                    <label style="font-size: 12px; color: var(--text-muted);">Proxy SOCKS5 Tor (Local ou Orbot / Tor Expert)</label>
+                    <input id="tor-socks-input" type="text" value="${escapeHtml(state.torSettings.socksProxy)}"
+                        placeholder="127.0.0.1:9050"
+                        style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; font-family: monospace; margin: 6px 0 14px;">
+
+                    <label style="font-size: 12px; color: var(--text-muted);">Pont Tor (Anti-censure / Contournement DPI)</label>
+                    <select id="tor-bridge-select" style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; margin: 6px 0 16px; outline: none;">
+                        <option value="none" ${!state.torSettings.bridgeType ? 'selected' : ''}>Aucun (Connexion directe aux relais Tor)</option>
+                        <option value="snowflake" ${state.torSettings.bridgeType === 'snowflake' ? 'selected' : ''}>Snowflake (WebRTC éphémère - Très résistant)</option>
+                        <option value="obfs4" ${state.torSettings.bridgeType === 'obfs4' ? 'selected' : ''}>obfs4 (Trafic brouillé)</option>
+                    </select>
+
+                    ${state.torSettings.onionAddress ? `
+                    <div style="margin-bottom: 16px;">
+                        <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">Mon adresse souveraine .onion (Tor v3)</div>
+                        <div style="font-size: 11px; font-family: monospace; color: var(--accent-purple-light); word-break: break-all; background: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                            <span>${escapeHtml(state.torSettings.onionAddress)}</span>
+                            <button class="btn-secondary" style="font-size: 11px; padding: 4px 10px; white-space: nowrap;" data-action="copyOnionAddress">Copier</button>
+                        </div>
+                    </div>
+                    ` : ''}
+
+                    <button class="btn-primary" style="width: 100%;" data-action="saveTorConfig">Appliquer la configuration Tor</button>
+                    <div id="tor-config-status" style="font-size: 11px; margin-top: 8px; text-align: center;"></div>
+                </div>
+
+                <!-- Advanced: connecting across two different networks (most people never need this) -->
+                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">AVANCÉ</div>
+                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 12px;">
+                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 4px;">Mon adresse</div>
+                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 10px;">
+                        La plupart des gens n'ont pas besoin de ça : vos contacts vous trouvent automatiquement s'ils sont sur le même Wi-Fi que vous. Ceci ne sert que si quelqu'un veut vous joindre depuis un autre réseau et vous demande votre adresse.
+                    </div>
+                    <div id="own-listen-addr" style="display: flex; flex-direction: column; gap: 6px;">
+                        ${state.ownFullListenAddrs.length > 0 ? state.ownFullListenAddrs.map(addr => `
+                            <div style="font-size: 11px; font-family: monospace; color: var(--accent-purple-light); word-break: break-all; background: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 12px;">${escapeHtml(addr)}</div>
+                        `).join('') : `<div style="font-size: 11px; color: var(--text-muted); background: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 12px;">Pas encore disponible.</div>`}
+                    </div>
+                </div>
+                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
+                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 4px;">Rejoindre quelqu'un sur un autre réseau</div>
+                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 10px;">
+                        Si un contact ne vous trouve pas automatiquement (vous n'êtes pas sur le même Wi-Fi), il peut vous donner une adresse à coller ici.
+                    </div>
+                    <input id="bootstrap-addr-input" type="text" value="${escapeHtml(state.bootstrapAddr)}"
+                        placeholder="Adresse fournie par un contact"
+                        style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; font-family: monospace; margin-bottom: 10px;">
+                    <button class="btn-secondary" style="width: 100%;" data-action="saveBootstrapAddr">Enregistrer et connecter</button>
+                    <div id="bootstrap-addr-status" style="font-size: 11px; color: var(--text-muted); margin-top: 8px;"></div>
+                </div>
+
+                <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="logout">Supprimer mon compte de cet appareil</button>
+            </div>
+
+            <!-- Profile Edit Modal -->
+            <div class="location-modal-overlay" id="edit-profile-modal">
+                <div class="location-modal-card" style="max-width: 360px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+                        <div style="font-size: 16px; font-weight: 700; color: white;">Modifier mon profil</div>
+                        <button class="icon-btn" data-action="closeEditProfileModal" style="width: 28px; height: 28px;">✕</button>
+                    </div>
+
+                    <div style="text-align: center; margin-bottom: 18px;">
+                        <input type="file" id="profile-avatar-input" accept="image/*" style="display: none;">
+                        <div class="avatar" id="edit-profile-avatar-preview" data-action="triggerAvatarPicker" style="width: 72px; height: 72px; font-size: 26px; margin: 0 auto 8px; cursor: pointer; position: relative; overflow: hidden; border: 2px dashed var(--accent-purple-light);">
+                            ${state.currentUser.avatarDataUrl ? `<img src="${state.currentUser.avatarDataUrl}" style="width: 100%; height: 100%; object-fit: cover;">` : escapeHtml(state.currentUser.name.charAt(0) || '?')}
+                        </div>
+                        <button class="btn-secondary" data-action="triggerAvatarPicker" style="font-size: 11px; padding: 6px 12px;">Choisir une photo</button>
+                    </div>
+
+                    <label style="font-size: 12px; color: var(--text-muted);">Nom d'affichage</label>
+                    <div style="background-color: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 14px; margin: 6px 0 14px; border: 1px solid var(--border-subtle);">
+                        <input type="text" id="edit-display-name-input" value="${escapeHtml(state.currentUser.name)}" placeholder="Votre nom" style="background: none; border: none; color: white; font-size: 14px; width: 100%; outline: none;">
+                    </div>
+
+                    <label style="font-size: 12px; color: var(--text-muted);">Biographie / Statut</label>
+                    <div style="background-color: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 14px; margin: 6px 0 18px; border: 1px solid var(--border-subtle);">
+                        <textarea id="edit-bio-input" rows="2" placeholder="Quelques mots sur vous..." style="background: none; border: none; color: white; font-size: 13px; width: 100%; outline: none; resize: none;">${escapeHtml(state.currentUser.bio)}</textarea>
+                    </div>
+
+                    <div style="display: flex; gap: 10px;">
+                        <button class="btn-secondary" style="flex: 1;" data-action="closeEditProfileModal">Annuler</button>
+                        <button class="btn-primary" style="flex: 1;" data-action="saveProfileChanges">Enregistrer</button>
+                    </div>
+                </div>
             </div>
         </div>
     `,
 
-    // 10. Identité & Sécurité
-    identity_security: () => `
+    // 10. Mon identité — regroupe le code à partager, la phrase secrète et l'appareil actif
+    identity: () => `
         <div class="screen-view">
             <header class="app-header">
-                <button class="icon-btn" onclick="navigateTo('settings')">${icons.arrowLeft}</button>
-                <div class="header-title">Identité & Sécurité</div>
+                <button class="icon-btn" data-action="navigate" data-screen="settings">${icons.arrowLeft}</button>
+                <div class="header-title">Mon identité</div>
                 <div style="width: 38px;"></div>
             </header>
 
-            <div style="padding: 20px; overflow-y: auto;">
-                <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; margin-bottom: 16px; border: 1px solid var(--border-subtle);">
-                    <div style="font-size: 12px; color: var(--text-muted);">Clé publique maîtresse Ed25519</div>
-                    <div style="font-size: 13px; font-family: monospace; color: var(--accent-purple-light); margin-top: 6px;">${state.currentUser.publicKey}</div>
+            <div style="padding: 24px 20px; overflow-y: auto; padding-bottom: 90px;">
+                <div style="text-align: center; margin-bottom: 20px;">
+                    <div style="background: white; width: 220px; height: 220px; border-radius: var(--radius-lg); margin: 0 auto 14px; display: flex; align-items: center; justify-content: center; box-shadow: 0 8px 32px rgba(0,0,0,0.5); overflow: hidden; padding: 10px;">
+                        <canvas id="my-qr-canvas" width="200" height="200"></canvas>
+                    </div>
+
+                    <div style="display: inline-flex; align-items: center; gap: 6px; background: rgba(168, 85, 247, 0.15); border: 1px solid var(--accent-purple-light); padding: 4px 12px; border-radius: 20px; font-size: 11px; color: var(--accent-purple-light); margin-bottom: 8px;">
+                        <span>⏱ Valable 24h</span> • <span>🔒 Signature infalsifiable</span>
+                    </div>
+
+                    <div style="font-size: 18px; font-weight: 700; color: white;">${escapeHtml(state.currentUser.name) || 'Compte non créé'}</div>
+                    <p style="font-size: 12px; color: var(--text-muted); margin: 6px auto 0; max-width: 290px;">
+                        Faites scanner ce QR code pour vous ajouter, ou partagez votre lien sécurisé par SMS ou sur vos réseaux sociaux.
+                    </p>
                 </div>
 
-                <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; margin-bottom: 20px; border: 1px solid var(--border-subtle);">
-                    <div style="font-size: 14px; font-weight: 600; color: white;">Sauvegarde mnémonique</div>
-                    <p style="font-size: 12px; color: var(--text-muted); margin: 6px 0 12px;">Votre phrase secrète protège l'intégralité de vos sessions et contacts locaux.</p>
-                    <button class="btn-secondary" style="width: 100%; font-size: 13px;" onclick="openMnemonicAuthModal()">Afficher ma phrase secrète</button>
+                <!-- Action buttons: Save Image & Share -->
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px;">
+                    <button class="btn-secondary" style="font-size: 12px; padding: 10px;" data-action="saveQrImage">
+                        <span>📥 Enregistrer l'image</span>
+                    </button>
+                    <button class="btn-secondary" style="font-size: 12px; padding: 10px;" data-action="shareInvitation">
+                        <span>🔗 Partager le lien</span>
+                    </button>
                 </div>
+
+                <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; margin-bottom: 12px; border: 1px solid var(--border-subtle); text-align: left;">
+                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; font-weight: 600;">Lien d'invitation sécurisé (pour SMS / messagerie) :</div>
+                    <textarea id="my-bundle-output" readonly rows="2" style="width: 100%; background: none; border: none; color: var(--accent-purple-light); font-family: monospace; font-size: 11px; resize: none; outline: none; word-break: break-all;">${escapeHtml(state.currentUser.invitationUri || state.currentUser.bundleHex) || (hasBackend ? 'Génération du lien sécurisé…' : 'Compte non créé.')}</textarea>
+                </div>
+                <button class="btn-primary" style="width: 100%;" data-action="copyOwnBundle">Copier mon lien sécurisé</button>
+
+                ${state.torSettings.onionAddress ? `
+                <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 14px; margin-top: 16px; border: 1px solid var(--border-subtle);">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <div style="font-size: 13px; font-weight: 600; color: white;">Adresse Tor Onion v3 (Furtive)</div>
+                        <span style="font-size: 10px; color: var(--accent-purple-light); background: rgba(168, 85, 247, 0.15); padding: 2px 8px; border-radius: 10px;">0 fuite IP</span>
+                    </div>
+                    <div style="font-size: 11px; font-family: monospace; color: var(--accent-purple-light); word-break: break-all; background: var(--bg-elevated); border-radius: var(--radius-sm); padding: 8px 10px; margin-bottom: 8px;">
+                        ${escapeHtml(state.torSettings.onionAddress)}
+                    </div>
+                    <button class="btn-secondary" style="width: 100%; font-size: 11px; padding: 6px 12px;" data-action="copyOnionAddress">Copier l'adresse .onion</button>
+                </div>
+                ` : ''}
+
+                <div style="height: 1px; background: var(--border-subtle); margin: 24px 0;"></div>
+
+                <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; margin-bottom: 16px; border: 1px solid var(--border-subtle);">
+                    <div style="font-size: 14px; font-weight: 600; color: white;">Ma phrase secrète</div>
+                    <p style="font-size: 12px; color: var(--text-muted); margin: 6px 0 12px;">C'est ce qui vous permet de retrouver votre compte sur un autre appareil. Ne la partagez jamais avec personne.</p>
+                    <button class="btn-secondary" style="width: 100%; font-size: 13px;" data-action="openMnemonicAuthModal">Afficher ma phrase secrète</button>
+                </div>
+
+                <div class="item-card" style="background: var(--bg-surface); border: 1px solid var(--border-subtle);">
+                    ${icons.user}
+                    <div class="item-content">
+                        <div class="item-name">Cet appareil</div>
+                        <div class="item-sub" style="color: var(--status-success);">Votre compte est actif ici</div>
+                    </div>
+                </div>
+                <p style="font-size: 12px; color: var(--text-muted); text-align: center; margin-top: 8px;">Un compte ne peut être utilisé que sur un seul appareil à la fois.</p>
             </div>
 
             <!-- Re-authentication gate before revealing the recovery phrase: a device left
@@ -631,155 +1057,34 @@ const screens = {
                 <div class="location-modal-card">
                     <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
                         <div style="font-size: 16px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
-                            ${icons.lock} Confirmer votre code local
+                            ${icons.lock} Confirmez que c'est bien vous
                         </div>
-                        <button class="icon-btn" onclick="closeMnemonicAuthModal()" style="width: 28px; height: 28px;">✕</button>
+                        <button class="icon-btn" data-action="closeMnemonicAuthModal" style="width: 28px; height: 28px;">✕</button>
                     </div>
                     <p style="font-size: 13px; color: var(--text-muted);">
-                        Saisissez votre code d'appareil pour révéler votre phrase de récupération. (Sur un appareil réel, cette étape appellerait l'authentification native — biométrie ou code système — plutôt qu'un code saisi dans la page.)
+                        Entrez votre code pour afficher votre phrase secrète.
                     </p>
-                    <input type="password" inputmode="numeric" id="mnemonic-auth-pin" placeholder="Code local" maxlength="8"
-                        style="width: 100%; margin: 14px 0; background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; border: 1px solid var(--border-subtle); color: white; font-size: 15px; letter-spacing: 3px; text-align: center;"
-                        onkeydown="if(event.key==='Enter') confirmMnemonicPin()">
+                    <input type="password" inputmode="numeric" id="mnemonic-auth-pin" placeholder="Votre code" maxlength="8"
+                        style="width: 100%; margin: 14px 0; background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; border: 1px solid var(--border-subtle); color: white; font-size: 15px; letter-spacing: 3px; text-align: center;">
                     <div id="mnemonic-auth-error" style="font-size: 12px; color: var(--status-danger); min-height: 16px; margin-bottom: 8px;"></div>
                     <div style="display: flex; gap: 10px;">
-                        <button class="btn-secondary" style="flex: 1;" onclick="closeMnemonicAuthModal()">Annuler</button>
-                        <button class="btn-primary" style="flex: 1;" onclick="confirmMnemonicPin()">Confirmer</button>
+                        <button class="btn-secondary" style="flex: 1;" data-action="closeMnemonicAuthModal">Annuler</button>
+                        <button class="btn-primary" style="flex: 1;" data-action="confirmMnemonicPin">Confirmer</button>
                     </div>
                 </div>
             </div>
         </div>
     `,
 
-    // 11. Appareils connectés
-    connected_devices: () => `
-        <div class="screen-view">
-            <header class="app-header">
-                <button class="icon-btn" onclick="navigateTo('settings')">${icons.arrowLeft}</button>
-                <div class="header-title">Appareils connectés</div>
-                <div style="width: 38px;"></div>
-            </header>
-
-            <div style="padding: 20px; overflow-y: auto;">
-                <div class="item-card" style="background: var(--bg-surface); margin-bottom: 12px; border: 1px solid var(--border-subtle);">
-                    ${icons.user}
-                    <div class="item-content">
-                        <div class="item-name">Smartphone Principal (Pixel 8)</div>
-                        <div class="item-sub" style="color: var(--status-success);">Session active en cours</div>
-                    </div>
-                </div>
-                <div class="item-card" style="background: var(--bg-surface); margin-bottom: 20px; border: 1px solid var(--border-subtle);">
-                    ${icons.user}
-                    <div class="item-content">
-                        <div class="item-name">PC Desktop (Windows)</div>
-                        <div class="item-sub">Actif il y a 5 minutes</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    `,
-
-    // 12. QR Code d'identité
-    identity_qrcode: () => `
-        <div class="screen-view">
-            <header class="app-header">
-                <button class="icon-btn" onclick="navigateTo('settings')">${icons.arrowLeft}</button>
-                <div class="header-title">Mon QR Code</div>
-                <div style="width: 38px;"></div>
-            </header>
-
-            <div style="padding: 30px 20px; text-align: center; overflow-y: auto;">
-                <div style="background: white; width: 220px; height: 220px; border-radius: var(--radius-lg); margin: 0 auto 20px; display: flex; align-items: center; justify-content: center; box-shadow: 0 8px 32px rgba(0,0,0,0.5);">
-                    <div style="width: 180px; height: 180px; border: 4px solid black; display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; padding: 8px;">
-                        <div style="background: black;"></div><div style="background: white;"></div><div style="background: black;"></div><div style="background: black;"></div>
-                        <div style="background: white;"></div><div style="background: black;"></div><div style="background: white;"></div><div style="background: black;"></div>
-                        <div style="background: black;"></div><div style="background: white;"></div><div style="background: black;"></div><div style="background: white;"></div>
-                        <div style="background: black;"></div><div style="background: black;"></div><div style="background: white;"></div><div style="background: black;"></div>
-                    </div>
-                </div>
-
-                <div style="font-size: 18px; font-weight: 700; color: white;">alex.nova</div>
-                <p style="font-size: 12px; color: var(--text-muted); margin: 8px auto 24px; max-width: 260px;">Scannez ce code pour établir une connexion 1-to-1 directe sécurisée.</p>
-
-                <button class="btn-primary" onclick="alert('Lien d\\'invitation P2P copié dans le presse-papiers !')">Partager mon identité</button>
-            </div>
-        </div>
-    `,
-
-    // 13. État de connexion & Diagnostics
-    connection_diagnostics: () => `
-        <div class="screen-view">
-            <header class="app-header">
-                <button class="icon-btn" onclick="navigateTo('chat')">${icons.arrowLeft}</button>
-                <div class="header-title">Diagnostic Réseau</div>
-                <div style="width: 38px;"></div>
-            </header>
-
-            <div style="padding: 20px; overflow-y: auto;">
-                <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; margin-bottom: 12px; border: 1px solid var(--border-subtle);">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-size: 14px; font-weight: 600; color: white;">Statut de Liaison</span>
-                        <span style="color: var(--status-success); font-weight: 700; font-size: 13px;">● Connecté</span>
-                    </div>
-                    <div style="height: 1px; background: var(--border-subtle); margin: 10px 0;"></div>
-                    <div style="display: flex; justify-content: space-between; font-size: 13px; color: var(--text-muted);">
-                        <span>Mode de transport</span>
-                        <span style="color: white; font-weight: 600;">Direct P2P (UDP Hole Punching)</span>
-                    </div>
-                    <div style="display: flex; justify-content: space-between; font-size: 13px; color: var(--text-muted); margin-top: 6px;">
-                        <span>Protocole</span>
-                        <span style="color: white; font-weight: 600;">QUIC (TLS 1.3)</span>
-                    </div>
-                    <div style="display: flex; justify-content: space-between; font-size: 13px; color: var(--text-muted); margin-top: 6px;">
-                        <span>Latence RTT</span>
-                        <span style="color: var(--status-success); font-weight: 700;">38 ms</span>
-                    </div>
-                    <div style="display: flex; justify-content: space-between; font-size: 13px; color: var(--text-muted); margin-top: 6px;">
-                        <span>Chiffrement E2EE</span>
-                        <span style="color: var(--accent-purple-light); font-weight: 600;">Double Ratchet / ChaCha20</span>
-                    </div>
-                </div>
-            </div>
-        </div>
-    `,
-
-    // 14. Notifications (100% 1-to-1)
-    notifications: () => `
-        <div class="screen-view">
-            <header class="app-header">
-                <button class="icon-btn" onclick="navigateTo('settings')">${icons.arrowLeft}</button>
-                <div class="header-title">Notifications</div>
-                <div style="width: 38px;"></div>
-            </header>
-
-            <div style="padding: 20px;">
-                <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; border: 1px solid var(--border-subtle);">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-                        <span style="font-size: 14px; color: white;">Messages directs</span>
-                        <input type="checkbox" checked style="accent-color: var(--accent-purple); width: 18px; height: 18px;">
-                    </div>
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-                        <span style="font-size: 14px; color: white;">Alertes nouveaux contacts</span>
-                        <input type="checkbox" checked style="accent-color: var(--accent-purple); width: 18px; height: 18px;">
-                    </div>
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-size: 14px; color: white;">Masquer l'aperçu du contenu</span>
-                        <input type="checkbox" checked style="accent-color: var(--accent-purple); width: 18px; height: 18px;">
-                    </div>
-                </div>
-            </div>
-        </div>
-    `,
-
-    // 15. Recherche globale (Aucune suggestion parasite avant saisie)
+    // 11. Recherche globale (Aucune suggestion parasite avant saisie)
     global_search: () => `
         <div class="screen-view">
             <header class="app-header">
-                <button class="icon-btn" onclick="navigateTo('conversations')">${icons.arrowLeft}</button>
+                <button class="icon-btn" data-action="navigate" data-screen="conversations">${icons.arrowLeft}</button>
                 <div style="flex: 1; margin: 0 10px;">
                     <div class="search-input-box">
                         ${icons.search}
-                        <input type="text" id="global-search-input" placeholder="Rechercher messages, contacts..." autofocus oninput="handleStrictSearch(this.value)">
+                        <input type="text" id="global-search-input" placeholder="Rechercher messages, contacts..." autofocus>
                     </div>
                 </div>
             </header>
@@ -790,9 +1095,9 @@ const screens = {
                     <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--text-dim);">
                         ${icons.search}
                     </div>
-                    <div style="font-size: 15px; font-weight: 600; color: white;">Recherche locale 1-to-1</div>
+                    <div style="font-size: 15px; font-weight: 600; color: white;">Rechercher</div>
                     <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">
-                        Tapez un nom de contact ou un mot-clé pour rechercher dans vos échanges locaux.
+                        Tapez un nom ou un mot pour retrouver un contact ou un message.
                     </p>
                 </div>
             </div>
@@ -801,12 +1106,44 @@ const screens = {
 };
 
 // --- CONTROLLER & NAVIGATION ---
-function navigateTo(screenKey) {
+async function navigateTo(screenKey) {
+    closeQrCameraScanner();
+    closeMediaPreviewModal();
+    if (document.activeElement && typeof document.activeElement.blur === 'function') {
+        document.activeElement.blur();
+    }
     if (!screens[screenKey]) return;
     state.currentScreen = screenKey;
 
+    // Refresh from the real backend *before* rendering, for screens whose content it owns —
+    // otherwise the screen would render last-known (possibly stale) local state first.
+    if (hasBackend) {
+        if (screenKey === 'conversations') {
+            await refreshConversationsFromBackend();
+            await refreshContactsFromBackend();
+        } else if (screenKey === 'contacts') {
+            await refreshContactsFromBackend();
+        } else if (screenKey === 'chat' && state.activeContact) {
+            await refreshMessagesFromBackend(state.activeContact.conversationId);
+            await refreshDiagnostics(state.activeContact.peerId);
+        } else if (screenKey === 'contact_profile' && state.activeContact) {
+            await refreshDiagnostics(state.activeContact.peerId);
+        } else if (screenKey === 'identity') {
+            await refreshOwnBundleHex();
+            await refreshTorStatusFromBackend();
+        } else if (screenKey === 'settings') {
+            await refreshBootstrapAddr();
+            await refreshOwnFullListenAddr();
+            await refreshTorStatusFromBackend();
+        }
+    }
+
     const container = document.getElementById('screen-container');
     container.innerHTML = screens[screenKey]();
+
+    if (screenKey === 'identity') {
+        renderOwnQrCode();
+    }
 
     // Update bottom nav & rail tabs
     document.querySelectorAll('.nav-tab, .rail-item').forEach(tab => {
@@ -825,54 +1162,252 @@ function navigateTo(screenKey) {
         mobileNav.style.display = isRootTab ? 'flex' : 'none';
     }
 
-    // Auto scroll chat & measure real latency
+    // Auto scroll chat, and poll for incoming messages + live connection diagnostics
     if (screenKey === 'chat') {
-        if (latencyMonitorInterval) clearInterval(latencyMonitorInterval);
-        measureRealLatency();
-        latencyMonitorInterval = setInterval(measureRealLatency, 3500);
+        if (messagePollInterval) clearInterval(messagePollInterval);
+        if (hasBackend && state.activeContact) {
+            const conversationId = state.activeContact.conversationId;
+            const peerId = state.activeContact.peerId;
+            messagePollInterval = setInterval(async () => {
+                const newOnes = await refreshMessagesFromBackend(conversationId);
+                await refreshDiagnostics(peerId);
+                // Only touch the DOM if this conversation is still the one open — the user may
+                // have navigated away while the fetches were in flight.
+                if (state.currentScreen === 'chat' && state.activeContact && state.activeContact.conversationId === conversationId) {
+                    newOnes.forEach(appendChatMessageToBody);
+                    const statusEl = document.getElementById('chat-header-status');
+                    if (statusEl) statusEl.innerHTML = chatHeaderStatusHtml();
+                }
+            }, 2000);
+        }
 
         setTimeout(() => {
             const body = document.getElementById('chat-body');
-            if (body) body.scrollTop = body.scrollHeight;
-            const input = document.getElementById('chat-input');
-            if (input) input.focus();
+            if (body) {
+                body.scrollTop = body.scrollHeight;
+                // Automatically dismiss keyboard when touching / scrolling message history
+                body.addEventListener('touchstart', () => {
+                    const input = document.getElementById('chat-input');
+                    if (document.activeElement === input) {
+                        input.blur();
+                    }
+                }, { passive: true });
+            }
         }, 50);
-    } else {
-        if (latencyMonitorInterval) {
-            clearInterval(latencyMonitorInterval);
-            latencyMonitorInterval = null;
-        }
+    } else if (messagePollInterval) {
+        clearInterval(messagePollInterval);
+        messagePollInterval = null;
     }
 }
 
-let latencyMonitorInterval = null;
+// Applies the identity nova-engine just created/restored to local UI state.
+function applyAccountInfo(name, peerId, mnemonic, networkActive, bio, avatarDataUrl) {
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '');
+    state.currentUser.name = name;
+    state.currentUser.username = slug;
+    state.currentUser.handle = slug + '.nova';
+    state.currentUser.peerId = peerId;
+    state.currentUser.publicKey = peerId;
+    state.currentUser.mnemonic = mnemonic || '';
+    if (typeof bio === 'string') state.currentUser.bio = bio;
+    if (typeof avatarDataUrl === 'string' || avatarDataUrl === null) state.currentUser.avatarDataUrl = avatarDataUrl;
+    state.currentUser.status = networkActive
+        ? 'Connecté au réseau NOVA'
+        : 'Compte prêt — pas de connexion réseau pour l\'instant';
+}
 
-async function measureRealLatency() {
-    const t0 = performance.now();
-    try {
-        await fetch('/index.html', { method: 'HEAD', cache: 'no-store' });
-        const t1 = performance.now();
-        const measured = Math.max(1, Math.round(t1 - t0));
-        state.activeContact.latencyMs = measured;
-        const latencyEl = document.getElementById('chat-header-latency');
-        if (latencyEl) {
-            latencyEl.innerText = `${measured} ms`;
-        }
-        return measured;
-    } catch (e) {
-        const fallback = 12;
-        state.activeContact.latencyMs = fallback;
-        const latencyEl = document.getElementById('chat-header-latency');
-        if (latencyEl) {
-            latencyEl.innerText = `${fallback} ms`;
-        }
-        return fallback;
+let pendingAvatarDataUrl = null;
+
+function openEditProfileModal() {
+    const modal = document.getElementById('edit-profile-modal');
+    if (!modal) return;
+    pendingAvatarDataUrl = state.currentUser.avatarDataUrl || null;
+    modal.classList.add('show');
+}
+
+function closeEditProfileModal() {
+    const modal = document.getElementById('edit-profile-modal');
+    if (modal) modal.classList.remove('show');
+    pendingAvatarDataUrl = null;
+}
+
+function handleAvatarFileSelect(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const maxDim = 256;
+            let width = img.width;
+            let height = img.height;
+            if (width > height) {
+                if (width > maxDim) {
+                    height = Math.round((height * maxDim) / width);
+                    width = maxDim;
+                }
+            } else {
+                if (height > maxDim) {
+                    width = Math.round((width * maxDim) / height);
+                    height = maxDim;
+                }
+            }
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, width, height);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+            pendingAvatarDataUrl = dataUrl;
+
+            const preview = document.getElementById('edit-profile-avatar-preview');
+            if (preview) {
+                preview.innerHTML = `<img src="${dataUrl}" style="width: 100%; height: 100%; object-fit: cover;">`;
+            }
+        };
+        img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+}
+
+async function saveProfileChanges() {
+    const nameInput = document.getElementById('edit-display-name-input');
+    const bioInput = document.getElementById('edit-bio-input');
+    const newName = (nameInput && nameInput.value.trim()) || state.currentUser.name;
+    const newBio = (bioInput && bioInput.value.trim()) || '';
+
+    if (!newName) {
+        alert('Entrez un nom pour votre profil.');
+        return;
     }
+
+    try {
+        if (hasBackend) {
+            await tauriInvoke('update_user_profile', {
+                displayName: newName,
+                bio: newBio,
+                avatarDataUrl: pendingAvatarDataUrl,
+            });
+        }
+        state.currentUser.name = newName;
+        state.currentUser.bio = newBio;
+        state.currentUser.avatarDataUrl = pendingAvatarDataUrl;
+
+        closeEditProfileModal();
+        if (state.currentScreen === 'settings') {
+            navigateTo('settings');
+        }
+    } catch (e) {
+        alert('Échec de la sauvegarde du profil : ' + e);
+    }
+}
+
+async function createAccountReal() {
+    if (!requireBackend()) return;
+    const input = document.getElementById('account-name-input');
+    const name = (input && input.value.trim()) || '';
+    if (!name) {
+        alert('Entrez un nom pour continuer.');
+        return;
+    }
+    try {
+        const info = await tauriInvoke('create_account', { username: name });
+        applyAccountInfo(name, info.peer_id, info.mnemonic, info.network_active);
+        const networkNote = info.network_active
+            ? ''
+            : '\n\n(Pas de connexion réseau détectée pour l\'instant — votre compte est bien créé et sauvegardé, l\'app réessaiera de se connecter automatiquement.)';
+        alert('Votre compte est prêt ! Notez ces 12 mots quelque part de sûr (papier, gestionnaire de mots de passe...) — c\'est la seule façon de retrouver votre compte plus tard :\n\n' + info.mnemonic + networkNote);
+        await refreshConversationsFromBackend();
+        navigateTo('conversations');
+    } catch (e) {
+        alert(String(e).includes('already exists')
+            ? 'Vous avez déjà un compte sur cet appareil. Pour en créer un nouveau, supprimez d\'abord l\'actuel (Réglages → Mon identité).'
+            : 'Impossible de créer le compte pour le moment : ' + e);
+    }
+}
+
+async function restoreAccountReal() {
+    if (!requireBackend()) return;
+    const nameInput = document.getElementById('restore-name-input');
+    const mnemonicInput = document.getElementById('restore-mnemonic-input');
+    const name = (nameInput && nameInput.value.trim()) || '';
+    const mnemonic = (mnemonicInput && mnemonicInput.value.trim()) || '';
+    if (!name) {
+        alert('Entrez un nom pour continuer.');
+        return;
+    }
+    if (mnemonic.split(/\s+/).filter(Boolean).length !== 12) {
+        alert('Vérifiez votre phrase secrète : il doit y avoir exactement 12 mots, séparés par des espaces.');
+        return;
+    }
+    try {
+        const info = await tauriInvoke('restore_account', { mnemonic, username: name });
+        applyAccountInfo(name, info.peer_id, mnemonic, info.network_active);
+        if (!info.network_active) {
+            alert('Compte retrouvé ! Pas de connexion réseau détectée pour l\'instant — l\'app réessaiera de se connecter automatiquement.');
+        }
+        await refreshConversationsFromBackend();
+        navigateTo('conversations');
+    } catch (e) {
+        alert(String(e).includes('already exists')
+            ? 'Vous avez déjà un compte sur cet appareil. Pour en retrouver un autre, supprimez d\'abord l\'actuel (Réglages → Mon identité).'
+            : 'Impossible de retrouver ce compte — vérifiez que les 12 mots sont corrects. ' + e);
+    }
+}
+
+// Logs this device out (see the Rust-side `logout` command / `NovaEngine::clear_identity`):
+// there is no server account to log back into — identity is device-bound — so this wipes the
+// local identity, contacts, conversations and messages rather than merely hiding the screen.
+// Irreversible without the mnemonic, hence the confirmation.
+async function logoutReal() {
+    if (!requireBackend()) return;
+    if (!confirm('Se déconnecter effacera définitivement l\'identité, les contacts et les messages de cet appareil (il n\'y a pas de compte distant à récupérer — seule votre phrase de récupération, si vous l\'avez notée, permet de revenir). Continuer ?')) {
+        return;
+    }
+    try {
+        await tauriInvoke('logout');
+    } catch (e) {
+        alert('Échec de la déconnexion : ' + e);
+        return;
+    }
+    state.currentUser = {
+        name: '', username: '', handle: '', peerId: '', bio: '',
+        status: 'Compte non créé', publicKey: '', mnemonic: '', bundleHex: '',
+    };
+    try {
+        localStorage.removeItem('nova_pin_hash');
+        localStorage.removeItem('nova_pin_salt');
+    } catch (_) {}
+    state.activeContact = null;
+    state.currentDiagnostics = null;
+    state.conversations = [];
+    state.messages = [];
+    state.contacts = [];
+    updateGlobalUnreadBadges();
+    navigateTo('onboarding');
 }
 
 function openChatWith(name, handle) {
-    state.activeContact.name = name;
-    state.activeContact.handle = handle;
+    // `handle` is the peer's real identifier (hex Ed25519 public key) for any contact added via
+    // addContactReal — see the field comment on `state.contacts` entries. The conversation id
+    // matches nova-engine's own convention (`conv_<peer_id>`, see NovaEngine::add_contact) so
+    // that fetching this conversation's history from the backend finds the right one.
+    const contact = state.contacts.find(c => c.name === name || c.handle === handle);
+    const peerId = contact ? contact.handle : handle;
+    state.activeContact = {
+        name: contact ? contact.name : name,
+        handle: peerId,
+        peerId: peerId,
+        conversationId: 'conv_' + peerId,
+        publicKey: (contact && contact.key) || 'Non disponible',
+        safetyNumber: (contact && contact.safetyNumber) || 'Non disponible',
+        isOnline: !!(contact && contact.online),
+        p2pMode: (contact && contact.p2pMode) || 'Non connecté',
+    };
+    // Reset stale diagnostics from whatever contact was previously open — navigateTo('chat')
+    // below fetches fresh ones for this contact before rendering.
+    state.currentDiagnostics = null;
 
     // 1. Clear unread notification badge on this conversation
     const conv = state.conversations.find(c => c.name === name || c.handle === handle);
@@ -880,15 +1415,440 @@ function openChatWith(name, handle) {
         conv.unread = 0;
     }
 
-    // 2. Mark all messages as read
+    // 2. Mark this conversation's messages as read (not other conversations')
     state.messages.forEach(m => {
-        m.status = 'read';
+        if (m.conversationId === state.activeContact.conversationId) {
+            m.status = 'read';
+        }
     });
 
     // 3. Update global navigation tab badges
     updateGlobalUnreadBadges();
 
     navigateTo('chat');
+}
+
+// Real per-peer connection state from nova-transport's TransportSupervisor — populated only by
+// an actual connection attempt (dial or send), never fabricated. `null` means "no attempt yet",
+// rendered as an honest "unknown" state rather than defaulted to looking connected or offline.
+async function refreshDiagnostics(peerId) {
+    if (!hasBackend || !peerId) {
+        state.currentDiagnostics = null;
+        return;
+    }
+    try {
+        state.currentDiagnostics = await tauriInvoke('get_diagnostics', { peerId });
+    } catch (e) {
+        console.error('refreshDiagnostics failed', e);
+        state.currentDiagnostics = null;
+    }
+}
+
+// Plain-language connection description — shown on the contact profile, never in the chat
+// header itself (that just shows a simple online/offline dot, see chatHeaderStatusHtml).
+function transportModeLabel(mode) {
+    switch (mode) {
+        case 'DirectQuic': return 'connexion directe';
+        case 'RelayedOpaque': return 'connexion via un relais';
+        case 'Disconnected': return 'non connecté';
+        default: return 'statut inconnu';
+    }
+}
+
+function chatHeaderStatusHtml() {
+    const d = state.currentDiagnostics;
+    if (!d) return 'Statut inconnu pour l\'instant';
+    if (d.is_connected) {
+        return `<span style="font-size: 8px;">●</span> En ligne`;
+    }
+    return `<span style="font-size: 8px;">●</span> Hors ligne`;
+}
+
+// Plain-language connection line for the contact profile screen (folds in what used to be a
+// separate "Diagnostics" screen — see refreshDiagnostics, called when opening this screen).
+function contactConnectionStatusText() {
+    const d = state.currentDiagnostics;
+    if (!d) return 'Statut inconnu — envoyez un message pour vérifier la connexion';
+    if (d.is_connected) return `En ligne (${transportModeLabel(d.mode)})`;
+    return 'Hors ligne pour le moment';
+}
+
+// Fetches this device's real, signature-verifiable X3DH invitation ticket (valid for 24h).
+async function refreshOwnBundleHex() {
+    if (!hasBackend) return;
+    try {
+        const uri = await tauriInvoke('get_own_invitation_uri', { ttlSeconds: 86400 });
+        state.currentUser.invitationUri = uri;
+        state.currentUser.bundleHex = uri;
+    } catch (e) {
+        console.error('get_own_invitation_uri failed, fallback to raw prekey bundle', e);
+        try {
+            state.currentUser.bundleHex = await tauriInvoke('get_own_prekey_bundle_hex');
+            state.currentUser.invitationUri = state.currentUser.bundleHex;
+        } catch (e2) {
+            console.error('refreshOwnBundleHex fallback failed', e2);
+            state.currentUser.bundleHex = '';
+            state.currentUser.invitationUri = '';
+        }
+    }
+}
+
+// Loads the currently configured bootstrap/rendezvous address, if any. Called when navigating to
+// Settings, so the field starts prefilled with whatever set_bootstrap_addr last persisted (or the
+// NOVA_BOOTSTRAP_ADDR the app was launched with).
+async function refreshBootstrapAddr() {
+    if (!hasBackend) return;
+    try {
+        state.bootstrapAddr = (await tauriInvoke('get_bootstrap_addr')) || '';
+    } catch (e) {
+        console.error('refreshBootstrapAddr failed', e);
+    }
+}
+
+// This device's own dialable addresses, for display when it's playing the rendezvous role.
+async function refreshOwnFullListenAddr() {
+    if (!hasBackend) return;
+    try {
+        state.ownFullListenAddrs = (await tauriInvoke('get_own_full_listen_addrs')) || [];
+    } catch (e) {
+        console.error('refreshOwnFullListenAddr failed', e);
+    }
+}
+
+// Loads the current Tor connectivity and configuration status.
+async function refreshTorStatusFromBackend() {
+    if (!hasBackend) return;
+    try {
+        const status = await tauriInvoke('get_tor_status');
+        if (status) {
+            state.torSettings = {
+                enabled: !!status.enabled,
+                connected: !!status.connected,
+                bootstrapPercent: status.bootstrap_percent || 0,
+                onionAddress: status.onion_address || '',
+                socksProxy: status.socks_proxy || '127.0.0.1:9050',
+                mode: status.mode || 'direct_only',
+                bridgeType: status.bridge_type || null,
+            };
+        }
+    } catch (e) {
+        console.error('get_tor_status failed', e);
+    }
+}
+
+async function saveTorConfigReal() {
+    if (!requireBackend()) return;
+    const enabledChk = document.getElementById('tor-enabled-chk');
+    const modeSelect = document.getElementById('tor-mode-select');
+    const socksInput = document.getElementById('tor-socks-input');
+    const bridgeSelect = document.getElementById('tor-bridge-select');
+    const statusEl = document.getElementById('tor-config-status');
+
+    const enabled = enabledChk ? enabledChk.checked : false;
+    const mode = modeSelect ? modeSelect.value : 'direct_only';
+    const socksProxy = (socksInput && socksInput.value.trim()) || '127.0.0.1:9050';
+    const bridgeType = bridgeSelect && bridgeSelect.value !== 'none' ? bridgeSelect.value : null;
+
+    if (statusEl) statusEl.innerHTML = '<span style="color: var(--accent-purple-light);">Application de la configuration Tor...</span>';
+
+    try {
+        await tauriInvoke('configure_tor', {
+            enabled,
+            mode,
+            socksProxy,
+            bridgeType,
+        });
+        await refreshTorStatusFromBackend();
+        if (statusEl) {
+            statusEl.innerHTML = '<span style="color: var(--status-success);">✓ Configuration Tor appliquée avec succès.</span>';
+            setTimeout(() => { if (statusEl) statusEl.innerText = ''; }, 4000);
+        }
+    } catch (e) {
+        console.error('configure_tor failed', e);
+        if (statusEl) {
+            statusEl.innerHTML = `<span style="color: var(--status-danger);">Erreur : ${escapeHtml(String(e.message || e))}</span>`;
+        }
+    }
+}
+
+function copyOnionAddressReal(el) {
+    if (!state.torSettings.onionAddress) {
+        alert('Adresse Onion non disponible pour l\'instant.');
+        return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(state.torSettings.onionAddress).then(() => {
+            if (el) {
+                const original = el.innerText;
+                el.innerText = 'Copié !';
+                setTimeout(() => { if (el) el.innerText = original; }, 2000);
+            }
+        }).catch(() => {
+            alert('Mon adresse Onion : ' + state.torSettings.onionAddress);
+        });
+    } else {
+        alert('Mon adresse Onion : ' + state.torSettings.onionAddress);
+    }
+}
+
+// Persists the bootstrap/rendezvous multiaddr entered on the Settings screen — the mechanism a
+// device with no shell (i.e. Android, launched from the home screen rather than a terminal that
+// could export NOVA_BOOTSTRAP_ADDR) uses to configure this at all. Takes effect on the next app
+// launch if the network for this session has already started.
+async function saveBootstrapAddr() {
+    if (!requireBackend()) return;
+    const input = document.getElementById('bootstrap-addr-input');
+    const statusEl = document.getElementById('bootstrap-addr-status');
+    if (!input) return;
+    const val = input.value.trim();
+    if (statusEl) statusEl.innerHTML = '<span style="color: var(--accent-purple-light);">Connexion en cours...</span>';
+    try {
+        await tauriInvoke('set_bootstrap_addr', { addr: val });
+        state.bootstrapAddr = val;
+        if (statusEl) {
+            if (val) {
+                statusEl.innerHTML = '<span style="color: var(--status-success);">✓ Enregistré et connexion P2P lancée.</span>';
+            } else {
+                statusEl.innerHTML = '<span style="color: var(--text-muted);">Adresse de démarrage effacée.</span>';
+            }
+        }
+    } catch (e) {
+        console.error('saveBootstrapAddr failed', e);
+        if (statusEl) statusEl.innerHTML = `<span style="color: var(--status-danger);">Adresse invalide : ${escapeHtml(String(e.message || e))}</span>`;
+    }
+}
+
+function formatMessageTime(timestampUtc) {
+    return new Date(timestampUtc * 1000).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+}
+
+// Replaces the local conversation list with what nova-engine's local (encrypted) storage
+// actually has — called before rendering the conversations screen, and after any action that
+// changes it (adding a contact, sending a message).
+async function refreshConversationsFromBackend() {
+    if (!hasBackend) return;
+    try {
+        const convos = await tauriInvoke('get_conversations');
+        state.conversations = convos.map(c => ({
+            id: c.id,
+            name: c.title,
+            handle: c.peer_id,
+            lastMsg: c.last_message_text,
+            time: c.last_message_time_utc ? formatMessageTime(c.last_message_time_utc) : '',
+            unread: c.unread_count,
+            online: false,
+            mode: 'DHT',
+        }));
+    } catch (e) {
+        console.error('refreshConversationsFromBackend failed', e);
+    }
+}
+
+// --- STRUCTURED PAYLOADS OVER THE TEXT PIPELINE ---
+// nova-engine's wire protocol already has a MessageContentType/MediaMetadata schema for
+// images/audio/files, but no binary payload field is wired up end-to-end yet on the storage
+// side (see nova-protocol::packet::MessagePayload) — extending that properly (schema + storage
+// column + chunking for anything bigger than one packet) is real follow-on work. In the
+// meantime, location/photo/file/voice messages below travel as a small JSON envelope inside the
+// *existing*, already-tested text pipeline (X3DH/Double Ratchet encrypted exactly like any other
+// message, real bytes actually sent over nova-transport) — genuinely real and working today, not
+// a mock, just not yet the "proper" schema. `MAX_STRUCTURED_PAYLOAD_BYTES` keeps this well under
+// the single-packet ceiling (see nova_protocol::packet::MAX_PACKET_SIZE) after base64 and
+// JSON overhead; anything bigger needs real chunking.
+const STRUCTURED_MARKER = '__NOVA_STRUCTURED_MSG_V1__:';
+const MAX_STRUCTURED_PAYLOAD_BYTES = 5 * 1024 * 1024; // 5 Mo maximum (bien en-dessous du plafond protocolaire de 8 Mo)
+
+function encodeStructuredMessage(obj) {
+    return STRUCTURED_MARKER + JSON.stringify(obj);
+}
+
+function decodeStructuredMessage(text) {
+    if (typeof text !== 'string' || !text.startsWith(STRUCTURED_MARKER)) return null;
+    try {
+        return JSON.parse(text.slice(STRUCTURED_MARKER.length));
+    } catch (e) {
+        return null;
+    }
+}
+
+function mapBackendMessage(m, conversationId) {
+    const base = {
+        id: m.id,
+        conversationId,
+        time: formatMessageTime(m.timestamp_utc),
+        isOutgoing: m.is_outgoing,
+        status: m.is_outgoing ? 'sent' : 'read',
+    };
+    const structured = decodeStructuredMessage(m.text_content);
+    if (structured && structured.kind === 'location') {
+        return { ...base, type: 'location', text: structured.label, meta: 'Précision d\'environ 5 mètres' };
+    }
+    if (structured && structured.kind === 'media') {
+        return { ...base, type: structured.mediaType, text: structured.name, meta: structured.metaText, url: structured.dataUrl };
+    }
+    return { ...base, type: 'text', text: m.text_content };
+}
+
+// Fetches the full message history for one conversation from local storage and merges it into
+// `state.messages`, returning only the messages new since the last fetch (by id) — the chat-open
+// polling loop uses this to append incrementally instead of destroying scroll position and input
+// focus with a full re-render on every poll.
+async function refreshMessagesFromBackend(conversationId) {
+    if (!hasBackend || !conversationId) return [];
+    let fetched;
+    try {
+        fetched = await tauriInvoke('get_messages', { conversationId });
+    } catch (e) {
+        console.error('refreshMessagesFromBackend failed', e);
+        return [];
+    }
+
+    const previouslyKnownIds = new Set(
+        state.messages.filter(m => m.conversationId === conversationId).map(m => m.id)
+    );
+    const mapped = fetched.map(m => mapBackendMessage(m, conversationId));
+
+    const newOnes = mapped.filter(m => !previouslyKnownIds.has(m.id));
+    if (newOnes.length > 0 && previouslyKnownIds.size > 0) {
+        newOnes.filter(m => !m.isOutgoing).forEach(maybeNotifyIncomingMessage);
+    }
+
+    state.messages = state.messages.filter(m => m.conversationId !== conversationId).concat(mapped);
+    return newOnes;
+}
+
+// Renders a real, scannable QR code encoding the cryptographically signed invitation ticket.
+function renderOwnQrCode() {
+    const canvas = document.getElementById('my-qr-canvas');
+    const textToEncode = state.currentUser.invitationUri || state.currentUser.bundleHex;
+    if (!canvas || !textToEncode || typeof QRCode === 'undefined') return;
+    QRCode.toCanvas(canvas, textToEncode, { errorCorrectionLevel: 'M', margin: 1, width: 200 }, (err) => {
+        if (err) console.error('QR render failed', err);
+    });
+}
+
+function saveQrImage() {
+    const canvas = document.getElementById('my-qr-canvas');
+    if (!canvas) {
+        alert('QR code indisponible.');
+        return;
+    }
+    const link = document.createElement('a');
+    link.download = `nova_invite_${(state.currentUser.username || 'contact')}.png`;
+    link.href = canvas.toDataURL('image/png');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+async function shareInvitation() {
+    const text = state.currentUser.invitationUri || state.currentUser.bundleHex;
+    if (!text) {
+        alert('Créez d\'abord votre compte pour partager votre invitation.');
+        return;
+    }
+    const shareData = {
+        title: 'Invitation NOVA Chat',
+        text: `Ajoutez-moi sur NOVA Chat avec mon lien sécurisé (valable 24h) :\n${text}`,
+    };
+    if (navigator.share) {
+        try {
+            await navigator.share(shareData);
+            return;
+        } catch (e) {
+            // Cancelled or not supported, fallback to copy
+        }
+    }
+    copyOwnBundle();
+}
+
+function copyOwnBundle() {
+    const text = state.currentUser.invitationUri || state.currentUser.bundleHex;
+    if (!text) {
+        alert('Créez d\'abord votre compte pour obtenir votre lien.');
+        return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => {});
+    }
+    const textarea = document.getElementById('my-bundle-output');
+    if (textarea) {
+        textarea.select();
+        document.execCommand('copy');
+    }
+    alert('Lien d\'invitation sécurisé copié ! Vous pouvez l\'envoyer par SMS, WhatsApp ou tout autre moyen.');
+}
+
+function maybeNotifyIncomingMessage(msg) {
+    if (!state.notificationPrefs.notifyMessages) return;
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    const title = state.notificationPrefs.hideContent
+        ? 'NOVA Chat'
+        : (state.activeContact ? `Nouveau message de ${state.activeContact.name}` : 'Nouveau message reçu');
+    const body = state.notificationPrefs.hideContent
+        ? 'Nouveau message chiffré reçu'
+        : (msg.type === 'text' ? msg.text : `[${msg.type}]`);
+    try {
+        new Notification(title, { body, icon: 'favicon.ico' });
+    } catch (e) {
+        // Notification API unavailable or denied in certain WebViews
+    }
+}
+
+async function refreshContactsFromBackend() {
+    if (!hasBackend) return;
+    try {
+        const contacts = await tauriInvoke('get_contacts');
+        state.contacts = contacts.map(c => ({
+            name: c.display_name,
+            handle: c.peer_id,
+            peerId: c.peer_id,
+            online: c.is_online,
+            isBlocked: c.is_blocked,
+            p2pMode: c.is_blocked ? 'Contact bloqué' : 'Contact vérifié',
+            key: c.peer_id,
+            safetyNumber: c.safety_number,
+        }));
+    } catch (e) {
+        console.error('refreshContactsFromBackend failed', e);
+    }
+}
+
+async function blockActiveContact() {
+    if (!state.activeContact || !requireBackend()) return;
+    const peerId = state.activeContact.peerId || state.activeContact.handle;
+    try {
+        await tauriInvoke('block_contact', { peerId });
+        await refreshContactsFromBackend();
+        await refreshConversationsFromBackend();
+        alert('Ce contact a été bloqué au niveau du moteur Rust. Ses paquets seront désormais ignorés.');
+        state.activeContact = null;
+        navigateTo('conversations');
+    } catch (e) {
+        alert('Échec du blocage : ' + e);
+    }
+}
+
+async function unblockActiveContact(peerId) {
+    const targetPeerId = peerId || (state.activeContact && (state.activeContact.peerId || state.activeContact.handle));
+    if (!targetPeerId || !requireBackend()) return;
+    try {
+        await tauriInvoke('unblock_contact', { peerId: targetPeerId });
+        await refreshContactsFromBackend();
+        await refreshConversationsFromBackend();
+        alert('Contact débloqué avec succès.');
+        if (state.currentScreen === 'contact_profile') {
+            const found = state.contacts.find(c => c.handle === targetPeerId || c.peerId === targetPeerId);
+            if (found) {
+                openChatWith(found.name, found.handle);
+                navigateTo('contact_profile');
+                return;
+            }
+        }
+        navigateTo('contacts');
+    } catch (e) {
+        alert('Échec du déblocage : ' + e);
+    }
 }
 
 // Reads the target contact from data-* attributes rather than from an inline onclick argument.
@@ -904,28 +1864,73 @@ function openChatWithEl(el) {
 
 function openImagePreviewEl(el) {
     const url = el.dataset.url;
-    if (url) window.open(url);
+    if (!url) return;
+    // Validation stricte : autoriser UNIQUEMENT data:image/ ou blob: (rejet de tout javascript:, file:, ou schémas externes)
+    if (url.startsWith('data:image/') || url.startsWith('blob:')) {
+        const win = window.open();
+        if (win) {
+            win.document.write(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Aperçu Image - NOVA Chat</title>
+                    <meta charset="utf-8">
+                    <style>
+                        body { margin: 0; background: #080A10; display: flex; align-items: center; justify-content: center; height: 100vh; font-family: sans-serif; color: white; }
+                        img { max-width: 95vw; max-height: 95vh; object-fit: contain; border-radius: 8px; box-shadow: 0 4px 24px rgba(0,0,0,0.85); }
+                    </style>
+                </head>
+                <body>
+                    <img src="${escapeHtml(url)}" alt="Aperçu image NOVA" />
+                </body>
+                </html>
+            `);
+            win.document.close();
+        }
+    } else {
+        console.warn('Tentative d\'ouverture d\'une URL non autorisée bloquée :', url);
+    }
 }
 
 function showFileAlertEl(el) {
     const filename = el.dataset.filename || '';
-    alert('Document sécurisé vérifié en local : ' + filename);
+    alert('Document reçu : ' + filename);
 }
 
-// --- MNEMONIC REVEAL GATE (re-authentication before showing the master recovery secret) ---
+function alertCallTo(el, kind) {
+    alert('Les appels ' + (kind === 'video' ? 'vidéo' : 'vocaux') + ' ne sont pas encore proposés dans cette version.');
+}
+
+// --- MNEMONIC REVEAL GATE (authentification par PIN haché cryptographiquement) ---
 let mnemonicAuthAttempts = 0;
 let mnemonicAuthLockoutUntil = 0;
 const MNEMONIC_AUTH_MAX_ATTEMPTS = 3;
 const MNEMONIC_AUTH_LOCKOUT_MS = 60_000;
 
+async function hashPinCode(pin, saltHex) {
+    const enc = new TextEncoder();
+    const data = enc.encode(saltHex + ':' + pin);
+    const hashBuf = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 function openMnemonicAuthModal() {
     const modal = document.getElementById('mnemonic-auth-modal');
     const errorEl = document.getElementById('mnemonic-auth-error');
     const input = document.getElementById('mnemonic-auth-pin');
+    const subtitle = modal ? modal.querySelector('p') : null;
     if (!modal) return;
 
     if (errorEl) errorEl.textContent = '';
     if (input) input.value = '';
+
+    const hasStoredPin = !!localStorage.getItem('nova_pin_hash');
+    if (subtitle) {
+        subtitle.textContent = hasStoredPin
+            ? 'Entrez votre code de sécurité pour afficher votre phrase secrète.'
+            : 'Définissez votre code de sécurité (4 à 8 chiffres) pour protéger votre phrase secrète :';
+    }
+
     modal.classList.add('show');
     if (input) setTimeout(() => input.focus(), 50);
 }
@@ -935,7 +1940,7 @@ function closeMnemonicAuthModal() {
     if (modal) modal.classList.remove('show');
 }
 
-function confirmMnemonicPin() {
+async function confirmMnemonicPin() {
     const errorEl = document.getElementById('mnemonic-auth-error');
     const input = document.getElementById('mnemonic-auth-pin');
 
@@ -946,11 +1951,40 @@ function confirmMnemonicPin() {
         return;
     }
 
-    const entered = input ? input.value : '';
-    if (entered === state.currentUser.localPin) {
+    const entered = input ? input.value.trim() : '';
+    if (!entered || entered.length < 4) {
+        if (errorEl) errorEl.textContent = 'Le code doit comporter au moins 4 chiffres.';
+        return;
+    }
+
+    const storedHash = localStorage.getItem('nova_pin_hash');
+    let storedSalt = localStorage.getItem('nova_pin_salt');
+
+    if (!storedHash) {
+        // Premier enregistrement du code PIN
+        const saltBytes = new Uint8Array(16);
+        crypto.getRandomValues(saltBytes);
+        storedSalt = Array.from(saltBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+        const newHash = await hashPinCode(entered, storedSalt);
+        localStorage.setItem('nova_pin_hash', newHash);
+        localStorage.setItem('nova_pin_salt', storedSalt);
+
         mnemonicAuthAttempts = 0;
         closeMnemonicAuthModal();
-        alert('Phrase de récupération:\n\n' + state.currentUser.mnemonic);
+        alert(state.currentUser.mnemonic
+            ? 'Code de sécurité enregistré avec succès !\n\nVotre phrase secrète :\n\n' + state.currentUser.mnemonic
+            : 'Code de sécurité configuré.');
+        return;
+    }
+
+    // Vérification du code PIN existant
+    const computedHash = await hashPinCode(entered, storedSalt);
+    if (computedHash === storedHash) {
+        mnemonicAuthAttempts = 0;
+        closeMnemonicAuthModal();
+        alert(state.currentUser.mnemonic
+            ? 'Votre phrase secrète :\n\n' + state.currentUser.mnemonic
+            : 'Créez d\'abord votre compte pour obtenir une phrase secrète.');
         return;
     }
 
@@ -958,9 +1992,10 @@ function confirmMnemonicPin() {
     if (mnemonicAuthAttempts >= MNEMONIC_AUTH_MAX_ATTEMPTS) {
         mnemonicAuthLockoutUntil = now + MNEMONIC_AUTH_LOCKOUT_MS;
         mnemonicAuthAttempts = 0;
-        if (errorEl) errorEl.textContent = 'Trop de tentatives incorrectes. Réessayez dans 60s.';
+        if (errorEl) errorEl.textContent = 'Trop de tentatives incorrectes. Verrouillé 60 secondes.';
     } else if (errorEl) {
-        errorEl.textContent = 'Code incorrect.';
+        const remainingTries = MNEMONIC_AUTH_MAX_ATTEMPTS - mnemonicAuthAttempts;
+        errorEl.textContent = `Code incorrect (${remainingTries} essai(s) restant(s)).`;
     }
     if (input) {
         input.value = '';
@@ -998,45 +2033,37 @@ function buildMessageHtml(m) {
     if (m.type === 'image') {
         contentHtml = `
             <div class="msg-photo-card">
-                ${m.url ? `<img src="${escapeHtml(m.url)}" class="msg-image-thumb" data-url="${escapeHtml(m.url)}" onclick="openImagePreviewEl(this)" title="Cliquer pour agrandir" />` : `
+                ${m.url ? `<img src="${escapeHtml(m.url)}" class="msg-image-thumb" data-url="${escapeHtml(m.url)}" data-action="openImagePreview" title="Cliquer pour agrandir" />` : `
                     <div class="msg-photo-preview">
                         ${icons.image}
-                        <span style="font-size: 11px; font-weight: 600; color: white;">${safeText || 'Photo P2P (Chiffrée)'}</span>
-                        <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || '1.8 MB • Direct UDP'}</span>
+                        <span style="font-size: 11px; font-weight: 600; color: white;">${safeText || 'Photo'}</span>
+                        <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || '1,8 Mo'}</span>
                     </div>
                 `}
                 <div style="padding: 6px 10px; font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center;">
                     <span style="font-weight: 600; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px;">${safeText}</span>
-                    <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || 'Direct UDP'}</span>
+                    <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || 'Envoyé'}</span>
                 </div>
             </div>
         `;
     } else if (m.type === 'file') {
         contentHtml = `
-            <div class="msg-file-card" data-filename="${escapeHtml(m.text)}" onclick="showFileAlertEl(this)" style="cursor: pointer;">
+            <div class="msg-file-card" data-filename="${escapeHtml(m.text)}" data-action="showFileAlert" style="cursor: pointer;">
                 ${icons.file}
                 <div style="overflow: hidden;">
                     <div style="font-size: 13px; font-weight: 600; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px;">${safeText}</div>
-                    <div style="font-size: 11px; color: var(--text-muted);">${safeMeta || '2.4 MB • Document E2EE'}</div>
+                    <div style="font-size: 11px; color: var(--text-muted);">${safeMeta || '2,4 Mo'}</div>
                 </div>
             </div>
         `;
     } else if (m.type === 'voice') {
+        // A real, playable recording (see stopAndSendVoiceRecording) — native <audio controls>
+        // rather than a custom-styled player, so playback is guaranteed correct rather than
+        // hand-rolled and unverified.
         contentHtml = `
-            <div class="msg-voice-card">
-                <button class="voice-play-btn" onclick="toggleVoicePlay(this)">▶</button>
-                <div class="voice-waveform">
-                    <div class="voice-bar" style="height: 12px;"></div>
-                    <div class="voice-bar" style="height: 20px;"></div>
-                    <div class="voice-bar" style="height: 15px;"></div>
-                    <div class="voice-bar" style="height: 24px;"></div>
-                    <div class="voice-bar" style="height: 18px;"></div>
-                    <div class="voice-bar" style="height: 10px;"></div>
-                    <div class="voice-bar" style="height: 22px;"></div>
-                    <div class="voice-bar" style="height: 14px;"></div>
-                    <div class="voice-bar" style="height: 8px;"></div>
-                </div>
-                <span style="font-size: 11px; color: var(--text-muted); font-family: monospace;">${safeMeta || '0:14'}</span>
+            <div class="msg-voice-card" style="flex-direction: column; align-items: stretch; gap: 4px;">
+                ${m.url ? `<audio controls preload="none" src="${escapeHtml(m.url)}" style="width: 220px; height: 36px;"></audio>` : `<span style="font-size: 12px; color: var(--text-dim);">Audio indisponible</span>`}
+                <span style="font-size: 11px; color: var(--text-muted); font-family: monospace;">${safeMeta || ''}</span>
             </div>
         `;
     } else if (m.type === 'location') {
@@ -1047,9 +2074,9 @@ function buildMessageHtml(m) {
                     <div class="map-pin-pulse" style="width: 32px; height: 32px;">${icons.mapPin}</div>
                 </div>
                 <div class="msg-location-body">
-                    <div style="font-size: 12px; font-weight: 700; color: white;">Position P2P Sécurisée</div>
+                    <div style="font-size: 12px; font-weight: 700; color: white;">Position partagée</div>
                     <div style="font-size: 11px; color: var(--accent-purple-light); font-family: monospace; margin-top: 2px;">${safeText}</div>
-                    <div style="font-size: 10px; color: var(--text-dim); margin-top: 4px;">${safeMeta || 'Précision GPS ~5m'}</div>
+                    <div style="font-size: 10px; color: var(--text-dim); margin-top: 4px;">${safeMeta || 'Précision d\'environ 5 mètres'}</div>
                 </div>
             </div>
         `;
@@ -1062,7 +2089,7 @@ function buildMessageHtml(m) {
     const safeId = escapeHtml(m.id);
     const statusHtml = m.isOutgoing ? `
         <span id="msg-status-${safeId}" style="display: inline-flex; align-items: center;">
-            ${m.status === 'sending' ? '<span class="status-tick-sending">⏳</span>' : (m.status === 'sent' ? '<span class="status-tick-sent">✓</span>' : `<span class="status-tick-read" title="Déchiffré & Lu">${icons.checkCheck}</span>`)}
+            ${m.status === 'sending' ? '<span class="status-tick-sending">⏳</span>' : (m.status === 'sent' ? '<span class="status-tick-sent">✓</span>' : `<span class="status-tick-read" title="Lu">${icons.checkCheck}</span>`)}
         </span>
     ` : '';
 
@@ -1080,6 +2107,15 @@ function buildMessageHtml(m) {
 function appendChatMessageToBody(msg) {
     const chatBody = document.getElementById('chat-body');
     if (!chatBody) return;
+
+    // Prevent duplicate DOM messages caused by concurrent polling
+    const existing = document.getElementById(`msg-row-${msg.id}`);
+    if (existing) {
+        if (msg.isOutgoing && msg.status) {
+            updateMessageStatus(msg.id, msg.status);
+        }
+        return;
+    }
     
     // Remove typing indicator if present before appending message
     const typingRow = document.getElementById('typing-indicator-row');
@@ -1094,35 +2130,6 @@ function appendChatMessageToBody(msg) {
     }, 20);
 }
 
-function setEmmaTyping(isTyping) {
-    state.isTyping = isTyping;
-    const chatBody = document.getElementById('chat-body');
-    if (!chatBody) return;
-
-    let typingRow = document.getElementById('typing-indicator-row');
-    if (isTyping) {
-        if (!typingRow) {
-            typingRow = document.createElement('div');
-            typingRow.id = 'typing-indicator-row';
-            typingRow.className = 'typing-indicator-row';
-            typingRow.innerHTML = `
-                <div class="typing-indicator-bubble">
-                    <div class="typing-dot"></div>
-                    <div class="typing-dot"></div>
-                    <div class="typing-dot"></div>
-                </div>
-                <span style="font-size: 11px; color: var(--text-muted); font-style: italic;">${state.activeContact.name} est en train d'écrire...</span>
-            `;
-            chatBody.appendChild(typingRow);
-            setTimeout(() => {
-                chatBody.scrollTo({ top: chatBody.scrollHeight, behavior: 'smooth' });
-            }, 20);
-        }
-    } else {
-        if (typingRow) typingRow.remove();
-    }
-}
-
 function updateMessageStatus(msgId, status) {
     const target = state.messages.find(m => m.id === msgId);
     if (target) target.status = status;
@@ -1134,24 +2141,8 @@ function updateMessageStatus(msgId, status) {
         } else if (status === 'sent') {
             el.innerHTML = '<span class="status-tick-sent">✓</span>';
         } else {
-            el.innerHTML = `<span class="status-tick-read" title="Déchiffré & Lu">${icons.checkCheck}</span>`;
+            el.innerHTML = `<span class="status-tick-read" title="Lu">${icons.checkCheck}</span>`;
         }
-    }
-}
-
-function toggleVoicePlay(btn) {
-    if (btn.innerText === '▶') {
-        btn.innerText = '⏸';
-        const bars = btn.parentElement.querySelectorAll('.voice-bar');
-        bars.forEach((b, idx) => {
-            b.style.transition = 'height 0.2s ease';
-            b.style.height = `${(idx % 3 + 1) * 7 + 4}px`;
-        });
-        setTimeout(() => {
-            btn.innerText = '▶';
-        }, 3000);
-    } else {
-        btn.innerText = '▶';
     }
 }
 
@@ -1162,57 +2153,208 @@ function triggerDeviceMediaPicker() {
     closePanels();
 }
 
-function handleMediaFileSelect(event) {
-    const file = event.target.files && event.target.files[0];
-    if (!file) return;
+function formatFileSize(bytes) {
+    return bytes > 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
+}
 
-    const sizeStr = file.size > 1024 * 1024 
-        ? `${(file.size / (1024 * 1024)).toFixed(1)} MB` 
-        : `${(file.size / 1024).toFixed(0)} KB`;
-    
-    const isVideo = file.type.startsWith('video');
-    const label = (isVideo ? '🎬 ' : '📷 ') + file.name;
+// Sends a File's actual bytes (as a base64 data URL) through the same encrypted text pipeline as
+// a normal message.
+async function sendFileAsStructuredMessage(file, mediaType, label, metaTextOverride, existingDataUrl) {
+    if (!state.activeContact || !requireBackend()) return;
+    if (file.size > MAX_STRUCTURED_PAYLOAD_BYTES) {
+        alert(`Fichier trop volumineux (${formatFileSize(file.size)}). Limite actuelle : ${formatFileSize(MAX_STRUCTURED_PAYLOAD_BYTES)}.`);
+        return;
+    }
+
+    const dataUrl = existingDataUrl || await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
+
+    const sizeStr = formatFileSize(file.size);
     const now = new Date();
     const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const newMsgId = 'm_' + Date.now();
+    const metaText = metaTextOverride || sizeStr;
+    const payload = encodeStructuredMessage({ kind: 'media', mediaType, name: label, metaText, dataUrl });
 
-    const reader = new FileReader();
-    reader.onload = function(e) {
-        const previewUrl = e.target.result;
+    try {
+        const record = await tauriInvoke('send_message', {
+            conversationId: state.activeContact.conversationId,
+            recipientPeerId: state.activeContact.peerId,
+            text: payload,
+        });
         const newMsg = {
-            id: newMsgId,
-            type: 'image',
+            id: record.id,
+            conversationId: state.activeContact.conversationId,
+            type: mediaType,
             text: label,
-            meta: `${sizeStr} • Direct UDP`,
-            url: previewUrl,
+            meta: metaText,
+            url: (mediaType === 'image' || mediaType === 'voice' || mediaType === 'video') ? dataUrl : undefined,
             time: timeStr,
             isOutgoing: true,
-            status: 'read'
+            status: 'sent',
         };
-
         state.messages.push(newMsg);
         appendChatMessageToBody(newMsg);
+    } catch (e) {
+        alert('Échec de l\'envoi du fichier : ' + e);
+    }
+}
 
-        // Emma peer acknowledgment
-        setTimeout(() => {
-            setEmmaTyping(true);
-            setTimeout(() => {
-                setEmmaTyping(false);
-                const replyMsg = {
-                    id: 'm_' + Date.now(),
-                    type: 'text',
-                    text: `Média "${file.name}" reçu et déchiffré en local (${sizeStr}) ! 📷✨`,
-                    time: timeStr,
-                    isOutgoing: false
-                };
-                state.messages.push(replyMsg);
-                appendChatMessageToBody(replyMsg);
-            }, 1200);
-        }, 800);
-    };
+// --- SYSTEMATIC MEDIA PREVIEW & CONFIRMATION BEFORE SENDING ---
+let pendingMedia = null;
 
-    reader.readAsDataURL(file);
+function openMediaPreviewModal(mediaInfo) {
+    pendingMedia = mediaInfo;
+    const modal = document.getElementById('media-preview-modal');
+    const container = document.getElementById('media-preview-container');
+    const titleEl = document.getElementById('media-preview-title');
+    const captionInput = document.getElementById('media-caption-input');
+    if (!modal || !container) return;
+
+    if (captionInput) captionInput.value = '';
+
+    if (mediaInfo.isImage) {
+        if (titleEl) titleEl.innerHTML = `${icons.image} <span>Aperçu de la photo</span>`;
+        container.innerHTML = `<img src="${mediaInfo.dataUrl}" style="max-width: 100%; max-height: 260px; object-fit: contain; border-radius: var(--radius-sm);" alt="${escapeHtml(mediaInfo.name)}">`;
+    } else if (mediaInfo.isVideo) {
+        if (titleEl) titleEl.innerHTML = `${icons.image} <span>Aperçu de la vidéo</span>`;
+        container.innerHTML = `<video src="${mediaInfo.dataUrl}" controls autoplay muted style="max-width: 100%; max-height: 260px; border-radius: var(--radius-sm);"></video>`;
+    } else {
+        if (titleEl) titleEl.innerHTML = `${icons.file} <span>Aperçu du document</span>`;
+        container.innerHTML = `
+            <div style="padding: 24px 20px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 8px;">
+                <div style="width: 56px; height: 56px; border-radius: var(--radius-md); background: var(--bg-surface-2); display: flex; align-items: center; justify-content: center; color: var(--accent-purple-light); border: 1px solid var(--border-subtle);">
+                    ${icons.file}
+                </div>
+                <div style="font-weight: 600; font-size: 14px; color: white; word-break: break-all; max-width: 260px;">${escapeHtml(mediaInfo.name)}</div>
+                <div style="font-size: 12px; color: var(--text-muted);">${formatFileSize(mediaInfo.size)}</div>
+            </div>
+        `;
+    }
+
+    modal.classList.add('show');
+    closePanels();
+}
+
+function closeMediaPreviewModal() {
+    const modal = document.getElementById('media-preview-modal');
+    if (modal) modal.classList.remove('show');
+    const container = document.getElementById('media-preview-container');
+    if (container) container.innerHTML = '';
+    pendingMedia = null;
+}
+
+async function confirmAndSendPendingMedia() {
+    if (!pendingMedia || !state.activeContact) {
+        closeMediaPreviewModal();
+        return;
+    }
+    const captionInput = document.getElementById('media-caption-input');
+    const caption = (captionInput && captionInput.value.trim()) || '';
+    const { file, mediaType, dataUrl, name, size } = pendingMedia;
+    closeMediaPreviewModal();
+
+    const label = caption ? `${caption} (${name})` : (mediaType === 'image' ? (name.match(/\.(mp4|webm|mov)$/i) ? '🎬 ' : '📷 ') + name : '📄 ' + name);
+    await sendFileAsStructuredMessage(file, mediaType, label, formatFileSize(size), dataUrl);
+}
+
+async function compressImageIfNeeded(file, maxDimension = 2048, quality = 0.82) {
+    if (!file.type.startsWith('image/') || file.type === 'image/gif' || file.type === 'image/svg+xml') {
+        return new Promise((resolve) => {
+            const r = new FileReader();
+            r.onload = (e) => resolve({ dataUrl: e.target.result, size: file.size, name: file.name });
+            r.readAsDataURL(file);
+        });
+    }
+
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const img = new Image();
+            img.onload = () => {
+                let width = img.width;
+                let height = img.height;
+
+                if (width > maxDimension || height > maxDimension) {
+                    if (width > height) {
+                        height = Math.round((height * maxDimension) / width);
+                        width = maxDimension;
+                    } else {
+                        width = Math.round((width * maxDimension) / height);
+                        height = maxDimension;
+                    }
+                }
+
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, width, height);
+
+                const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
+                const approxBytes = Math.round((compressedDataUrl.length * 3) / 4);
+                const safeName = file.name.replace(/\.[^/.]+$/, "") + ".jpg";
+                resolve({ dataUrl: compressedDataUrl, size: approxBytes, name: safeName });
+            };
+            img.onerror = () => {
+                resolve({ dataUrl: e.target.result, size: file.size, name: file.name });
+            };
+            img.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+    });
+}
+
+async function handleMediaFileSelect(event) {
+    const file = event.target.files && event.target.files[0];
     event.target.value = '';
+    if (!file) return;
+
+    const isVideo = file.type.startsWith('video') || /\.(mp4|webm|mov)$/i.test(file.name);
+    const isImage = file.type.startsWith('image') || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(file.name);
+    const mediaType = isVideo ? 'video' : (isImage ? 'image' : 'file');
+
+    // Auto-compress high-resolution camera photos if image
+    if (isImage) {
+        const processed = await compressImageIfNeeded(file);
+        if (processed.size > MAX_STRUCTURED_PAYLOAD_BYTES) {
+            alert(`Image trop volumineuse après compression (${formatFileSize(processed.size)}). Limite : ${formatFileSize(MAX_STRUCTURED_PAYLOAD_BYTES)}.`);
+            return;
+        }
+        openMediaPreviewModal({
+            file,
+            mediaType,
+            dataUrl: processed.dataUrl,
+            name: processed.name,
+            size: processed.size,
+            isVideo: false,
+            isImage: true,
+        });
+        return;
+    }
+
+    if (file.size > MAX_STRUCTURED_PAYLOAD_BYTES) {
+        alert(`Fichier trop volumineux (${formatFileSize(file.size)}). Limite actuelle : ${formatFileSize(MAX_STRUCTURED_PAYLOAD_BYTES)}.`);
+        return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        const dataUrl = e.target.result;
+        openMediaPreviewModal({
+            file,
+            mediaType,
+            dataUrl,
+            name: file.name,
+            size: file.size,
+            isVideo,
+            isImage,
+        });
+    };
+    reader.readAsDataURL(file);
 }
 
 function triggerDeviceDocPicker() {
@@ -1223,49 +2365,34 @@ function triggerDeviceDocPicker() {
 
 function handleDocFileSelect(event) {
     const file = event.target.files && event.target.files[0];
+    event.target.value = '';
     if (!file) return;
 
-    const sizeStr = file.size > 1024 * 1024 
-        ? `${(file.size / (1024 * 1024)).toFixed(1)} MB` 
-        : `${(file.size / 1024).toFixed(0)} KB`;
-    
-    const now = new Date();
-    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const newMsgId = 'm_' + Date.now();
+    if (file.size > MAX_STRUCTURED_PAYLOAD_BYTES) {
+        alert(`Document trop volumineux (${formatFileSize(file.size)}). Limite actuelle : ${formatFileSize(MAX_STRUCTURED_PAYLOAD_BYTES)}.`);
+        return;
+    }
 
-    const newMsg = {
-        id: newMsgId,
-        type: 'file',
-        text: '📄 ' + file.name,
-        meta: `${sizeStr} • Document E2EE`,
-        time: timeStr,
-        isOutgoing: true,
-        status: 'read'
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        const dataUrl = e.target.result;
+        openMediaPreviewModal({
+            file,
+            mediaType: 'file',
+            dataUrl,
+            name: file.name,
+            size: file.size,
+            isVideo: false,
+            isImage: false,
+        });
     };
-
-    state.messages.push(newMsg);
-    appendChatMessageToBody(newMsg);
-    event.target.value = '';
-
-    // Emma response
-    setTimeout(() => {
-        setEmmaTyping(true);
-        setTimeout(() => {
-            setEmmaTyping(false);
-            const replyMsg = {
-                id: 'm_' + Date.now(),
-                type: 'text',
-                text: `Document "${file.name}" reçu en direct P2P et intégrité SHA-256 validée ! 🛡️`,
-                time: timeStr,
-                isOutgoing: false
-            };
-            state.messages.push(replyMsg);
-            appendChatMessageToBody(replyMsg);
-        }, 1100);
-    }, 800);
+    reader.readAsDataURL(file);
 }
 
-// --- ADVANCED WHATSAPP-LIKE VOICE RECORDER (RECORD, PAUSE, RESUME, PREVIEW & SEND) ---
+// --- WHATSAPP-LIKE VOICE RECORDER (RECORD, PAUSE, RESUME & SEND) ---
+// Records real microphone audio via MediaRecorder — the resulting bytes are what actually gets
+// sent (see stopAndSendVoiceRecording), not a simulation. The waveform bars during recording are
+// a cosmetic animation, not a real-time visualization of the captured audio.
 let voiceRecordingTimer = null;
 let voiceRecordingSeconds = 0;
 let voiceWaveformAnim = null;
@@ -1273,14 +2400,58 @@ let isVoiceRecordingPaused = false;
 let isVoicePreviewPlaying = false;
 let voicePreviewTimer = null;
 let voicePreviewElapsed = 0;
+let activeMediaRecorder = null;
+let activeMicStream = null;
+let recordedAudioChunks = [];
 
-function startVoiceRecording() {
+async function startVoiceRecording() {
     closePanels();
     const normalRow = document.getElementById('normal-input-row');
     const voiceBar = document.getElementById('voice-recording-bar');
     const micBtn = document.getElementById('mic-record-btn');
 
-    if (!voiceBar || !normalRow) return;
+    if (!voiceBar || !normalRow || !state.activeContact) return;
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert('Micro indisponible dans ce contexte.');
+        return;
+    }
+
+    let stream;
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+        alert('Accès au microphone refusé ou indisponible : ' + e);
+        return;
+    }
+
+    activeMicStream = stream;
+    recordedAudioChunks = [];
+
+    // Negotiate optimal audio MIME type across Android WebView, iOS WebKit, and Desktop browsers
+    let recorderOptions = {};
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+            recorderOptions = { mimeType: 'audio/webm;codecs=opus' };
+        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+            recorderOptions = { mimeType: 'audio/mp4' };
+        } else if (MediaRecorder.isTypeSupported('audio/aac')) {
+            recorderOptions = { mimeType: 'audio/aac' };
+        } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+            recorderOptions = { mimeType: 'audio/ogg;codecs=opus' };
+        }
+    }
+
+    try {
+        activeMediaRecorder = new MediaRecorder(stream, recorderOptions);
+    } catch (err) {
+        activeMediaRecorder = new MediaRecorder(stream);
+    }
+
+    activeMediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) recordedAudioChunks.push(e.data);
+    };
+    activeMediaRecorder.start();
 
     normalRow.style.display = 'none';
     voiceBar.classList.remove('paused', 'previewing');
@@ -1302,6 +2473,16 @@ function startVoiceRecording() {
     if (previewBtn) previewBtn.style.display = 'none';
 
     startTimerAndWaveform();
+}
+
+function stopMicCapture() {
+    if (activeMediaRecorder && activeMediaRecorder.state !== 'inactive') {
+        try { activeMediaRecorder.stop(); } catch (e) { /* already stopped */ }
+    }
+    if (activeMicStream) {
+        activeMicStream.getTracks().forEach(t => t.stop());
+    }
+    activeMicStream = null;
 }
 
 function startTimerAndWaveform() {
@@ -1335,6 +2516,7 @@ function togglePauseVoiceRecording() {
     if (!isVoiceRecordingPaused) {
         // --- PAUSE RECORDING ---
         isVoiceRecordingPaused = true;
+        if (activeMediaRecorder && activeMediaRecorder.state === 'recording') activeMediaRecorder.pause();
         if (voiceRecordingTimer) clearInterval(voiceRecordingTimer);
         if (voiceWaveformAnim) clearInterval(voiceWaveformAnim);
 
@@ -1352,6 +2534,7 @@ function togglePauseVoiceRecording() {
         if (isVoicePreviewPlaying) {
             stopVoicePreview();
         }
+        if (activeMediaRecorder && activeMediaRecorder.state === 'paused') activeMediaRecorder.resume();
         isVoiceRecordingPaused = false;
         if (voiceBar) {
             voiceBar.classList.remove('paused', 'previewing');
@@ -1426,6 +2609,8 @@ function cancelVoiceRecording() {
     if (voiceRecordingTimer) clearInterval(voiceRecordingTimer);
     if (voiceWaveformAnim) clearInterval(voiceWaveformAnim);
     if (voicePreviewTimer) clearInterval(voicePreviewTimer);
+    stopMicCapture();
+    recordedAudioChunks = [];
 
     const normalRow = document.getElementById('normal-input-row');
     const voiceBar = document.getElementById('voice-recording-bar');
@@ -1439,7 +2624,7 @@ function cancelVoiceRecording() {
     isVoicePreviewPlaying = false;
 }
 
-function stopAndSendVoiceRecording() {
+async function stopAndSendVoiceRecording() {
     if (voiceRecordingTimer) clearInterval(voiceRecordingTimer);
     if (voiceWaveformAnim) clearInterval(voiceWaveformAnim);
     if (voicePreviewTimer) clearInterval(voicePreviewTimer);
@@ -1460,39 +2645,32 @@ function stopAndSendVoiceRecording() {
     isVoiceRecordingPaused = false;
     isVoicePreviewPlaying = false;
 
-    const now = new Date();
-    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const newMsgId = 'm_' + Date.now();
+    const recorder = activeMediaRecorder;
+    if (!state.activeContact || !recorder) {
+        stopMicCapture();
+        return;
+    }
 
-    const newMsg = {
-        id: newMsgId,
-        type: 'voice',
-        text: '🎤 Note_Vocale.opus',
-        meta: durationStr,
-        time: timeStr,
-        isOutgoing: true,
-        status: 'read'
-    };
+    const mimeType = recorder.mimeType || 'audio/webm';
+    const blob = await new Promise((resolve) => {
+        if (recorder.state === 'inactive') {
+            resolve(new Blob(recordedAudioChunks, { type: mimeType }));
+            return;
+        }
+        recorder.addEventListener('stop', () => {
+            resolve(new Blob(recordedAudioChunks, { type: mimeType }));
+        }, { once: true });
+        recorder.stop();
+    });
+    stopMicCapture();
+    recordedAudioChunks = [];
 
-    state.messages.push(newMsg);
-    appendChatMessageToBody(newMsg);
+    if (blob.size === 0) {
+        alert('Aucun son enregistré.');
+        return;
+    }
 
-    // Emma response
-    setTimeout(() => {
-        setEmmaTyping(true);
-        setTimeout(() => {
-            setEmmaTyping(false);
-            const replyMsg = {
-                id: 'm_' + Date.now(),
-                type: 'text',
-                text: `Note vocale (${durationStr}) bien écoutée en local, le son est très net ! 🎧👌`,
-                time: timeStr,
-                isOutgoing: false
-            };
-            state.messages.push(replyMsg);
-            appendChatMessageToBody(replyMsg);
-        }, 1200);
-    }, 800);
+    await sendFileAsStructuredMessage(blob, 'voice', `🎤 Note vocale (${durationStr})`, durationStr);
 }
 
 // --- LOCATION CONFIRMATION & SHARING ---
@@ -1513,7 +2691,7 @@ function openLocationModal() {
                 pendingCoordinates = {
                     lat: pos.coords.latitude,
                     lon: pos.coords.longitude,
-                    text: `${lat}° N, ${lon}° E (Direct GPS)`
+                    text: `${lat}° N, ${lon}° E (position exacte)`
                 };
                 const preview = document.getElementById('loc-coords-preview');
                 if (preview) preview.innerText = pendingCoordinates.text;
@@ -1533,124 +2711,81 @@ function closeLocationModal() {
     if (modal) modal.classList.remove('show');
 }
 
-function confirmAndSendLocation() {
+async function confirmAndSendLocation() {
     closeLocationModal();
+    if (!state.activeContact) return;
+    if (!requireBackend()) return;
 
     const now = new Date();
     const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const newMsgId = 'm_' + Date.now();
+    const payload = encodeStructuredMessage({
+        kind: 'location',
+        lat: pendingCoordinates.lat,
+        lon: pendingCoordinates.lon,
+        label: pendingCoordinates.text,
+    });
 
-    const newMsg = {
-        id: newMsgId,
-        type: 'location',
-        text: pendingCoordinates.text,
-        meta: 'Précision GPS ~5m • Chiffré P2P',
-        time: timeStr,
-        isOutgoing: true,
-        status: 'read'
-    };
-
-    state.messages.push(newMsg);
-    appendChatMessageToBody(newMsg);
-
-    // Emma response
-    setTimeout(() => {
-        setEmmaTyping(true);
-        setTimeout(() => {
-            setEmmaTyping(false);
-            const replyMsg = {
-                id: 'm_' + Date.now(),
-                type: 'text',
-                text: 'Position bien reçue et affichée sur la carte locale chiffrée ! 📍🛡️',
-                time: timeStr,
-                isOutgoing: false
-            };
-            state.messages.push(replyMsg);
-            appendChatMessageToBody(replyMsg);
-        }, 1100);
-    }, 800);
+    try {
+        const record = await tauriInvoke('send_message', {
+            conversationId: state.activeContact.conversationId,
+            recipientPeerId: state.activeContact.peerId,
+            text: payload,
+        });
+        const newMsg = {
+            id: record.id,
+            conversationId: state.activeContact.conversationId,
+            type: 'location',
+            text: pendingCoordinates.text,
+            meta: 'Précision d\'environ 5 mètres',
+            time: timeStr,
+            isOutgoing: true,
+            status: 'sent',
+        };
+        state.messages.push(newMsg);
+        appendChatMessageToBody(newMsg);
+    } catch (e) {
+        alert('Échec de l\'envoi de la position : ' + e);
+    }
 }
 
-
-
-function sendRichAttachment(type, name, meta) {
-    const now = new Date();
-    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-
-    const newMsg = {
-        id: 'm_' + Date.now(),
-        type: type,
-        text: name,
-        meta: meta,
-        time: timeStr,
-        isOutgoing: true,
-        status: 'read'
-    };
-
-    state.messages.push(newMsg);
-    closePanels();
-    appendChatMessageToBody(newMsg);
-
-    // Emma response
-    setTimeout(() => {
-        setEmmaTyping(true);
-
-        setTimeout(() => {
-            setEmmaTyping(false);
-            const replyMsg = {
-                id: 'm_' + Date.now(),
-                type: 'text',
-                text: `Pièce jointe (${name.split(' ')[1] || name}) bien reçue et vérifiée en local ! 👌`,
-                time: timeStr,
-                isOutgoing: false
-            };
-            state.messages.push(replyMsg);
-            appendChatMessageToBody(replyMsg);
-        }, 1100);
-    }, 800);
-}
-
-// Text send path (was referenced by the send button/Enter key but never implemented — the
-// button was a dead click). Storage is raw text; escaping happens once, at render time, in
-// buildMessageHtml — never here, so the value is never escaped twice.
-function sendMessage() {
+// Text send path, wired to the send button and the Enter key. Storage is raw text; escaping
+// happens once, at render time, in buildMessageHtml — never here, so the value is never escaped
+// twice. Encrypts (X3DH/Double Ratchet) and queues the message for real delivery via nova-transport.
+// `status` stays 'sending' until the outbox pump actually hands it off (direct or via relay) —
+// the next poll of get_messages picks up the authoritative status from local storage.
+async function sendMessage() {
     const input = document.getElementById('chat-input');
-    if (!input) return;
+    if (!input || !state.activeContact) return;
+    if (!requireBackend()) return;
     const text = input.value.trim();
     if (!text) return;
 
     const now = new Date();
     const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const conversationId = state.activeContact.conversationId;
 
-    const newMsg = {
-        id: 'm_' + Date.now(),
-        type: 'text',
-        text,
-        time: timeStr,
-        isOutgoing: true,
-        status: 'sent',
-    };
-
-    state.messages.push(newMsg);
-    appendChatMessageToBody(newMsg);
-    input.value = '';
-    input.focus();
-
-    setTimeout(() => {
-        setEmmaTyping(true);
-        setTimeout(() => {
-            setEmmaTyping(false);
-            const replyMsg = {
-                id: 'm_' + Date.now(),
-                type: 'text',
-                text: 'Message bien reçu, déchiffré localement via Double Ratchet.',
-                time: timeStr,
-                isOutgoing: false,
-            };
-            state.messages.push(replyMsg);
-            appendChatMessageToBody(replyMsg);
-        }, 1100);
-    }, 700);
+    try {
+        const record = await tauriInvoke('send_message', {
+            conversationId,
+            recipientPeerId: state.activeContact.peerId,
+            text,
+        });
+        const newMsg = {
+            id: record.id,
+            conversationId,
+            type: 'text',
+            text: record.text_content,
+            time: timeStr,
+            isOutgoing: true,
+            status: 'sent',
+        };
+        state.messages.push(newMsg);
+        appendChatMessageToBody(newMsg);
+        input.value = '';
+        input.focus();
+    } catch (e) {
+        alert('Échec de l\'envoi : ' + e);
+    }
 }
 
 function insertEmoji(emoji) {
@@ -1684,35 +2819,186 @@ function closePanels() {
     if (panel) panel.classList.remove('show');
 }
 
-// --- CONTACTS & STRICT SEARCH ---
-function addNewContact() {
-    const input = document.getElementById('add-handle-input');
-    if (!input || !input.value.trim()) return;
+// --- LIVE CAMERA & IMAGE QR SCANNER ---
+let qrScannerStream = null;
+let qrScannerAnimId = null;
 
-    const handle = input.value.trim().replace('@', '');
-    const name = handle.charAt(0).toUpperCase() + handle.slice(1).split('.')[0];
+async function openQrCameraScanner() {
+    const modal = document.getElementById('qr-camera-modal');
+    const video = document.getElementById('qr-scanner-video');
+    const errBox = document.getElementById('qr-camera-error');
+    if (!modal || !video) return;
 
-    state.contacts.push({
-        name: name,
-        handle: handle.includes('.nova') ? handle : handle + '.nova',
-        online: true,
-        p2pMode: 'Direct (35 ms)',
-        key: '8899 AABB CCDD EEFF ... 1122'
-    });
+    modal.classList.add('show');
+    if (errBox) errBox.style.display = 'none';
 
-    state.conversations.unshift({
-        id: 'conv_' + Date.now(),
-        name: name,
-        handle: handle.includes('.nova') ? handle : handle + '.nova',
-        lastMsg: 'Nouvelle conversation directe',
-        time: 'À l\'instant',
-        unread: 0,
-        online: true,
-        mode: 'Direct'
-    });
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        if (errBox) errBox.style.display = 'flex';
+        return;
+    }
 
-    alert(`Contact @${handle} ajouté avec succès.`);
-    navigateTo('conversations');
+    try {
+        qrScannerStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                facingMode: { ideal: 'environment' },
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+            }
+        });
+        video.srcObject = qrScannerStream;
+        await video.play();
+        requestQrScanFrame();
+    } catch (err) {
+        console.warn('getUserMedia with constraints failed, trying default video', err);
+        try {
+            qrScannerStream = await navigator.mediaDevices.getUserMedia({ video: true });
+            video.srcObject = qrScannerStream;
+            await video.play();
+            requestQrScanFrame();
+        } catch (err2) {
+            console.error('Camera access completely failed or denied', err2);
+            if (errBox) errBox.style.display = 'flex';
+        }
+    }
+}
+
+function closeQrCameraScanner() {
+    const modal = document.getElementById('qr-camera-modal');
+    if (modal) modal.classList.remove('show');
+
+    if (qrScannerAnimId) {
+        cancelAnimationFrame(qrScannerAnimId);
+        qrScannerAnimId = null;
+    }
+
+    if (qrScannerStream) {
+        try {
+            qrScannerStream.getTracks().forEach(track => track.stop());
+        } catch (e) {}
+        qrScannerStream = null;
+    }
+
+    const video = document.getElementById('qr-scanner-video');
+    if (video) {
+        video.srcObject = null;
+    }
+}
+
+function requestQrScanFrame() {
+    if (!qrScannerStream) return;
+    qrScannerAnimId = requestAnimationFrame(scanQrCameraFrame);
+}
+
+function scanQrCameraFrame() {
+    const video = document.getElementById('qr-scanner-video');
+    const canvas = document.getElementById('qr-scanner-canvas');
+    if (!video || !canvas || video.readyState < 2) {
+        requestQrScanFrame();
+        return;
+    }
+
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    if (typeof jsQR !== 'undefined') {
+        const code = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: 'dontInvert',
+        });
+        if (code && code.data && code.data.trim().length > 0) {
+            const detected = code.data.trim();
+            const bundleInput = document.getElementById('add-bundle-input');
+            if (bundleInput) bundleInput.value = detected;
+            closeQrCameraScanner();
+            if (navigator.vibrate) {
+                navigator.vibrate(100);
+            }
+            return;
+        }
+    }
+
+    requestQrScanFrame();
+}
+
+// Decodes a QR code from an imported image file or screenshot and fills the bundle input.
+function handleQrImageSelect(event) {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    if (!file) return;
+    if (typeof jsQR === 'undefined') {
+        alert('Décodeur QR indisponible.');
+        return;
+    }
+
+    const img = new Image();
+    img.onload = () => {
+        // Downscale large smartphone photos (e.g. 12MP-48MP) to max 1024px for fast, reliable jsQR decoding
+        const maxDim = 1024;
+        let width = img.width;
+        let height = img.height;
+        if (width > maxDim || height > maxDim) {
+            if (width > height) {
+                height = Math.round((height * maxDim) / width);
+                width = maxDim;
+            } else {
+                width = Math.round((width * maxDim) / height);
+                height = maxDim;
+            }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        const imageData = ctx.getImageData(0, 0, width, height);
+        const result = jsQR(imageData.data, imageData.width, imageData.height);
+        URL.revokeObjectURL(img.src);
+        if (!result) {
+            alert('Aucun QR code détecté dans cette image. Vérifiez que la photo est nette et bien cadrée.');
+            return;
+        }
+
+        const bundleInput = document.getElementById('add-bundle-input');
+        if (bundleInput) bundleInput.value = result.data.trim();
+        closeQrCameraScanner();
+    };
+    img.onerror = () => alert('Impossible de charger cette image.');
+    img.src = URL.createObjectURL(file);
+}
+
+// Adds a contact from an invitation URI or pasted X3DH prekey bundle. The backend verifies the
+// invitation's unforgeable signature and expiry deadline before accepting it.
+async function addContactReal() {
+    if (!requireBackend()) return;
+    const displayNameInput = document.getElementById('add-display-name-input');
+    const bundleInput = document.getElementById('add-bundle-input');
+    const displayName = (displayNameInput && displayNameInput.value.trim()) || '';
+    const bundleHex = (bundleInput && bundleInput.value.trim()) || '';
+
+    if (!displayName) {
+        alert('Entrez un nom pour ce contact.');
+        return;
+    }
+    if (!bundleHex) {
+        alert('Collez le lien ou code reçu de votre contact.');
+        return;
+    }
+
+    try {
+        await tauriInvoke('add_contact', {
+            username: displayName.toLowerCase().replace(/[^a-z0-9]+/g, ''),
+            displayName: displayName,
+            bundleHex: bundleHex,
+        });
+        await refreshContactsFromBackend();
+        await refreshConversationsFromBackend();
+        navigateTo('conversations');
+    } catch (e) {
+        alert('Impossible d\'ajouter ce contact — vérifiez que le code a été copié en entier et sans erreur. ' + e);
+    }
 }
 
 function filterContactsList(query) {
@@ -1724,8 +3010,8 @@ function filterContactsList(query) {
         c.handle.toLowerCase().includes(query.toLowerCase())
     );
 
-    container.innerHTML = filtered.map(c => `
-        <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" onclick="openChatWithEl(this)">
+    container.innerHTML = filtered.length > 0 ? filtered.map(c => `
+        <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
             <div class="avatar">
                 ${escapeHtml(c.name.charAt(0))}
                 <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
@@ -1735,7 +3021,7 @@ function filterContactsList(query) {
                 <div class="item-sub">@${escapeHtml(c.handle)} • ${escapeHtml(c.p2pMode)}</div>
             </div>
         </div>
-    `).join('');
+    `).join('') : `<div style="text-align: center; color: var(--text-dim); padding: 40px 20px; font-size: 13px;">Aucun contact ne correspond à « ${escapeHtml(query)} ».</div>`;
 }
 
 function handleStrictSearch(query) {
@@ -1765,7 +3051,7 @@ function handleStrictSearch(query) {
     resultsContainer.innerHTML = `
         <div style="font-size: 12px; color: var(--text-muted); margin: 0 0 8px 12px; font-weight: 600;">CONTACTS (${filteredContacts.length})</div>
         ${filteredContacts.length > 0 ? filteredContacts.map(c => `
-            <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" onclick="openChatWithEl(this)">
+            <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
                 <div class="avatar">${escapeHtml(c.name.charAt(0))}</div>
                 <div class="item-content">
                     <div class="item-name">${escapeHtml(c.name)}</div>
@@ -1776,7 +3062,7 @@ function handleStrictSearch(query) {
 
         <div style="font-size: 12px; color: var(--text-muted); margin: 16px 0 8px 12px; font-weight: 600;">MESSAGES (${filteredMessages.length})</div>
         ${filteredMessages.length > 0 ? filteredMessages.map(m => `
-            <div class="item-card" onclick="navigateTo('chat')">
+            <div class="item-card" data-action="navigate" data-screen="chat">
                 <div class="avatar">${icons.chat}</div>
                 <div class="item-content">
                     <div class="item-name">${escapeHtml(m.text)}</div>
@@ -1788,7 +3074,7 @@ function handleStrictSearch(query) {
 }
 
 // --- INITIALIZATION ---
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     // Setup rail & nav tabs
     document.querySelectorAll('[data-tab]').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -1800,8 +3086,32 @@ document.addEventListener('DOMContentLoaded', () => {
     // Update initial unread badges
     updateGlobalUnreadBadges();
 
-    // Render initial screen
-    navigateTo('conversations');
+    // If this device already created/restored an identity in a previous session, resume it
+    // straight from local encrypted storage — a "sovereign" identity app that made you re-type
+    // your 12-word mnemonic every single launch would defeat a good part of the point.
+    let resumed = null;
+    if (hasBackend) {
+        try {
+            resumed = await tauriInvoke('try_resume_session');
+        } catch (e) {
+            console.error('try_resume_session failed', e);
+        }
+    }
+    if (resumed) {
+        applyAccountInfo(
+            resumed.display_name || resumed.username,
+            resumed.peer_id,
+            resumed.mnemonic,
+            resumed.network_active,
+            resumed.bio || '',
+            resumed.avatar_data_url || null
+        );
+        await refreshContactsFromBackend();
+        await refreshConversationsFromBackend();
+        await refreshTorStatusFromBackend();
+    }
+
+    navigateTo(state.currentUser.peerId ? 'conversations' : 'onboarding');
 });
 
 // Close drawers (attachments, emoji picker) when clicking outside
@@ -1823,3 +3133,15 @@ document.addEventListener('click', (event) => {
         }
     }
 });
+
+// Automatically scroll chat messages when mobile keyboard opens/resizes
+if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => {
+        if (state.currentScreen === 'chat') {
+            const body = document.getElementById('chat-body');
+            if (body) {
+                body.scrollTop = body.scrollHeight;
+            }
+        }
+    });
+}

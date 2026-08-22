@@ -7,6 +7,8 @@ members = [
     "core/nova-transport",
     "core/nova-engine",
     "server",
+    "nova-bootstrap",
+    "ui/src-tauri",
 ]
 
 [workspace.package]
@@ -44,6 +46,26 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = "0.13"
 futures-util = "0.3"
 bytes = "1.6"
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "quic",
+    "dns",
+    "kad",
+    "mdns",
+    "identify",
+    "relay",
+    "dcutr",
+    "noise",
+    "yamux",
+    "request-response",
+    "cbor",
+    "macros",
+    "ed25519",
+] }
+
+# Best-effort automatic port forwarding (UPnP IGD) for a rendezvous device whose operator has no
+# router admin access — see nova-transport::dht_node's use of it.
+igd-next = { version = "0.17", features = ["aio_tokio"] }
 
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -55,3 +77,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = true

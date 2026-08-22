@@ -2,11 +2,14 @@
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <!-- viewport-fit=cover and interactive-widget=resizes-content ensure proper safe-area insets
+         and that the chat input bar stays pinned right above the virtual keyboard on mobile without cutoffs. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
     <title>NOVA Chat — Messagerie 1-to-1 P2P Souveraine</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- No web font: style-src in tauri.conf.json's CSP is 'self' 'unsafe-inline' only, so a
+         fonts.googleapis.com/fonts.gstatic.com stylesheet is blocked outright — it was a dead
+         network request on every launch. A system font stack (see style.css --font-sans) keeps
+         the "no cloud dependency" promise made on the onboarding screen and needs nothing here. -->
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -14,7 +17,7 @@
     <div id="app" class="app-root">
         <!-- Desktop Sidebar Rail (Visible on PC screens > 1024px) -->
         <aside class="desktop-rail" id="desktop-rail">
-            <div class="rail-brand" onclick="navigateTo('conversations')">
+            <div class="rail-brand" data-action="navigate" data-screen="conversations">
                 <div class="rail-logo">
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
                 </div>
@@ -63,6 +66,12 @@
         </nav>
     </div>
 
+    <!-- Vendored (not CDN — the app's CSP is script-src 'self') real QR encode/decode libraries:
+         qrcode (MIT, https://github.com/soldair/node-qrcode) and jsQR (Apache-2.0,
+         https://github.com/cozmo/jsQR). Verified via an independent round-trip test (encode
+         with qrcode, decode the resulting image with jsQR) before vendoring. -->
+    <script src="vendor/qrcode.js"></script>
+    <script src="vendor/jsQR.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

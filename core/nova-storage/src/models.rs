@@ -78,3 +78,31 @@ pub struct OutboxItem {
     pub attempt_count: i32,
     pub next_retry_utc: i64,
 }
+
+/// Personal profile metadata for the local device identity, encrypted at rest.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserProfileRecord {
+    pub display_name: String,
+    pub bio: String,
+    pub avatar_data_url: Option<String>,
+}
+
+/// Configuration for Tor anonymous routing and SOCKS5 proxying stored in the local database.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TorSettingsRecord {
+    pub enabled: bool,
+    pub mode: String, // "direct_only", "hybrid", "tor_strict"
+    pub socks_proxy: String,
+    pub bridge_type: Option<String>,
+}
+
+impl Default for TorSettingsRecord {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "direct_only".to_string(),
+            socks_proxy: "127.0.0.1:9050".to_string(),
+            bridge_type: None,
+        }
+    }
+}
