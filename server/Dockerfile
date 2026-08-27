@@ -36,7 +36,17 @@ RUN mkdir -p core/nova-crypto/src core/nova-protocol/src core/nova-storage/src \
     && cargo build --release -p nova-server 2>/dev/null || true
 
 COPY . .
-RUN cargo build --release -p nova-server
+# `COPY` preserves each file's original mtime from the build context rather than stamping it with
+# the current time, so real source files here can end up with an *older* mtime than the stub
+# `lib.rs`/`main.rs` files the previous layer's dummy build just compiled moments ago. Cargo's
+# staleness check is mtime-based: without this, it can wrongly conclude the real nova-protocol
+# (etc.) source hasn't changed since that dummy build and reuse its cached, effectively-empty
+# rlib — silently linking nova-server against stub crates instead of the real ones, surfacing as
+# "unresolved import" errors for types (`PeerEndpoint`, `ServerRequest`, ...) that genuinely do
+# exist in the real source. Touching every real local-crate `.rs` file to "now" after the copy
+# guarantees Cargo sees them as newer than anything the dummy layer produced.
+RUN find core server nova-bootstrap ui/src-tauri -name '*.rs' -exec touch {} + \
+    && cargo build --release -p nova-server
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
