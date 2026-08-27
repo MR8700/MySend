@@ -4,12 +4,12 @@ use crate::models::{
     TorSettingsRecord, UserProfileRecord,
 };
 use nova_crypto::{
-    derive_storage_key, generate_one_time_prekey, generate_storage_salt, DeviceIdentity,
-    DoubleRatchetSession, OneTimePreKeyPublic, OneTimePreKeySecret, PreKeyBundle,
-    SignedPreKeyPublic, SignedPreKeySecret,
+    derive_storage_key, generate_storage_salt, DeviceIdentity, DoubleRatchetSession,
+    OneTimePreKeyPublic, OneTimePreKeySecret, PreKeyBundle, SignedPreKeyPublic, SignedPreKeySecret,
 };
 use nova_protocol::MessageContentType;
 use parking_lot::Mutex;
+#[cfg(test)]
 use rand::Rng;
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use thiserror::Error;
@@ -461,31 +461,37 @@ impl StorageEngine {
     }
 
     /// Assembles this device's own publishable prekey bundle (identity keys + active signed
-    /// prekey + one fresh one-time prekey if any remain). Automatically replenishes the OPK pool
-    /// with 20 fresh keys if the available stock falls below 5. Share this out-of-band (QR code,
-    /// direct exchange) so a peer can call `add_contact` with it.
+    /// prekey, deliberately no one-time prekey — see below). Share this out-of-band (QR code,
+    /// invitation link, direct exchange) so a peer can call `add_contact` with it.
+    ///
+    /// Never embeds a one-time prekey, even though the `one_time_prekeys` pool/publishing
+    /// machinery below still exists and is exercised by its own tests: this bundle (or the signed
+    /// `nova://invite` ticket wrapping it — see `nova_protocol::SignedContactInvitation`) is a
+    /// static artifact the UI deliberately keeps valid and re-showable for up to 24h (a QR code
+    /// displayed once, a link pasted into several chats), so there is no way to guarantee any
+    /// "one-time" key embedded in it is ever actually used by only one recipient. It previously
+    /// was taken from the pool here on every call: the first person to complete a handshake using
+    /// a given invitation consumed the key, and every other recipient of that *same* invitation
+    /// then silently derived a different-and-wrong X3DH shared secret from the (by then missing)
+    /// one-time prekey — every message they ever sent failed its AEAD tag check forever after,
+    /// with no way to recover short of a brand new invitation (see the 2026-08-24 3-device mesh
+    /// test that reproduced this: two of three devices could add and message the third, since both
+    /// read the third's one single invitation). X3DH without a one-time prekey (`opk_secret: None`
+    /// in `x3dh_respond`) is still a fully secure, standard X3DH mode — the one-time-prekey term
+    /// only ever added marginal extra forward secrecy, which this design cannot deliver safely
+    /// anyway without a live server handing out each key exactly once.
     pub fn get_own_prekey_bundle(&self, identity: &DeviceIdentity) -> Result<PreKeyBundle, StorageError> {
         let (_secret, signed_prekey) = self
             .load_active_signed_prekey()?
             .ok_or_else(|| StorageError::NotFound("no signed prekey generated yet".into()))?;
 
-        // Automatic replenishment: ensure we never exhaust one-time prekeys
-        let remaining_opks = self.count_unpublished_one_time_prekeys()?;
-        if remaining_opks < 5 {
-            let new_keys: Vec<_> = (0..20)
-                .map(|_| generate_one_time_prekey(storage_random_key_id()))
-                .collect();
-            self.save_one_time_prekeys(&new_keys)?;
-        }
-
-        let one_time_prekey = self.take_one_time_prekey_for_publishing()?;
         let onion_address = Some(nova_crypto::derive_onion_v3_address(&identity.verifying_key_bytes));
 
         Ok(PreKeyBundle {
             identity_ed25519_pub: identity.verifying_key_bytes,
             identity_x25519_pub: identity.dh_public_bytes,
             signed_prekey,
-            one_time_prekey,
+            one_time_prekey: None,
             onion_address,
         })
     }
@@ -568,6 +574,39 @@ impl StorageEngine {
             "UPDATE contacts SET is_blocked = 0 WHERE peer_id = ?1",
             params![peer_id],
         )?;
+        Ok(())
+    }
+
+    /// Permanently removes a contact and everything tied to them: message history, any pending
+    /// outbox items addressed to them, and the Double Ratchet session — unlike `block_contact`,
+    /// which keeps all of this and just stops future messages, this is a full wipe of the
+    /// relationship. Re-adding the same peer afterwards starts a fresh conversation with no
+    /// memory of the old one (the opposite of `test_readding_contact_preserves_conversation_
+    /// history`'s re-add-without-deleting case). `conversations`/`messages` have a `FOREIGN KEY`
+    /// relationship enforced (`PRAGMA foreign_keys = ON`), so deletion order matters: attachments
+    /// before messages before conversations.
+    pub fn delete_contact(&self, peer_id: &str) -> Result<(), StorageError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM message_attachments WHERE message_id IN (
+                SELECT id FROM messages WHERE conversation_id IN (
+                    SELECT id FROM conversations WHERE peer_id = ?1
+                )
+             )",
+            params![peer_id],
+        )?;
+        tx.execute(
+            "DELETE FROM messages WHERE conversation_id IN (
+                SELECT id FROM conversations WHERE peer_id = ?1
+             )",
+            params![peer_id],
+        )?;
+        tx.execute("DELETE FROM conversations WHERE peer_id = ?1", params![peer_id])?;
+        tx.execute("DELETE FROM outbox_queue WHERE recipient_id = ?1", params![peer_id])?;
+        tx.execute("DELETE FROM ratchet_sessions WHERE peer_id = ?1", params![peer_id])?;
+        tx.execute("DELETE FROM contacts WHERE peer_id = ?1", params![peer_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1075,6 +1114,10 @@ impl StorageEngine {
     }
 }
 
+// Only the pool-roundtrip test still needs a fresh key id — `get_own_prekey_bundle` no longer
+// publishes one-time prekeys at all (see its doc comment), and `provision_prekeys`
+// (nova-engine) generates its own ids independently.
+#[cfg(test)]
 fn storage_random_key_id() -> u32 {
     rand::thread_rng().gen_range(1..=u32::MAX)
 }
@@ -1106,7 +1149,7 @@ fn row_to_contact(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_crypto::{generate_signed_prekey, MnemonicPhrase};
+    use nova_crypto::{generate_one_time_prekey, generate_signed_prekey, MnemonicPhrase};
 
     fn test_identity(name: &str) -> DeviceIdentity {
         let mnemonic = MnemonicPhrase::generate().unwrap();
@@ -1185,7 +1228,10 @@ mod tests {
 
         let bundle = storage.get_own_prekey_bundle(&identity).unwrap();
         assert_eq!(bundle.identity_ed25519_pub, identity.verifying_key_bytes);
-        assert!(bundle.one_time_prekey.is_some());
+        // Deliberately never a one-time prekey — see get_own_prekey_bundle's doc comment: this
+        // bundle backs a QR/invitation link the UI keeps re-showable for 24h, so nothing about it
+        // can safely be "used exactly once".
+        assert!(bundle.one_time_prekey.is_none());
     }
 
     #[test]
@@ -1459,28 +1505,139 @@ mod tests {
         assert_eq!(storage.get_blocked_contacts().unwrap().len(), 0);
     }
 
+    /// `delete_contact` must wipe every trace of the relationship (contact row, conversation,
+    /// messages, their attachment blob, any queued outbox item, and the Double Ratchet session)
+    /// — unlike block/unblock, which keeps all of it — while leaving a second, unrelated contact
+    /// and their own conversation completely untouched.
     #[test]
-    fn test_auto_replenish_opk_pool() {
+    fn test_delete_contact_wipes_everything_but_leaves_other_contacts_intact() {
+        use nova_crypto::DoubleRatchetSession;
+        use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
+        let storage = StorageEngine::open(":memory:", "unlock-pass").unwrap();
+
+        let make_contact = |name: &str| {
+            let id = test_identity(name);
+            let (_secret, signed_prekey) = generate_signed_prekey(&id, 1);
+            let bundle = PreKeyBundle {
+                identity_ed25519_pub: id.verifying_key_bytes,
+                identity_x25519_pub: id.dh_public_bytes,
+                signed_prekey,
+                one_time_prekey: None,
+                onion_address: None,
+            };
+            ContactRecord {
+                peer_id: hex::encode(id.verifying_key_bytes),
+                username: format!("{name}.nova"),
+                display_name: name.to_string(),
+                prekey_bundle: bundle,
+                safety_number: "1234-5678".into(),
+                is_online: false,
+                is_blocked: false,
+                last_seen_utc: 1787119000,
+            }
+        };
+
+        let bob = make_contact("bob");
+        let carol = make_contact("carol");
+        storage.save_contact(&bob).unwrap();
+        storage.save_contact(&carol).unwrap();
+
+        for (peer, conv_id) in [(&bob, "conv_bob"), (&carol, "conv_carol")] {
+            storage
+                .save_conversation(&ConversationRecord {
+                    id: conv_id.into(),
+                    peer_id: peer.peer_id.clone(),
+                    title: peer.display_name.clone(),
+                    last_message_text: String::new(),
+                    last_message_time_utc: 0,
+                    unread_count: 0,
+                })
+                .unwrap();
+            let attachment_bytes = vec![0xCDu8; 1024];
+            storage
+                .save_message_with_attachment(
+                    &MessageRecord {
+                        id: format!("msg_{}", peer.display_name),
+                        conversation_id: conv_id.into(),
+                        sender_id: "me".into(),
+                        recipient_id: peer.peer_id.clone(),
+                        text_content: format!("hello {}", peer.display_name),
+                        timestamp_utc: 1787119100,
+                        status: DbMessageStatus::Sent,
+                        is_outgoing: true,
+                        content_type: MessageContentType::Image,
+                        attachment: Some(AttachmentMeta {
+                            mime_type: "image/jpeg".into(),
+                            file_name: "photo.jpg".into(),
+                            size_bytes: attachment_bytes.len() as u64,
+                        }),
+                    },
+                    "checksum",
+                    &attachment_bytes,
+                )
+                .unwrap();
+            storage
+                .enqueue_outbox(&format!("msg_{}", peer.display_name), conv_id, &peer.peer_id, b"payload")
+                .unwrap();
+
+            let shared_key = [7u8; 32];
+            let dhs = StaticSecret::random_from_rng(&mut rand::thread_rng());
+            let dh_pub = *X25519PublicKey::from(&dhs).as_bytes();
+            let session = DoubleRatchetSession::init_alice(&shared_key, &dh_pub).unwrap();
+            storage.save_session(&peer.peer_id, &session).unwrap();
+        }
+
+        storage.delete_contact(&bob.peer_id).unwrap();
+
+        // Bob is gone, entirely.
+        assert!(storage.get_contact(&bob.peer_id).unwrap().is_none());
+        assert_eq!(storage.get_messages("conv_bob").unwrap().len(), 0);
+        assert!(storage.get_attachment_blob("msg_bob").unwrap().is_none());
+        assert_eq!(storage.get_pending_outbox().unwrap().iter().filter(|o| o.recipient_id == bob.peer_id).count(), 0);
+        assert!(storage.load_session(&bob.peer_id).unwrap().is_none());
+        assert!(!storage.get_conversations().unwrap().iter().any(|c| c.id == "conv_bob"));
+
+        // Carol is entirely untouched.
+        assert!(storage.get_contact(&carol.peer_id).unwrap().is_some());
+        assert_eq!(storage.get_messages("conv_carol").unwrap().len(), 1);
+        assert!(storage.get_attachment_blob("msg_carol").unwrap().is_some());
+        assert_eq!(storage.get_pending_outbox().unwrap().iter().filter(|o| o.recipient_id == carol.peer_id).count(), 1);
+        assert!(storage.load_session(&carol.peer_id).unwrap().is_some());
+        assert!(storage.get_conversations().unwrap().iter().any(|c| c.id == "conv_carol"));
+    }
+
+    /// `get_own_prekey_bundle` itself no longer touches the one-time-prekey pool at all (see its
+    /// doc comment) — this test exercises the pool's own publish/consume machinery directly
+    /// instead, since `take_one_time_prekey_for_publishing`/`consume_one_time_prekey_secret` stay
+    /// in place for decoding invitations minted by an older build that still embedded one.
+    #[test]
+    fn test_one_time_prekey_pool_publish_and_consume_roundtrip() {
         let storage = StorageEngine::open(":memory:", "unlock-pass").unwrap();
         let bob = test_identity("bob");
         let (secret, public) = generate_signed_prekey(&bob, 1);
         storage.save_signed_prekey(&secret, &public).unwrap();
 
-        // Initially no OPKs provisioned; calling get_own_prekey_bundle auto-replenishes 20 keys
-        let bundle1 = storage.get_own_prekey_bundle(&bob).unwrap();
-        assert!(bundle1.one_time_prekey.is_some());
-        assert!(bundle1.onion_address.is_some());
+        assert_eq!(storage.count_unpublished_one_time_prekeys().unwrap(), 0);
+        let new_keys: Vec<_> = (0..20).map(|_| generate_one_time_prekey(storage_random_key_id())).collect();
+        storage.save_one_time_prekeys(&new_keys).unwrap();
+        assert_eq!(storage.count_unpublished_one_time_prekeys().unwrap(), 20);
+
+        let published = storage.take_one_time_prekey_for_publishing().unwrap().unwrap();
         assert_eq!(storage.count_unpublished_one_time_prekeys().unwrap(), 19);
 
-        // Consume 16 more keys (bringing remaining unpublished down to 3 < 5)
-        for _ in 0..16 {
-            let b = storage.get_own_prekey_bundle(&bob).unwrap();
-            assert!(b.one_time_prekey.is_some());
-        }
+        // The exact key handed out above must still be consumable (this is the path
+        // `consume_one_time_prekey_secret` takes when a handshake references it) ...
+        let consumed = storage.consume_one_time_prekey_secret(published.key_id).unwrap();
+        assert!(consumed.is_some());
+        // ... but only once: a second consumption of the same id (the exact scenario that used to
+        // silently corrupt a second recipient's session — see get_own_prekey_bundle's doc comment)
+        // must come back empty, not some stale or fabricated secret.
+        assert!(storage.consume_one_time_prekey_secret(published.key_id).unwrap().is_none());
 
-        // Check that OPK pool was automatically replenished and never drops to 0
-        let count = storage.count_unpublished_one_time_prekeys().unwrap();
-        assert!(count >= 5, "OPK pool should have been automatically replenished, count is {count}");
+        // And `get_own_prekey_bundle` must never hand one out, regardless of how full the pool is.
+        let bundle = storage.get_own_prekey_bundle(&bob).unwrap();
+        assert!(bundle.one_time_prekey.is_none());
     }
 
     /// Regression test for the 2026-08-22 audit's "no backoff" finding: `record_outbox_retry`
@@ -1516,8 +1673,9 @@ mod tests {
     fn test_tor_settings_persistence() {
         let storage = StorageEngine::open(":memory:", "unlock-pass").unwrap();
         let initial = storage.get_tor_settings().unwrap();
-        assert!(!initial.enabled);
-        assert_eq!(initial.mode, "direct_only");
+        // Enabled/hybrid by default — see TorSettingsRecord::default()'s doc comment.
+        assert!(initial.enabled);
+        assert_eq!(initial.mode, "hybrid");
         assert_eq!(initial.socks_proxy, "127.0.0.1:9050");
 
         let updated = TorSettingsRecord {

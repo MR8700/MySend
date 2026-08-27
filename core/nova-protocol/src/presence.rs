@@ -27,10 +27,15 @@ pub struct PeerEndpoint {
 /// relay) can verify the registrant genuinely controls `peer_id` before trusting the announced
 /// address — without this, anyone could announce presence under someone else's identity and
 /// hijack their discovery entry.
+/// `#[serde(with = "serde_bytes")]` on `signature` is load-bearing, not cosmetic: without it,
+/// plain `serde::Serialize` encodes a `Vec<u8>` as a CBOR array of one integer item per byte
+/// instead of a compact CBOR byte string — see the identical footgun documented on
+/// `MessagePayload::chunk_bytes` in packet.rs and on `SignedContactInvitation`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignedPresenceRegistration {
     pub endpoint: PeerEndpoint,
     pub timestamp_utc: u64,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -60,10 +65,13 @@ fn drain_signing_input(peer_id: &str, timestamp_utc: u64) -> Vec<u8> {
 /// opaque packets — without this, anyone who guesses or observes a peer_id could drain and
 /// discard another peer's pending relayed messages (a delivery-availability attack), even
 /// though the relay's zero-knowledge design already prevents them from reading the contents.
+/// See `SignedPresenceRegistration`'s doc comment for why `#[serde(with = "serde_bytes")]` on
+/// `signature` is load-bearing here too.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignedDrainRequest {
     pub peer_id: String,
     pub timestamp_utc: u64,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 

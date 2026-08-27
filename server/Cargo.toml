@@ -15,3 +15,15 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+# Render (like most PaaS hosts) only exposes an HTTP(S)/TCP ingress to the outside world — no raw
+# UDP passthrough — so the discovery/relay signaling endpoint runs as a WebSocket upgrade over
+# axum's HTTP server instead of a bare `UdpSocket`. TLS itself is terminated by Render's edge
+# proxy in front of this process; the server here only ever speaks plain `ws://` on its bound port.
+axum = { version = "0.7", features = ["ws"] }
+
+[dev-dependencies]
+# For server/tests/ws_e2e.rs: axum's "ws" feature above already pulls tokio-tungstenite/
+# tungstenite in transitively — this just names it directly so the test can act as a real
+# WebSocket client against this server's own axum app.
+tokio-tungstenite.workspace = true
+futures-util.workspace = true

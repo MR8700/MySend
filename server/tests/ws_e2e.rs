@@ -1,13 +1,16 @@
-//! End-to-end test of the discovery/relay server over a real UDP socket: this is the network
-//! surface a hostile peer actually talks to, so it is exercised here rather than only through
-//! the in-process unit tests in `registry.rs`/`relay.rs`.
+//! End-to-end test of the discovery/relay server over a real WebSocket connection (what it
+//! actually serves once deployed, since a host like Render exposes no raw UDP ingress — see
+//! `service.rs`'s module doc comment): this is the network surface a hostile peer actually talks
+//! to, so it is exercised here rather than only through the in-process unit tests in
+//! `registry.rs`/`relay.rs`.
 
+use futures_util::{SinkExt, StreamExt};
 use nova_crypto::{DeviceIdentity, MnemonicPhrase};
 use nova_protocol::{PeerEndpoint, ServerRequest, ServerResponse, SignedDrainRequest, SignedPresenceRegistration};
-use nova_server::run_server;
+use nova_server::bind;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::Message;
 
 fn identity(name: &str) -> DeviceIdentity {
     let mnemonic = MnemonicPhrase::generate().unwrap();
@@ -19,48 +22,47 @@ fn now_secs() -> u64 {
 }
 
 async fn start_test_server() -> String {
-    // Port 0 lets the OS assign a free port; retry a couple of fixed high ports as a fallback
-    // for environments where UdpSocket::bind(":0") behaves oddly is unnecessary here since we
-    // bind directly and then read the resolved local address back out via the OS.
-    let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-    let bind_addr = addr.to_string();
-
-    let spawn_addr = bind_addr.clone();
-    tokio::spawn(async move {
-        let _ = run_server(&spawn_addr).await;
-    });
-
-    // Give the server a moment to bind before the test starts sending.
+    let (listener, registry, relay) = bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(nova_server::serve_forever(listener, registry, relay));
+    // Give the server a moment to start accepting connections before the test starts dialing.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    bind_addr
+    addr
 }
 
-async fn roundtrip(client: &UdpSocket, server_addr: &str, request: &ServerRequest) -> ServerResponse {
-    let bytes = request.to_bytes().unwrap();
-    client.send_to(&bytes, server_addr).await.unwrap();
-
-    let mut buf = vec![0u8; 16 * 1024];
-    let (len, _) = timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+/// One request, one response, one fresh WebSocket connection — mirrors exactly how
+/// `nova-transport`'s real fallback client uses this server (see `udp_fallback.rs`).
+async fn roundtrip(server_addr: &str, request: &ServerRequest) -> ServerResponse {
+    let url = format!("ws://{server_addr}/");
+    let (mut ws, _) = timeout(Duration::from_secs(2), tokio_tungstenite::connect_async(&url))
         .await
-        .expect("server did not respond in time")
+        .expect("server did not accept the connection in time")
         .unwrap();
 
-    ServerResponse::from_bytes(&buf[..len]).unwrap()
+    ws.send(Message::Binary(request.to_bytes().unwrap())).await.unwrap();
+
+    let msg = timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("server did not respond in time")
+        .expect("connection closed without a response")
+        .unwrap();
+
+    let Message::Binary(bytes) = msg else {
+        panic!("expected a binary WebSocket message, got {msg:?}");
+    };
+    ServerResponse::from_bytes(&bytes).unwrap()
 }
 
 #[tokio::test]
-async fn test_register_then_lookup_over_real_udp_socket() {
+async fn test_register_then_lookup_over_real_websocket() {
     let server_addr = start_test_server().await;
-    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     let alice = identity("alice");
     // Alice's device cannot know its own post-NAT public IP, so it claims a plausible but
-    // fictitious one here — the server must ignore this and record the UDP source IP it actually
-    // observed instead (a STUN-style reflexive-address correction, see
+    // fictitious one here — the server must ignore this and record the address it actually
+    // observed the connection arrive from instead (a STUN-style reflexive-address correction, see
     // `PresenceRegistry::register`). The claimed port (51820, standing in for Alice's actual QUIC
-    // endpoint port, which is a different socket than this signaling client) is kept as-is.
+    // endpoint port, which is a different socket than this signaling connection) is kept as-is.
     let endpoint = PeerEndpoint {
         peer_id: String::new(),
         public_ip: "203.0.113.5".into(),
@@ -69,13 +71,11 @@ async fn test_register_then_lookup_over_real_udp_socket() {
         local_port: Some(51820),
     };
     let registration = SignedPresenceRegistration::sign(&alice, endpoint, now_secs());
-    let client_local_addr = client.local_addr().unwrap();
 
-    let register_resp = roundtrip(&client, &server_addr, &ServerRequest::Register(registration)).await;
+    let register_resp = roundtrip(&server_addr, &ServerRequest::Register(registration)).await;
     assert!(matches!(register_resp, ServerResponse::Registered));
 
     let lookup_resp = roundtrip(
-        &client,
         &server_addr,
         &ServerRequest::Lookup {
             peer_id: alice.public_id_hex(),
@@ -85,7 +85,10 @@ async fn test_register_then_lookup_over_real_udp_socket() {
 
     match lookup_resp {
         ServerResponse::LookupResult(Some(found)) => {
-            assert_eq!(found.public_ip, client_local_addr.ip().to_string());
+            // No `X-Forwarded-For` header on a direct connection like this test's, so the
+            // observed address falls back to the real TCP peer — loopback, since both ends are
+            // 127.0.0.1 here.
+            assert_eq!(found.public_ip, "127.0.0.1");
             assert_ne!(found.public_ip, "203.0.113.5", "claimed IP must never be trusted verbatim");
             assert_eq!(found.public_port, 51820);
         }
@@ -94,9 +97,8 @@ async fn test_register_then_lookup_over_real_udp_socket() {
 }
 
 #[tokio::test]
-async fn test_spoofed_registration_is_rejected_over_real_udp_socket() {
+async fn test_spoofed_registration_is_rejected_over_real_websocket() {
     let server_addr = start_test_server().await;
-    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     let alice = identity("alice");
     let bob = identity("bob");
@@ -113,11 +115,10 @@ async fn test_spoofed_registration_is_rejected_over_real_udp_socket() {
     let mut hijack = SignedPresenceRegistration::sign(&bob, endpoint, now_secs());
     hijack.endpoint.peer_id = alice.public_id_hex();
 
-    let resp = roundtrip(&client, &server_addr, &ServerRequest::Register(hijack)).await;
+    let resp = roundtrip(&server_addr, &ServerRequest::Register(hijack)).await;
     assert!(matches!(resp, ServerResponse::Error(_)));
 
     let lookup_resp = roundtrip(
-        &client,
         &server_addr,
         &ServerRequest::Lookup {
             peer_id: alice.public_id_hex(),
@@ -128,15 +129,13 @@ async fn test_spoofed_registration_is_rejected_over_real_udp_socket() {
 }
 
 #[tokio::test]
-async fn test_relay_forward_and_authenticated_drain_over_real_udp_socket() {
+async fn test_relay_forward_and_authenticated_drain_over_real_websocket() {
     let server_addr = start_test_server().await;
-    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     let bob = identity("bob");
     let bob_peer_id = bob.public_id_hex();
 
     let forward_resp = roundtrip(
-        &client,
         &server_addr,
         &ServerRequest::RelayForward {
             target_peer_id: bob_peer_id.clone(),
@@ -150,12 +149,12 @@ async fn test_relay_forward_and_authenticated_drain_over_real_udp_socket() {
     let eve = identity("eve");
     let mut forged_drain = SignedDrainRequest::sign(&eve, now_secs());
     forged_drain.peer_id = bob_peer_id.clone();
-    let forged_resp = roundtrip(&client, &server_addr, &ServerRequest::RelayDrain(forged_drain)).await;
+    let forged_resp = roundtrip(&server_addr, &ServerRequest::RelayDrain(forged_drain)).await;
     assert!(matches!(forged_resp, ServerResponse::Error(_)));
 
     // Bob, proving ownership of his own key, can drain it.
     let real_drain = SignedDrainRequest::sign(&bob, now_secs());
-    let drain_resp = roundtrip(&client, &server_addr, &ServerRequest::RelayDrain(real_drain)).await;
+    let drain_resp = roundtrip(&server_addr, &ServerRequest::RelayDrain(real_drain)).await;
     match drain_resp {
         ServerResponse::RelayDrained(items) => {
             assert_eq!(items.len(), 1);

@@ -51,6 +51,17 @@ pub struct SignedPreKeyPublic {
     pub public: [u8; 32],
     /// Ed25519 signature (64 bytes). Stored as a `Vec<u8>` because `serde`'s derive does not
     /// implement (De)Serialize for fixed-size arrays larger than 32 elements.
+    ///
+    /// `#[serde(with = "serde_bytes")]` is load-bearing, not cosmetic: without it, plain
+    /// `serde::Serialize` for `Vec<u8>` encodes it as a CBOR array of one integer item per byte
+    /// (no built-in specialization for `T = u8`) instead of a compact CBOR byte string — see the
+    /// identical footgun documented on `MessagePayload::chunk_bytes` in nova-protocol/src/packet.rs.
+    /// This field sits inside `PreKeyBundle`, which is itself re-embedded as raw bytes in
+    /// `ContactInvitationPayload::bundle` and then in `SignedContactInvitation::payload_cbor` — so
+    /// this 2x bloat compounds with every wrapping layer, and previously blew the resulting
+    /// invitation URI straight through the QR code format's max capacity ("The amount of data is
+    /// too big to be stored in a QR Code").
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 

@@ -1,11 +1,20 @@
 //! Tor Onion v3 Address Derivation and Verification
 //!
 //! Implements the Tor v3 hidden service specification (rend-spec-v3.txt § 6):
-//! - checksum = SHA512(".onion checksum" || pubkey || version_byte)[0..2]
+//! - checksum = SHA3-256(".onion checksum" || pubkey || version_byte)[0..2]
 //! - address = base32(pubkey || checksum || version_byte) || ".onion"
 //! - Total encoded length: 56 characters in lowercase RFC 4648 base32 + ".onion".
+//!
+//! SHA3-256, not SHA-512, is load-bearing: the spec calls for SHA3-256 specifically (Tor's own
+//! `hs_ed25519_public_key`/onion-address derivation uses it), and the two hash families produce
+//! entirely different digests — an address computed with SHA-512 will never match what a real
+//! Tor node serving the same Ed25519 identity key actually publishes as its hidden service's
+//! address. Caught by standing up a real `tor` process with this identity's keys and diffing its
+//! `hostname` file against this function's output — they diverged in the last ~5 of 56 base32
+//! characters (the checksum+version tail), while the pubkey-derived prefix matched exactly,
+//! which is exactly what a checksum-algorithm mismatch (not a key error) looks like.
 
-use sha2::{Digest, Sha512};
+use sha3::{Digest, Sha3_256};
 use crate::error::CryptoError;
 
 const ONION_CHECKSUM_PREFIX: &[u8] = b".onion checksum";
@@ -15,7 +24,7 @@ const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 /// Derives a 56-character `.onion` v3 address string from an Ed25519 public key.
 pub fn derive_onion_v3_address(ed25519_pub: &[u8; 32]) -> String {
     // 1. Calculate 2-byte checksum
-    let mut hasher = Sha512::new();
+    let mut hasher = Sha3_256::new();
     hasher.update(ONION_CHECKSUM_PREFIX);
     hasher.update(ed25519_pub);
     hasher.update([ONION_V3_VERSION]);
@@ -67,7 +76,7 @@ pub fn parse_onion_v3_address(onion_addr: &str) -> Result<[u8; 32], CryptoError>
     }
 
     // Verify checksum
-    let mut hasher = Sha512::new();
+    let mut hasher = Sha3_256::new();
     hasher.update(ONION_CHECKSUM_PREFIX);
     hasher.update(&pubkey);
     hasher.update([ONION_V3_VERSION]);

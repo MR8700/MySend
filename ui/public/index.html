@@ -15,6 +15,10 @@
 <body>
     <!-- App Container -->
     <div id="app" class="app-root">
+        <!-- Persistent, screen-independent banner shown while the device has no Wi-Fi/mobile data
+             at all (navigator.onLine) — see updateOfflineBanner() in app.js. Sits outside
+             #screen-container so it survives every screen re-render. -->
+        <div id="offline-banner" class="offline-banner">📡 Pas de connexion réseau — vos messages seront envoyés dès qu'une connexion Wi-Fi ou mobile sera disponible.</div>
         <!-- Desktop Sidebar Rail (Visible on PC screens > 1024px) -->
         <aside class="desktop-rail" id="desktop-rail">
             <div class="rail-brand" data-action="navigate" data-screen="conversations">

@@ -1,0 +1,12 @@
+# Keeps the Docker build context (which is the whole repo — see server/Dockerfile's doc comment
+# on why a Cargo workspace needs that) small and fast to upload. None of these are needed to
+# build the `nova-server` binary.
+target/
+node_modules/
+ui/dist/
+ui/src-tauri/target/
+ui/src-tauri/gen/
+.git/
+.tor_test/
+*.log
+tor_probe_*

@@ -159,24 +159,85 @@ async fn start_network_once(state: &State<'_, AppState>, mnemonic_str: &str, use
         }
     };
 
-    let node = match P2PNode::start(identity, &state.listen_addr).await {
-        Ok(n) => n,
-        Err(e) => {
+    // Each network step below is best-effort — bootstrap_dial/announce_presence already treat
+    // their own errors as non-fatal (warn and continue, account stays locally usable) — but on a
+    // device with no working internet/LAN path at all, the underlying dial or DHT round-trip can
+    // *hang* rather than fail fast (no network error to catch, just nothing ever answering the
+    // oneshot channel these wait on). That turns "best-effort" into "blocks account creation
+    // forever" for exactly the offline case this fallback exists to handle. Bounding each step
+    // the same way the Tor-reapply step below already is keeps the intended behavior (account
+    // creation always succeeds locally; network_active just ends up false) even when there's no
+    // network to fail against quickly.
+    const NETWORK_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let node = match tokio::time::timeout(NETWORK_STEP_TIMEOUT, P2PNode::start(identity, &state.listen_addr)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
             tracing::warn!("P2P network failed to start, account remains usable locally (will retry next launch): {e}");
+            return false;
+        }
+        Err(_) => {
+            tracing::warn!("P2P network did not start within {NETWORK_STEP_TIMEOUT:?}, account remains usable locally (will retry next launch)");
             return false;
         }
     };
 
     if let Some(addr) = state.bootstrap_addr.lock().await.clone() {
-        if let Err(e) = node.bootstrap_dial(addr.clone()).await {
-            tracing::warn!("Bootstrap dial to {addr} failed (will still work over mDNS/LAN): {e}");
+        match tokio::time::timeout(NETWORK_STEP_TIMEOUT, node.bootstrap_dial(addr.clone())).await {
+            Ok(Err(e)) => tracing::warn!("Bootstrap dial to {addr} failed (will still work over mDNS/LAN): {e}"),
+            Err(_) => tracing::warn!("Bootstrap dial to {addr} did not complete within {NETWORK_STEP_TIMEOUT:?} (will still work over mDNS/LAN)"),
+            Ok(Ok(())) => {}
         }
     }
-    if let Err(e) = node.announce_presence().await {
-        tracing::warn!("Initial presence announcement failed (will retry on the usual heartbeat): {e}");
+    match tokio::time::timeout(NETWORK_STEP_TIMEOUT, node.announce_presence()).await {
+        Ok(Err(e)) => tracing::warn!("Initial presence announcement failed (will retry on the usual heartbeat): {e}"),
+        Err(_) => tracing::warn!("Initial presence announcement did not complete within {NETWORK_STEP_TIMEOUT:?} (will retry on the usual heartbeat)"),
+        Ok(Ok(())) => {}
     }
 
     state.engine.attach_network(node).await;
+
+    // The `P2PNode`/`TorManager` just created above always starts from `TorConfig::default()`
+    // (Tor disabled — see `nova_transport::dht_node::P2PNode::start`), with no knowledge of
+    // whatever the user previously saved via `configure_tor`/the Settings screen. Without this,
+    // a user who had explicitly enabled Tor in a past session would find it silently back to
+    // disabled on every relaunch/resume (`get_tor_status` reflects the *live* node once the
+    // network is attached, not the saved settings) — the Tor toggle looked "stuck disabled"
+    // every time the app reconnected. Re-apply the saved settings now so they actually take
+    // effect again immediately after the network comes up.
+    match state.engine.storage.get_tor_settings() {
+        Ok(saved) => {
+            // Bounded defensively: this locks `NovaEngine::network` and `NovaEngine::identity`,
+            // the same two locks `attach_network`'s just-spawned outbox-pump task (re-encrypting/
+            // resending anything left over from a previous session, e.g. a message that never
+            // got delivered before the app was last closed) also needs, in the opposite order.
+            // `try_resume_session`/`create_account`/`restore_account` all block the UI on this
+            // whole function returning — if this ever contends against that background task
+            // instead of racing it harmlessly, the entire app would be stuck on a permanently
+            // blank screen (nothing after this point, including the very first screen render,
+            // ever runs) rather than failing visibly. A real, reproducible instance of exactly
+            // this symptom (blank screen forever after a relaunch with a stuck pending message
+            // in the outbox) is what prompted adding this bound.
+            let tor_reapply = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                state
+                    .engine
+                    .configure_tor(saved.enabled, &saved.mode, &saved.socks_proxy, saved.bridge_type),
+            )
+            .await;
+            match tor_reapply {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("Failed to re-apply saved Tor settings on network start: {e}"),
+                Err(_) => tracing::warn!(
+                    "Re-applying saved Tor settings on network start did not complete within 5s \
+                     (likely lock contention with the outbox pump) — continuing without it; Tor \
+                     settings can still be changed from the Settings screen"
+                ),
+            }
+        }
+        Err(e) => tracing::warn!("Failed to load saved Tor settings on network start: {e}"),
+    }
+
     *started = true;
     true
 }
@@ -244,6 +305,11 @@ fn block_contact(state: State<'_, AppState>, peer_id: String) -> Result<(), Stri
 #[tauri::command]
 fn unblock_contact(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
     state.engine.unblock_contact(&peer_id).map_err(engine_err)
+}
+
+#[tauri::command]
+fn delete_contact(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
+    state.engine.delete_contact(&peer_id).map_err(engine_err)
 }
 
 #[tauri::command]
@@ -456,12 +522,28 @@ pub fn run() {
     tracing_subscriber::fmt::try_init().ok();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .expect("no app data directory available on this platform");
+            // Override lets several independent identities run side by side on the same machine
+            // under the same OS user account (e.g. two dev/test instances on one Windows box to
+            // exercise real LAN discovery end to end) without their local encrypted storage
+            // colliding on the same `app_data_dir()`. Unset in normal use, where the platform
+            // default applies exactly as before.
+            let data_dir = match std::env::var("NOVA_DATA_DIR") {
+                Ok(dir) => PathBuf::from(dir),
+                Err(_) => app
+                    .path()
+                    .app_data_dir()
+                    .expect("no app data directory available on this platform"),
+            };
             std::fs::create_dir_all(&data_dir).expect("failed to create app data directory");
+
+            // Persistent home for the embedded Tor client's consensus cache, guard state, and
+            // onion-service keystore (see `nova_transport::tor`) — a real, durable subdirectory
+            // of this device's own app data, so Tor doesn't have to re-bootstrap from scratch
+            // (a real, user-visible delay) on every app launch. Read directly by `dht_node.rs`
+            // via `NOVA_TOR_STATE_DIR`, the same env-var pattern as `NOVA_BOOTSTRAP_ADDR`.
+            std::env::set_var("NOVA_TOR_STATE_DIR", data_dir.join("tor_state"));
 
             let db_path = data_dir.join("nova.db");
             let passphrase = load_or_create_storage_passphrase(&data_dir.join("storage.key"));
@@ -516,6 +598,7 @@ pub fn run() {
             get_contacts,
             block_contact,
             unblock_contact,
+            delete_contact,
             send_message,
             send_media,
             get_attachment_data,

@@ -59,6 +59,14 @@ pub enum EngineError {
 /// because the recipient was offline or unreachable last attempt).
 const OUTBOX_PUMP_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long to let mDNS/bootstrap discovery populate the local DHT routing table before the very
+/// first `announce_presence()` call — see that method's own doc comment: with an empty routing
+/// table there is no peer to route the `put_record` through yet, so an immediate first attempt on
+/// a cold start would just fail. Also how far into the future to schedule the next periodic
+/// re-announce, forever, both to keep the record fresh and to retry now that new routing-table
+/// peers may have appeared (e.g. a LAN peer that mDNS discovers a few seconds after this one).
+const PRESENCE_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Starting delay before the first retry of a failed outbox item.
 const OUTBOX_RETRY_BASE_SECS: i64 = 1;
 /// Retry delay never grows past this, no matter how many attempts have failed.
@@ -204,6 +212,30 @@ impl NovaEngine {
                 if let Err(e) = engine.pump_outbox_once().await {
                     warn!("Outbox pump failed: {e}");
                 }
+            }
+        });
+
+        // Without this, this device's `PreKeyBundle` + reachable addresses are never published
+        // into the DHT (`P2PNode::announce_presence` was previously only ever called from tests),
+        // so every OTHER peer's `connect_to_peer` lookup for this device's nova_peer_id finds
+        // nothing and every message to it sits in the outbox forever, retried but never
+        // delivered — regardless of whether both sides had already added each other as a contact.
+        // Periodic, not one-shot: a `put_record` can fail the very first time (empty routing
+        // table on a cold start — see `PRESENCE_ANNOUNCE_INTERVAL`'s doc comment) or simply expire
+        // on the DHT, so this keeps retrying/refreshing for the lifetime of the attached network.
+        let announce_node = node.clone();
+        tokio::spawn(async move {
+            // `tokio::time::interval` fires its first tick immediately, not after one full
+            // period — an explicit sleep first is what actually gives mDNS/bootstrap discovery
+            // the head start described above, rather than guaranteeing the first attempt fails.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut interval = tokio::time::interval(PRESENCE_ANNOUNCE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                if let Err(e) = announce_node.announce_presence().await {
+                    debug!("announce_presence failed, will retry: {e}");
+                }
+                interval.tick().await;
             }
         });
     }
@@ -625,9 +657,17 @@ impl NovaEngine {
         };
         self.storage.save_conversation(&conv)?;
 
-        // Automatically dial the friend's rendezvous/relay addresses in the background
+        // Automatically dial the friend's rendezvous/relay addresses in the background — a
+        // best-effort convenience (adding the contact must still succeed even if this device is
+        // currently unreachable to them, e.g. no network at all), but a failure here used to be
+        // discarded with no trace whatsoever, not even a log line — impossible to diagnose why a
+        // freshly-added contact never connects (this address is almost always the peer's own LAN
+        // IP, which is simply unreachable across different Wi-Fi/cellular networks; see the Tor
+        // Hybrid fallback, which is what actually recovers that case now).
         for addr in rendezvous_addrs {
-            let _ = self.bootstrap_dial(&addr).await;
+            if let Err(e) = self.bootstrap_dial(&addr).await {
+                tracing::warn!("Initial rendezvous dial to {addr} failed (will retry via the outbox/Tor fallback when a message is sent): {e}");
+            }
         }
 
         Ok(contact)
@@ -1030,8 +1070,25 @@ impl NovaEngine {
                     ));
                 }
 
+                // If the handshake names a one-time prekey, that exact key MUST still be ours to
+                // consume: `x3dh_respond` below derives the shared secret differently depending on
+                // whether an OTP is used, so silently treating "already consumed" the same as
+                // "sender never used one" would make us derive a *different* secret than the
+                // sender did — not an error, just silently-wrong decryption downstream (every
+                // `ratchet_decrypt` on this session fails its AEAD tag check forever after,
+                // indistinguishable from tampering, and the sender's outbox retries it forever with
+                // no way to ever succeed). This is reachable in completely normal use: an invitation
+                // link/QR is deliberately reusable for its whole 24h TTL (see
+                // `SignedContactInvitation`), so the same one-time prekey it embeds can legitimately
+                // be read and used by two different people who add this device around the same
+                // time — whichever handshake we process first consumes it, and the second must fail
+                // loudly right here instead of limping on with a broken session.
                 let opk_secret = match handshake.used_one_time_prekey_id {
-                    Some(id) => self.storage.consume_one_time_prekey_secret(id)?,
+                    Some(id) => Some(self.storage.consume_one_time_prekey_secret(id)?.ok_or_else(|| {
+                        EngineError::HandshakeFailed(format!(
+                            "one-time prekey {id} was already used by another handshake (this invitation link may have been shared with more than one person) — ask {sender_peer_id} to send a fresh invitation"
+                        ))
+                    })?),
                     None => None,
                 };
 
@@ -1107,7 +1164,20 @@ impl NovaEngine {
         plaintext: &[u8],
     ) -> Result<ReceiveOutcome, EngineError> {
         let payload = MessagePayload::from_bytes(plaintext)?;
-        let conv_id = payload.conversation_id.clone();
+        // Deliberately NOT `payload.conversation_id`: that field is whatever the *sender's* own
+        // device called its side of this conversation (`conv_<this contact's peer_id>`, from the
+        // sender's perspective — see `add_contact`/app.js's identical `'conv_' + peerId`
+        // convention) — which, from THIS device's perspective, is `conv_<my own peer_id>`, not a
+        // conversation with the sender at all. Trusting it verbatim here filed every incoming
+        // "first message from a new contact" under a conversation id neither `add_contact` (run
+        // when this device added that contact) nor the real UI (`state.activeContact.conversationId
+        // = 'conv_' + contact.peerId`) would ever look up — the message was persisted but
+        // invisible in the actual chat screen. Always derive the LOCAL, receiver's-own-convention
+        // id from the sender's peer_id instead, exactly like `add_contact` does when this device
+        // is the one initiating. Caught by the 2026-08-25 three-device mesh test: it showed real
+        // `Delivered` status on the sender's outbox while the recipient's own `get_messages` on
+        // its natural conversation id never found anything.
+        let conv_id = format!("conv_{sender_peer_id}");
 
         // Check if message was already persisted to avoid duplicate notifications / double unread
         // counts — covers both a genuine text-message duplicate and an already-fully-reassembled
@@ -1187,7 +1257,9 @@ impl NovaEngine {
             media_meta: None,
             caption: None,
             content_type: payload.content_type.clone(),
-            conversation_id: payload.conversation_id.clone(),
+            // See the identical fix (and its rationale) in `persist_incoming_message` just above —
+            // `payload.conversation_id` is the sender's own local id, not ours.
+            conversation_id: format!("conv_{sender_peer_id}"),
             recipient_id: payload.recipient_id.clone(),
             timestamp_utc: payload.timestamp_utc,
             chunks: HashMap::new(),
@@ -1454,6 +1526,14 @@ impl NovaEngine {
     /// Checks if a contact is currently blocked.
     pub fn is_contact_blocked(&self, peer_id: &str) -> Result<bool, EngineError> {
         Ok(self.storage.is_contact_blocked(peer_id)?)
+    }
+
+    /// Permanently removes a contact and their entire message history — see
+    /// `StorageEngine::delete_contact` for exactly what gets wiped and why this is a stronger
+    /// operation than `block_contact`.
+    pub fn delete_contact(&self, peer_id: &str) -> Result<(), EngineError> {
+        self.storage.delete_contact(peer_id)?;
+        Ok(())
     }
 
     /// Retrieves all saved contacts.
@@ -1809,11 +1889,17 @@ mod tests {
             .await
             .unwrap();
 
+        // Bob looks this up under HIS OWN conversation-id convention (`conv_<the sender's
+        // peer_id>`, i.e. `conv_<alice_peer_id>`) — deliberately not Alice's `conv_id` above,
+        // which names *her* side of the same conversation (`conv_<bob_peer_id>`). See the fix in
+        // `persist_incoming_message`: the receiver never trusts the sender's embedded id.
+        let bob_conv_id = format!("conv_{alice_peer_id}");
+
         // The outbox pump runs every 500ms; poll for up to a few seconds for the message to
         // actually cross the network and land, decrypted, in Bob's conversation history.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let messages = bob.get_messages(&conv_id).unwrap();
+            let messages = bob.get_messages(&bob_conv_id).unwrap();
             if let Some(msg) = messages.iter().find(|m| !m.is_outgoing) {
                 assert_eq!(msg.text_content, "Salut depuis Ouaga, ceci transite sur le vrai reseau.");
                 assert_eq!(msg.sender_id, alice_peer_id);
@@ -2032,7 +2118,7 @@ mod tests {
     async fn test_send_and_receive_media_message_multi_chunk_reassembly() {
         let alice = NovaEngine::new(":memory:", "alice-pass").unwrap();
         let bob = NovaEngine::new(":memory:", "bob-pass").unwrap();
-        alice.create_account("alice").await.unwrap();
+        let (alice_pub, _) = alice.create_account("alice").await.unwrap();
         let (bob_pub, _) = bob.create_account("bob").await.unwrap();
 
         let bob_bundle = bob.get_own_prekey_bundle_bytes().await.unwrap();
@@ -2083,8 +2169,12 @@ mod tests {
         assert_eq!(final_msg.content_type, nova_protocol::MessageContentType::File);
         assert_eq!(final_msg.text_content, "📄 report.pdf");
 
-        // get_messages must never inline the attachment bytes.
-        let bob_messages = bob.get_messages(&conv_id).unwrap();
+        // get_messages must never inline the attachment bytes. Looked up under Bob's OWN
+        // conversation-id convention (`conv_<the sender's peer_id>` — see the fix in
+        // `persist_incoming_message`/`handle_incoming_media_chunk`), not Alice's `conv_id` above:
+        // those are deliberately different strings, one per side's own local naming.
+        let bob_conv_id = format!("conv_{alice_pub}");
+        let bob_messages = bob.get_messages(&bob_conv_id).unwrap();
         assert_eq!(bob_messages.len(), 1);
         assert_eq!(bob_messages[0].text_content, "📄 report.pdf");
         assert!(bob_messages[0].attachment.is_some());

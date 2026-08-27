@@ -39,6 +39,7 @@ use nova_crypto::DeviceIdentity;
 use nova_protocol::SignedDhtPeerRecord;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -154,8 +155,17 @@ pub struct P2PNode {
     listen_addrs: Vec<Multiaddr>,
     command_tx: mpsc::UnboundedSender<Command>,
     incoming_rx: Mutex<mpsc::UnboundedReceiver<IncomingMessage>>,
+    /// The sending half feeding `incoming_rx` — kept as a field (in addition to being moved into
+    /// `run_swarm_task` and cloned into the onion bridge at construction time) so
+    /// [`Self::ensure_onion_service_started`] can bridge the onion listener's own channel into it
+    /// later too, from [`Self::configure_tor`], not only at `start()` time.
+    incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
     pub supervisor: Arc<TransportSupervisor>,
     pub tor_manager: Arc<tokio::sync::RwLock<crate::tor::TorManager>>,
+    /// Guards [`Self::ensure_onion_service_started`] against launching the onion service twice —
+    /// once true (via `swap`), it stays true for the node's lifetime; the service itself is never
+    /// torn down once started (see that method's doc comment for why).
+    onion_service_started: AtomicBool,
     /// Secondary delivery path for when the DHT + relay-circuit path above cannot reach a peer
     /// at all — see `crate::udp_fallback`'s module docs. `None` unless `NOVA_UDP_FALLBACK_ADDR`
     /// is set: this path depends on a specific well-known `nova-server` instance being
@@ -175,8 +185,8 @@ enum IncomingSource {
     /// Pulled from `nova-server`'s blind relay via [`crate::udp_fallback::UdpFallbackClient::drain_incoming`]
     /// — store-and-forward, not a live round-trip, so there is no sender waiting for an outcome.
     UdpFallback,
-    /// A live connection over `crate::onion_channel`'s Tor SOCKS5 listener: the sender's
-    /// `send_via_onion` call is holding the TCP connection open, waiting on this outcome.
+    /// A live connection over `crate::onion_channel`'s embedded onion service: the sender's
+    /// `send_via_onion` call is holding the Tor stream open, waiting on this outcome.
     OnionDirect(crate::onion_channel::OnionIncoming),
 }
 
@@ -293,11 +303,50 @@ impl P2PNode {
             }
         }
 
+        // On a real "listen on every interface" deployment (0.0.0.0 / ::), libp2p's QUIC
+        // transport emits one NewListenAddr per local network interface — not one for the
+        // wildcard address itself, which isn't dialable by anyone. On a machine with a virtual
+        // adapter (WSL's vEthernet, a VPN, Hyper-V, ...) alongside the real Wi-Fi/Ethernet NIC,
+        // that means several candidate addresses arrive, in OS-dependent order, and some are
+        // useless to advertise to a peer:
+        //   - loopback (127.0.0.0/8, ::1) is never reachable by another device, ever.
+        // The old code kept only the *first* NewListenAddr per stack (`expected_listeners`
+        // capped collection at exactly 1 for IPv4) — on such a machine this could silently pick
+        // the virtual adapter's address (or, for the IPv6 dual-stack leg, loopback itself, since
+        // binding `::` also opens a loopback listener) as the ONLY address ever published in this
+        // device's own invitation/DHT record, while the real, reachable LAN address was dropped
+        // on the floor. A peer dialing that record then reaches nothing (or itself, for ::1) —
+        // this was reproduced directly: a real invitation ticket generated on this kind of
+        // machine advertised `/ip6/::1/udp/.../quic-v1`, a loopback address, as a rendezvous addr.
+        // Fixed by collecting and advertising *every* non-loopback address that shows up within
+        // the window instead of just the first: multi-address dialing is exactly what libp2p is
+        // designed to do (try each candidate, use whichever succeeds), so including a
+        // non-reachable virtual-adapter address alongside the real one is harmless — the peer's
+        // dial to it simply fails while the real one succeeds — whereas dropping the real address
+        // and keeping only a bogus one is fatal to connectivity.
+        //
+        // `requests_dual_stack` doubles as "this is a real wildcard deployment listen, not the
+        // test suite's explicit loopback address" — tests bind directly to 127.0.0.1 to talk to
+        // themselves on purpose, and must keep working exactly as before.
+        let is_wildcard_deployment = requests_dual_stack;
+        fn is_loopback(addr: &Multiaddr) -> bool {
+            addr.iter().any(|p| match p {
+                Protocol::Ip4(ip) => ip.is_loopback(),
+                Protocol::Ip6(ip) => ip.is_loopback(),
+                _ => false,
+            })
+        }
+
         // Block briefly with timeout until the transport resolves concrete listen address(es).
         let first_addr = match tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match swarm.select_next_some().await {
-                    SwarmEvent::NewListenAddr { address, .. } => return Ok(address),
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        if is_wildcard_deployment && is_loopback(&address) {
+                            continue;
+                        }
+                        return Ok(address);
+                    }
                     SwarmEvent::ListenerClosed { .. } | SwarmEvent::ListenerError { .. } => {
                         return Err(TransportError::Setup("listener failed to bind".into()));
                     }
@@ -312,13 +361,23 @@ impl P2PNode {
 
         let mut resolved_listen_addrs: Vec<Multiaddr> = vec![first_addr];
         let collect_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while resolved_listen_addrs.len() < expected_listeners {
+        loop {
+            if !is_wildcard_deployment && resolved_listen_addrs.len() >= expected_listeners {
+                break;
+            }
             let remaining = collect_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match tokio::time::timeout(remaining, swarm.select_next_some()).await {
-                Ok(SwarmEvent::NewListenAddr { address, .. }) => resolved_listen_addrs.push(address),
+                Ok(SwarmEvent::NewListenAddr { address, .. }) => {
+                    if is_wildcard_deployment && is_loopback(&address) {
+                        continue;
+                    }
+                    if !resolved_listen_addrs.contains(&address) {
+                        resolved_listen_addrs.push(address);
+                    }
+                }
                 Ok(SwarmEvent::ListenerClosed { .. } | SwarmEvent::ListenerError { .. }) => {
                     expected_listeners = expected_listeners.saturating_sub(1);
                 }
@@ -350,19 +409,37 @@ impl P2PNode {
         let own_onion_addr = nova_crypto::derive_onion_v3_address(&identity.verifying_key_bytes);
         let mut initial_tor_config = crate::tor::TorConfig::default();
         initial_tor_config.onion_address = Some(own_onion_addr);
-        let tor_manager = Arc::new(tokio::sync::RwLock::new(crate::tor::TorManager::new(initial_tor_config)));
+        // Where the embedded Tor client keeps its consensus cache, guard state, and onion-service
+        // keystore — a real, persistent directory is expected (set via `NOVA_TOR_STATE_DIR`, the
+        // same pattern as `NOVA_BOOTSTRAP_ADDR`/`NOVA_LISTEN_ADDR`/`NOVA_ONION_LISTEN_ADDR`), since
+        // rebuilding it from scratch means a fresh, slow Tor bootstrap on every launch. Falls back
+        // to a fixed subdirectory of the OS temp dir (fine for tests and ad-hoc runs, but not
+        // meant for a real install — `ui/src-tauri` sets this to a real app-data subdirectory).
+        let tor_state_dir = std::env::var("NOVA_TOR_STATE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("nova_tor_state"));
+        let tor_manager = Arc::new(tokio::sync::RwLock::new(crate::tor::TorManager::new(
+            initial_tor_config.clone(),
+            identity.signing_key_bytes,
+            tor_state_dir,
+        )));
 
         // Opt-in secondary delivery path (see `crate::udp_fallback`) for networks where this
         // node cannot reach the DHT/relay-circuit path at all yet — set by whoever operates a
         // `nova-server` instance this deployment should fall back to, the same way
-        // `NOVA_BOOTSTRAP_ADDR` names a DHT bootstrap peer.
+        // `NOVA_BOOTSTRAP_ADDR` names a DHT bootstrap peer. Must be a full `ws://`/`wss://` URL
+        // (e.g. `wss://nova-discovery.onrender.com`) now that the fallback server speaks
+        // WebSocket rather than raw UDP — see `udp_fallback.rs`'s module doc comment for why.
         let udp_fallback = std::env::var("NOVA_UDP_FALLBACK_ADDR")
             .ok()
-            .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
-            .map(|addr| Arc::new(UdpFallbackClient::new(addr)));
+            .and_then(|s| {
+                let parsed = url::Url::parse(&s).ok()?;
+                (parsed.scheme() == "ws" || parsed.scheme() == "wss").then_some(s)
+            })
+            .map(|url| Arc::new(UdpFallbackClient::new(url)));
         if udp_fallback.is_none() {
             if let Ok(raw) = std::env::var("NOVA_UDP_FALLBACK_ADDR") {
-                warn!("NOVA_UDP_FALLBACK_ADDR={raw} is not a valid socket address (expected e.g. 203.0.113.9:8080) — fallback relay disabled");
+                warn!("NOVA_UDP_FALLBACK_ADDR={raw} is not a valid ws:// or wss:// URL (expected e.g. wss://nova-discovery.onrender.com) — fallback relay disabled");
             }
         }
 
@@ -372,55 +449,24 @@ impl P2PNode {
             listen_addrs: resolved_listen_addrs,
             command_tx,
             incoming_rx: Mutex::new(incoming_rx),
+            incoming_tx: incoming_tx.clone(),
             supervisor,
             tor_manager: tor_manager.clone(),
+            onion_service_started: AtomicBool::new(false),
             udp_fallback: udp_fallback.clone(),
         });
 
-        // Onion-channel listener (see `crate::onion_channel`) — the receiving half of the Tor
-        // fallback path. Defaults to loopback-only: this listener applies no authentication of
-        // its own (see the module docs on why), so it must only ever be reachable via a local
-        // Tor process's hidden-service forwarding, never exposed directly to a public interface
-        // by default. Best-effort: a bind failure here (e.g. the port is already in use) does
-        // not prevent the node from starting — it only means this device won't be reachable via
-        // Tor until that's fixed, exactly like a QUIC listen failure elsewhere in this function
-        // would be a harder, non-recoverable error but a missing *optional* path is not.
-        // Defaults to an OS-assigned loopback port, NOT `DEFAULT_ONION_CHANNEL_PORT`: binding a
-        // fixed port automatically on every launch would collide with any other local instance
-        // (including, very concretely, this crate's own test suite starting several nodes in the
-        // same process) and presumptuously claim a system port nobody asked for. An operator who
-        // wants real onion reachability sets `NOVA_ONION_LISTEN_ADDR` explicitly (conventionally
-        // to `127.0.0.1:<DEFAULT_ONION_CHANNEL_PORT>`, matching what contacts dial by default) and
-        // points their Tor hidden-service forwarding at the same port.
-        let onion_listen_addr = std::env::var("NOVA_ONION_LISTEN_ADDR")
-            .ok()
-            .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
-            .unwrap_or_else(|| "127.0.0.1:0".parse().expect("hardcoded loopback address is always valid"));
-        let (onion_incoming_tx, mut onion_incoming_rx) = mpsc::unbounded_channel::<crate::onion_channel::OnionIncoming>();
-        tokio::spawn(async move {
-            match crate::onion_channel::bind(onion_listen_addr).await {
-                Ok(listener) => {
-                    let bound = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
-                    info!("Onion-channel listener bound at {bound} (forward a Tor hidden service here to be reachable via .onion)");
-                    crate::onion_channel::serve_forever(listener, onion_incoming_tx).await;
-                }
-                Err(e) => warn!("Onion-channel listener failed to bind {onion_listen_addr}: {e} — this device will not be reachable via Tor"),
-            }
-        });
-        // Bridges the onion listener's own channel into the unified `incoming_tx` stream
-        // `nova-engine::attach_network` reads from, so it has exactly one receive loop to run
-        // regardless of which of the three paths (libp2p, UDP fallback, onion) a packet arrived
-        // on — see `IncomingSource::OnionDirect`.
-        let incoming_tx_for_onion_bridge = incoming_tx.clone();
-        tokio::spawn(async move {
-            while let Some(onion_incoming) = onion_incoming_rx.recv().await {
-                let bytes = onion_incoming.bytes.clone();
-                let msg = IncomingMessage { bytes, source: IncomingSource::OnionDirect(onion_incoming) };
-                if incoming_tx_for_onion_bridge.send(msg).is_err() {
-                    break;
-                }
-            }
-        });
+        // Onion service (see `crate::onion_channel`) — the receiving half of the Tor fallback
+        // path, hosted in-process under this device's real identity key (see `crate::tor`'s doc
+        // comment) so its `.onion` address matches `own_onion_addr` above exactly. Only launched
+        // when Tor is enabled in the device's saved settings: bootstrapping a real Tor circuit
+        // and publishing a hidden-service descriptor has real bandwidth/CPU/battery cost, which a
+        // user who never opted into Tor shouldn't pay on every launch. `configure_tor` calls
+        // `ensure_onion_service_started` too, so enabling Tor later (without restarting) also
+        // starts receiving over it, not just sending.
+        if initial_tor_config.enabled {
+            node.ensure_onion_service_started();
+        }
 
         // `identity` moves into the background task by value rather than being cloned: it holds
         // zeroized private key material and deliberately does not implement `Clone`. Only the
@@ -445,12 +491,12 @@ impl P2PNode {
     /// Returns the live status of the Tor subsystem.
     pub async fn get_tor_status(&self) -> crate::tor::TorStatus {
         let mgr = self.tor_manager.read().await;
-        let is_live = mgr.check_proxy_liveness().await;
+        let (connected, bootstrap_percent) = mgr.bootstrap_status().await;
         let cfg = mgr.config();
         crate::tor::TorStatus {
             enabled: cfg.enabled,
-            connected: is_live,
-            bootstrap_percent: if is_live { 100 } else { 0 },
+            connected,
+            bootstrap_percent,
             onion_address: cfg.onion_address.clone().unwrap_or_default(),
             socks_proxy: cfg.socks_proxy.clone(),
             mode: cfg.mode,
@@ -458,10 +504,55 @@ impl P2PNode {
         }
     }
 
-    /// Reconfigures Tor operating mode, SOCKS proxy endpoint, and bridges.
+    /// Reconfigures Tor operating mode, SOCKS proxy endpoint, and bridges. If this turns Tor on
+    /// for the first time (it was off, or never started, when this node was constructed), also
+    /// starts the onion-service receiving side right now — see
+    /// [`Self::ensure_onion_service_started`] — so enabling Tor from Settings makes this device
+    /// reachable via `.onion` immediately, with no app restart required.
     pub async fn configure_tor(&self, config: crate::tor::TorConfig) {
-        let mut mgr = self.tor_manager.write().await;
-        mgr.update_config(config);
+        let enabled = config.enabled;
+        {
+            let mut mgr = self.tor_manager.write().await;
+            mgr.update_config(config);
+        }
+        if enabled {
+            self.ensure_onion_service_started();
+        }
+    }
+
+    /// Launches the onion-service receiving side (see
+    /// [`crate::onion_channel::spawn_onion_service`]) exactly once for this node's lifetime — a
+    /// second or later call is a cheap no-op, guarded by `onion_service_started`. Once started,
+    /// the service is never torn down again even if Tor is later disabled in settings: turning it
+    /// off only stops new *outbound* dials from using Tor (`connect_onion_stream` isn't called);
+    /// leaving an already-launched onion service listening costs nothing extra worth the
+    /// complexity of tearing down and re-launching it, and a peer with this device's onion
+    /// address on file should still be able to reach it — being *listed* under `TorStrict`/
+    /// `Hybrid` mode is a sending-side policy, not a promise that this device stops receiving.
+    ///
+    /// Called both from `start()` (if Tor was already enabled when the node was constructed) and
+    /// from `configure_tor()` (if the user enables Tor afterward, without restarting) — the two
+    /// only ways `enabled` can ever become true.
+    fn ensure_onion_service_started(&self) {
+        if self.onion_service_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (onion_incoming_tx, mut onion_incoming_rx) = mpsc::unbounded_channel::<crate::onion_channel::OnionIncoming>();
+        crate::onion_channel::spawn_onion_service(self.tor_manager.clone(), onion_incoming_tx);
+        // Bridges the onion listener's own channel into the unified `incoming_tx` stream
+        // `nova-engine::attach_network` reads from, so it has exactly one receive loop to run
+        // regardless of which of the three paths (libp2p, UDP fallback, onion) a packet arrived
+        // on — see `IncomingSource::OnionDirect`.
+        let incoming_tx_for_onion_bridge = self.incoming_tx.clone();
+        tokio::spawn(async move {
+            while let Some(onion_incoming) = onion_incoming_rx.recv().await {
+                let bytes = onion_incoming.bytes.clone();
+                let msg = IncomingMessage { bytes, source: IncomingSource::OnionDirect(onion_incoming) };
+                if incoming_tx_for_onion_bridge.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     /// This node's primary actual (OS-resolved) listen multiaddr, e.g. for out-of-band bootstrap
@@ -753,12 +844,12 @@ impl P2PNode {
         Ok((mode, last_outcome))
     }
 
-    /// Sends `bytes` to a peer via their `.onion` address directly through the Tor SOCKS5 proxy
+    /// Sends `bytes` to a peer via their `.onion` address through a real, in-process Tor circuit
     /// (see `crate::onion_channel`), bypassing the DHT/QUIC path entirely. The caller (`nova-
     /// engine`, which knows a contact's onion address from their `PreKeyBundle`) decides when to
     /// use this — as a fallback once `send_to_peer` reports `Disconnected`, or exclusively in
-    /// `TorStrict` mode. `port` should be the recipient's onion-listener port, conventionally the
-    /// same value as their `NOVA_ONION_LISTEN_ADDR`.
+    /// `TorStrict` mode. `port` should be the recipient's onion-service port, conventionally
+    /// `crate::onion_channel::DEFAULT_ONION_CHANNEL_PORT`.
     pub async fn send_via_onion(
         &self,
         onion_address: &str,
@@ -1326,9 +1417,17 @@ mod tests {
         bob.announce_presence().await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
+        // `enabled: false` is deliberate, not an oversight: `validate_outbound_dial` — the thing
+        // this test actually exercises, at the real `swarm.dial` call site — is driven purely by
+        // `mode`, never by `enabled` (see `TorManager::validate_outbound_dial`). `enabled: true`
+        // would additionally make `configure_tor` launch a real, in-process onion service (see
+        // `P2PNode::ensure_onion_service_started`), which tries to bootstrap a genuine Tor
+        // circuit over the real network — pointless network I/O this test doesn't need, and, on a
+        // host with no route to the Tor network (e.g. a sandboxed CI runner), a real multi-minute
+        // delay this test shouldn't be paying for just to prove a direct dial gets refused.
         alice
             .configure_tor(crate::tor::TorConfig {
-                enabled: true,
+                enabled: false,
                 mode: crate::tor::TorMode::TorStrict,
                 socks_proxy: "127.0.0.1:9050".to_string(),
                 onion_address: None,

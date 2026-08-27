@@ -1,8 +1,19 @@
-//! UDP-based discovery/signaling/relay fallback — a thin client for `nova-server`, the
-//! presence-registry-and-blind-relay UDP protocol that predates the Kademlia DHT migration (see
+//! Discovery/signaling/relay fallback — a thin client for `nova-server`, the
+//! presence-registry-and-blind-relay protocol that predates the Kademlia DHT migration (see
 //! `dht_node`'s module docs). Re-wired here as a genuine production backup path rather than left
 //! orphaned: when `nova-server` was found to have no remaining callers anywhere in the codebase
 //! (2026-08-22 audit), the fix chosen was to reconnect it as a fallback, not delete it.
+//!
+//! ## Why WebSocket, not raw UDP (module name kept for continuity)
+//!
+//! This module (and the `NOVA_UDP_FALLBACK_ADDR` env var, and the `UdpFallbackClient` name) date
+//! from when `nova-server` spoke raw UDP directly. It was rewritten to run over WebSocket
+//! (`nova-server`'s `service.rs`) so it can be deployed on ordinary HTTP-only PaaS hosts (Render,
+//! and effectively every other such host) that expose no raw UDP ingress at all — the whole point
+//! of this path is to be the one well-known, centrally-reachable fallback that works even when a
+//! device's network filters everything else, so it needs to be dead simple to keep running
+//! somewhere. The names were left as-is rather than renamed throughout `dht_node.rs` purely to
+//! keep this change mechanical; nothing about the actual wire behavior below is UDP anymore.
 //!
 //! ## Why keep a second path at all
 //!
@@ -10,13 +21,15 @@
 //! overwhelming majority of networks. But it depends on reaching at least one other peer first
 //! (mDNS on the LAN, or a known bootstrap/relay node) to even begin Kademlia routing-table
 //! discovery. A device that cannot reach ANY libp2p peer at all yet (a fresh install whose only
-//! configured bootstrap address happens to be unreachable right now, or a network where UDP/QUIC
-//! is filtered but plain UDP datagrams to a specific known port are not) has no path forward on
-//! the DHT alone. `nova-server`'s single well-known UDP endpoint is a second, independent way to
-//! both announce reachability and hand off opaque ciphertext — exactly the centrally-reachable
-//! fallback a "small list of well-known bootstrap peers" already assumes exists for first
-//! contact, just over a different, simpler protocol that degrades better under UDP-only
-//! filtering.
+//! configured bootstrap address happens to be unreachable right now, or a network where QUIC/UDP
+//! is filtered outright but ordinary outbound HTTPS/WebSocket traffic is not) has no path forward
+//! on the DHT alone. `nova-server`'s single well-known WebSocket endpoint is a second, independent
+//! way to both announce reachability and hand off opaque ciphertext — exactly the
+//! centrally-reachable fallback a "small list of well-known bootstrap peers" already assumes
+//! exists for first contact, just over a different, simpler protocol that degrades better under
+//! aggressive UDP filtering (the same class of restrictive network that also broke embedded Tor
+//! bootstrap for this project — see `tor.rs` — since outbound WebSocket-over-443 traffic is
+//! indistinguishable at the network level from any other HTTPS request).
 //!
 //! ## What this path can and cannot promise
 //!
@@ -30,61 +43,87 @@
 //! of, the primary path.
 
 use crate::error::TransportError;
+use futures_util::{SinkExt, StreamExt};
 use nova_crypto::DeviceIdentity;
 use nova_protocol::{PeerEndpoint, ServerRequest, ServerResponse, SignedDrainRequest, SignedPresenceRegistration};
-use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
+use tokio_tungstenite::tungstenite::Message;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 /// Matches `nova_server::service::MAX_DATAGRAM_SIZE` — the signaling endpoint is control-plane
 /// traffic, not bulk transfer, so a reply never needs to be larger than this.
 const MAX_RESPONSE_SIZE: usize = 16 * 1024;
-/// Also matches `nova_server::service::MAX_DATAGRAM_SIZE`: the server reads each incoming
-/// datagram into a fixed `MAX_DATAGRAM_SIZE` buffer, so anything larger than this arrives
-/// truncated (UDP recv semantics silently discard the excess) rather than rejected with a clear
-/// error, and a raw `send_to` above roughly the UDP/IP payload ceiling fails at the OS socket
-/// layer before a single byte leaves this machine either way. `relay_forward` checks this
-/// up front so an oversized `RelayForward { payload, .. }` — e.g. one of `nova-engine`'s
+/// Also matches `nova_server::service::MAX_DATAGRAM_SIZE`: `relay_forward` checks this up front
+/// so an oversized `RelayForward { payload, .. }` — e.g. one of `nova-engine`'s
 /// `MEDIA_CHUNK_SIZE` chunks, sized for the primary DHT/QUIC transport's ~1 MiB request ceiling,
-/// not this control-plane one — fails cleanly and immediately instead of being silently dropped
-/// mid-flight by the OS or the server's recv buffer.
+/// not this control-plane one — fails cleanly and immediately instead of being rejected by the
+/// server mid-flight.
 const MAX_RELAY_PAYLOAD_SIZE: usize = 15 * 1024;
 
-/// Client for the UDP discovery/signaling/blind-relay fallback server (`nova-server`).
+/// Client for the discovery/signaling/blind-relay fallback server (`nova-server`), spoken over a
+/// WebSocket connection — see this module's doc comment for why.
 #[derive(Clone, Debug)]
 pub struct UdpFallbackClient {
-    server_addr: SocketAddr,
+    /// A full `ws://` or `wss://` URL, e.g. `wss://nova-discovery.onrender.com`. Kept as the
+    /// original string (not a parsed `Url`) since `tokio_tungstenite::connect_async` accepts one
+    /// directly and this client never needs to inspect its components.
+    server_url: String,
 }
 
 impl UdpFallbackClient {
-    pub fn new(server_addr: SocketAddr) -> Self {
-        Self { server_addr }
+    /// `server_url` must include an explicit `ws://` or `wss://` scheme (e.g.
+    /// `wss://nova-discovery.onrender.com` for a real deployment, or `ws://127.0.0.1:8080` for a
+    /// local/LAN one) — there is no implicit default, since guessing wrong between plaintext and
+    /// TLS silently either leaks this signaling traffic or fails to connect at all.
+    pub fn new(server_url: impl Into<String>) -> Self {
+        Self { server_url: server_url.into() }
     }
 
-    pub fn server_addr(&self) -> SocketAddr {
-        self.server_addr
+    pub fn server_url(&self) -> &str {
+        &self.server_url
     }
 
+    /// Opens a fresh WebSocket connection for exactly one request/response pair, then closes it —
+    /// mirrors the previous UDP client's "fresh ephemeral socket per call" design, which kept
+    /// this trivially safe to share across concurrent callers (announce heartbeat, outbox
+    /// fallback sends, the drain poll) without needing connection pooling or a demultiplexing
+    /// layer for replies. This is a deliberately simple/low-frequency fallback path, not the hot
+    /// path, so a full connection handshake per call is an acceptable cost for that simplicity.
     async fn roundtrip(&self, request: &ServerRequest) -> Result<ServerResponse, TransportError> {
-        // A fresh ephemeral socket per request keeps this client trivially safe to share across
-        // concurrent callers (announce heartbeat, outbox fallback sends, the drain poll) without
-        // needing a mutex around a single shared socket or a demultiplexing layer for replies.
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let bytes = request.to_bytes()?;
-        socket.send_to(&bytes, self.server_addr).await?;
-
-        let mut buf = vec![0u8; MAX_RESPONSE_SIZE];
-        let (len, _src) = tokio::time::timeout(REQUEST_TIMEOUT, socket.recv_from(&mut buf))
+        let (mut ws, _response) = tokio::time::timeout(REQUEST_TIMEOUT, tokio_tungstenite::connect_async(&self.server_url))
             .await
-            .map_err(|_| TransportError::Timeout)??;
+            .map_err(|_| TransportError::Timeout)?
+            .map_err(|e| TransportError::Setup(format!("failed to connect to fallback server at {}: {e}", self.server_url)))?;
 
-        Ok(ServerResponse::from_bytes(&buf[..len])?)
+        let bytes = request.to_bytes()?;
+        tokio::time::timeout(REQUEST_TIMEOUT, ws.send(Message::Binary(bytes)))
+            .await
+            .map_err(|_| TransportError::Timeout)?
+            .map_err(|e| TransportError::Send(e.to_string()))?;
+
+        let msg = tokio::time::timeout(REQUEST_TIMEOUT, ws.next())
+            .await
+            .map_err(|_| TransportError::Timeout)?
+            .ok_or_else(|| TransportError::Setup("fallback server closed the connection without a response".to_string()))?
+            .map_err(|e| TransportError::Setup(format!("WebSocket error: {e}")))?;
+
+        // Best-effort graceful close — the response has already been read either way, so a
+        // failure here (e.g. the server already dropped the connection) is not itself an error.
+        let _ = ws.close(None).await;
+
+        match msg {
+            Message::Binary(bytes) if bytes.len() <= MAX_RESPONSE_SIZE => Ok(ServerResponse::from_bytes(&bytes)?),
+            Message::Binary(bytes) => Err(TransportError::Setup(format!(
+                "fallback server response of {} bytes exceeds the {MAX_RESPONSE_SIZE}-byte limit",
+                bytes.len()
+            ))),
+            other => Err(TransportError::Setup(format!("unexpected WebSocket message from fallback server: {other:?}"))),
+        }
     }
 
     /// Announces (or refreshes) this device's reachability with the fallback server. `endpoint`
     /// should be this node's best-known direct address (its own claim); the server overwrites
-    /// the public IP with whatever it actually observed the datagram arrive from (see
+    /// the public IP with whatever it actually observed the connection arrive from (see
     /// `nova_server::registry::PresenceRegistry::register`), so a stale or lying `public_ip`
     /// here can never misdirect anyone — the signature only proves identity, not the address.
     pub async fn register_presence(&self, identity: &DeviceIdentity, endpoint: PeerEndpoint) -> Result<(), TransportError> {
@@ -123,7 +162,7 @@ impl UdpFallbackClient {
     pub async fn relay_forward(&self, target_peer_id: &str, payload: Vec<u8>) -> Result<(), TransportError> {
         if payload.len() > MAX_RELAY_PAYLOAD_SIZE {
             return Err(TransportError::Send(format!(
-                "payload of {} bytes exceeds the fallback relay's {MAX_RELAY_PAYLOAD_SIZE}-byte datagram ceiling",
+                "payload of {} bytes exceeds the fallback relay's {MAX_RELAY_PAYLOAD_SIZE}-byte ceiling",
                 payload.len()
             )));
         }
@@ -173,13 +212,15 @@ mod tests {
     }
 
     /// Starts a real `nova-server` bound to an OS-assigned port and returns a client pointed at
-    /// it — every test in this module runs against the genuine server implementation, not a
-    /// mock of the wire protocol.
+    /// it over `ws://` — every test in this module runs against the genuine server
+    /// implementation, not a mock of the wire protocol.
     async fn start_test_server() -> UdpFallbackClient {
-        let (socket, registry, relay) = nova_server::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        tokio::spawn(nova_server::serve_forever(socket, registry, relay));
-        UdpFallbackClient::new(addr)
+        let (listener, registry, relay) = nova_server::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(nova_server::serve_forever(listener, registry, relay));
+        // Give the server a moment to start accepting connections before the first request.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        UdpFallbackClient::new(format!("ws://{addr}/"))
     }
 
     #[tokio::test]

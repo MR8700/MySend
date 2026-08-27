@@ -3,6 +3,13 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Voice notes: WebView getUserMedia({audio:true}) needs this Android-level grant too. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- QR camera scanner: WebView getUserMedia({video:true}) needs this Android-level grant too
+         — without it, the WebView's permission bridge denies the request outright before Android
+         ever shows the "Allow NOVA Chat to use the camera?" runtime prompt, which is exactly what
+         made the scanner fail with a permission error the app never visibly asked for. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <!-- Location sharing: WebView navigator.geolocation needs at least one of these. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
@@ -10,6 +17,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Same-Wi-Fi peer discovery (mDNS, see nova-transport's dht_node.rs) is entirely multicast
+         — Android drops incoming multicast packets by default to save power, so this is required
+         for MainActivity's MulticastLock to actually let mDNS replies through. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- AndroidTV support -->
@@ -33,6 +44,15 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Keeps the Rust P2P engine (mDNS/DHT listener, outbox retry pump) alive while the app
+             is backgrounded — see P2pForegroundService's doc comment. android:foregroundServiceType
+             must match the FOREGROUND_SERVICE_DATA_SYNC permission declared above and the type
+             passed to startForeground() in the service itself. -->
+        <service
+          android:name=".P2pForegroundService"
+          android:exported="false"
+          android:foregroundServiceType="dataSync" />
 
         <provider
           android:name="androidx.core.content.FileProvider"

@@ -22,16 +22,22 @@ pub enum DhtRecordError {
 /// `SignedPresenceRegistration` closed. This is the same fix, expressed for DHT storage instead
 /// of a single trusted registry: the DHT nodes storing this record do not need to be trusted,
 /// because the record authenticates itself.
+/// `#[serde(with = "serde_bytes")]` on the two `Vec<u8>` fields below is load-bearing, not
+/// cosmetic: without it, plain `serde::Serialize` encodes a `Vec<u8>` as a CBOR array of one
+/// integer item per byte instead of a compact CBOR byte string — see the identical footgun
+/// documented on `MessagePayload::chunk_bytes` in packet.rs and on `SignedContactInvitation`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignedDhtPeerRecord {
     /// Hex-encoded Ed25519 identity public key — also the record's DHT key.
     pub nova_peer_id: String,
     /// The libp2p `PeerId` bytes this nova identity is currently reachable at.
+    #[serde(with = "serde_bytes")]
     pub libp2p_peer_id_bytes: Vec<u8>,
     /// Multiaddrs the libp2p node believes it is reachable at (from listen addresses and/or
     /// addresses observed and confirmed by other peers via the `identify` protocol).
     pub addresses: Vec<String>,
     pub timestamp_utc: u64,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 

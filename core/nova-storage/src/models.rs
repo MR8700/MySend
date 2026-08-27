@@ -121,9 +121,18 @@ pub struct TorSettingsRecord {
 
 impl Default for TorSettingsRecord {
     fn default() -> Self {
+        // Enabled by default in Hybrid mode: this is a serverless P2P app with no rendezvous
+        // relay of its own, so two devices with no manually-configured bootstrap address (the
+        // common case — nothing pre-fills it on a launcher-started app, notably Android) can only
+        // ever reach each other directly when they happen to share the same LAN. Hybrid still
+        // prefers a direct connection whenever one exists (same LAN/bootstrap) and only falls back
+        // to the embedded Tor onion path (see `NovaEngine::try_onion_fallback_for_item`) for a
+        // peer that direct dialing can't reach — e.g. two phones on different Wi-Fi/cellular
+        // networks — rather than forcing every connection through Tor (that's `tor_strict`, still
+        // opt-in). The user can still turn Tor off entirely from Settings.
         Self {
-            enabled: false,
-            mode: "direct_only".to_string(),
+            enabled: true,
+            mode: "hybrid".to_string(),
             socks_proxy: "127.0.0.1:9050".to_string(),
             bridge_type: None,
         }

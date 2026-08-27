@@ -25,6 +25,7 @@ x25519-dalek = { version = "2.0", features = ["static_secrets", "serde", "zeroiz
 chacha20poly1305 = { version = "0.10", features = ["alloc"] }
 hkdf = "0.12"
 sha2 = "0.10"
+sha3 = "0.10"
 blake3 = "1.5"
 bip39 = { version = "2.1", features = ["rand"] }
 rand = "0.8"
@@ -43,11 +44,11 @@ serde_bytes = "0.11"
 
 # Async & Networking
 tokio = { version = "1.38", features = ["full"] }
-quinn = "0.11"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rcgen = "0.13"
 futures-util = "0.3"
-bytes = "1.6"
+# rustls (not native-tls/OpenSSL) so `wss://` client connections cross-compile cleanly for
+# Android alongside the rest of this workspace's already-rustls-based TLS usage (arti-client,
+# libp2p-quic), with no system OpenSSL dev headers needed on any target.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 libp2p = { version = "0.54", features = [
     "tokio",
     "quic",
@@ -70,11 +71,10 @@ libp2p = { version = "0.54", features = [
 igd-next = { version = "0.17", features = ["aio_tokio"] }
 
 # Storage
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.36", features = ["bundled"] }
 
 # Error Handling & Utilities
 thiserror = "1.0"
-anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }

@@ -30,9 +30,21 @@ pub struct ContactInvitationPayload {
 }
 
 /// A cryptographically signed contact invitation ticket with an unforgeable expiry deadline.
+///
+/// `#[serde(with = "serde_bytes")]` on both fields below is load-bearing, not cosmetic: without
+/// it, plain `serde::Serialize` for `Vec<u8>` encodes it as a CBOR array of one integer item per
+/// byte (no built-in specialization for `T = u8`) instead of a compact CBOR byte string — see the
+/// identical footgun documented on `MessagePayload::chunk_bytes` in nova-protocol/src/packet.rs.
+/// `payload_cbor` is a doubly costly instance of this: it already holds an inner CBOR encoding
+/// (itself inflated ~2x by `SignedPreKeyPublic::signature`'s own missing annotation — now fixed
+/// in nova-crypto), so re-encoding *that* as an array-of-ints multiplies the bloat again, several
+/// times over — which previously blew the resulting `nova://invite?d=...` URI straight through
+/// the QR code format's max capacity ("The amount of data is too big to be stored in a QR Code").
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignedContactInvitation {
+    #[serde(with = "serde_bytes")]
     pub payload_cbor: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -223,6 +235,58 @@ mod tests {
         };
         let verified_parsed = ticket.verify(now).unwrap();
         assert_eq!(verified_parsed, verified);
+    }
+
+    /// Regression test for the missing `#[serde(with = "serde_bytes")]` bug: without it, every
+    /// `Vec<u8>` in `PreKeyBundle`/`SignedContactInvitation` was CBOR-encoded as an array of one
+    /// integer per byte instead of a compact byte string, and — because `payload_cbor` is itself
+    /// already-encoded CBOR bytes re-embedded as a `Vec<u8>` field — that inflation compounded on
+    /// re-encoding, several times over. In production this pushed the invitation URI's length
+    /// past a QR code's absolute max capacity, so the Identity screen's QR code silently failed
+    /// to render ("The amount of data is too big to be stored in a QR Code").
+    ///
+    /// Builds the same realistic, worst-case bundle `get_own_prekey_bundle`
+    /// (nova-storage/src/db.rs) actually produces — unlike `test_identity_and_bundle` above, this
+    /// fills in `one_time_prekey` and `onion_address`, which every real invitation has — plus a
+    /// dual-stack (IPv4 + IPv6) rendezvous address list with the trailing `/p2p/<peer-id>` suffix
+    /// `own_full_listen_addrs` actually appends, then asserts the resulting URI stays well under
+    /// a QR code's max byte-mode capacity (2331 bytes at error-correction level 'M', version 40 —
+    /// see vendor/qrcode.js's `Version.getBestVersionForData`), with generous headroom for the
+    /// `errorCorrectionLevel: 'M'` the UI actually requests.
+    #[test]
+    fn test_realistic_invitation_uri_fits_in_a_qr_code() {
+        let mnemonic = MnemonicPhrase::generate().unwrap();
+        let identity = DeviceIdentity::from_mnemonic(&mnemonic, "alice").unwrap();
+        let (_spk_sec, spk_pub) = generate_signed_prekey(&identity, 1);
+        let (_opk_sec, opk_pub) = nova_crypto::generate_one_time_prekey(2);
+        let onion = nova_crypto::derive_onion_v3_address(&identity.verifying_key_bytes);
+        let bundle = PreKeyBundle {
+            identity_ed25519_pub: identity.verifying_key_bytes,
+            identity_x25519_pub: identity.dh_public_bytes,
+            signed_prekey: spk_pub,
+            one_time_prekey: Some(opk_pub),
+            onion_address: Some(onion),
+        };
+        let libp2p_peer_id = "12D3KooWGjMGZjJZgQjJZgQjJZgQjJZgQjJZgQjJZgQjJZgQjJZg"; // realistic length
+        let addrs = vec![
+            format!("/ip4/203.0.113.42/udp/4001/quic-v1/p2p/{libp2p_peer_id}"),
+            format!("/ip6/2001:db8::1/udp/4001/quic-v1/p2p/{libp2p_peer_id}"),
+        ];
+
+        let invitation = SignedContactInvitation::create(&identity, bundle, 86400, addrs).unwrap();
+        let uri = invitation.to_uri().unwrap();
+
+        // 2200 leaves ~130 bytes of headroom below the hard 2331-byte cap (room for e.g. a
+        // slightly longer onion/multiaddr) while still catching a regression of the
+        // serde_bytes bug: without it, this same realistic bundle measured ~4x larger, several
+        // thousand bytes over the cap.
+        assert!(
+            uri.len() < 2200,
+            "invitation URI is {} bytes — too close to (or over) a QR code's ~2331-byte max \
+             capacity at error-correction level 'M'; check for a missing #[serde(with = \"serde_bytes\")] \
+             on a Vec<u8> field somewhere in PreKeyBundle/SignedContactInvitation's encoding path",
+            uri.len()
+        );
     }
 
     /// The exact bug from the 2026-08-22 audit: the UI's fallback "share code" (a bare hex

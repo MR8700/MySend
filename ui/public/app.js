@@ -112,6 +112,7 @@ const CLICK_ACTIONS = {
     confirmAndSendPendingMedia: (el) => runPendingAction(el, confirmAndSendPendingMedia),
     blockActiveContact: (el) => runPendingAction(el, blockActiveContact),
     unblockActiveContact: (el) => runPendingAction(el, () => unblockActiveContact(el.dataset.peerId)),
+    deleteContact: (el) => runPendingAction(el, () => deleteContactReal(el.dataset.peerId, el.dataset.name)),
     addContact: (el) => runPendingAction(el, addContactReal),
     retryFailedMessage: (el) => runPendingAction(el, () => retryFailedMessageReal(el.dataset.msgId, el.dataset.convId, el.dataset.recipientId)),
     saveBootstrapAddr: (el) => runPendingAction(el, saveBootstrapAddr),
@@ -133,6 +134,7 @@ const CLICK_ACTIONS = {
     showFileAlert: (el) => showFileAlertEl(el),
     triggerQrImagePicker: () => document.getElementById('qr-image-input').click(),
     logout: (el) => runPendingAction(el, logoutReal),
+    retryOwnBundle: (el) => runPendingAction(el, retryOwnBundleReal),
 };
 
 document.addEventListener('click', (event) => {
@@ -217,6 +219,12 @@ const state = {
         bundleHex: '',
         // Cryptographically signed invitation URI (nova://invite?d=...) with 24h deadline
         invitationUri: '',
+        // Set by refreshOwnBundleHex() when both the signed-invitation call and the legacy
+        // prekey-bundle fallback fail — distinguishes a genuine, terminal failure (show an
+        // error + retry) from "still fetching" (bundleHex/invitationUri simply not populated
+        // yet), which previously looked identical and left the Identity screen stuck showing
+        // "Génération du lien sécurisé…" forever with a blank QR code and no way to retry.
+        linkGenerationError: '',
     },
     // Set by openChatWith() when a conversation is opened. null means "no chat open" — screens
     // that render it must handle that rather than assume a contact always exists.
@@ -635,10 +643,11 @@ const screens = {
                 </div>
 
                 ${state.activeContact.isBlocked ? `
-                    <button class="btn-primary" style="width: 100%;" data-action="unblockActiveContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}">Débloquer ce contact</button>
+                    <button class="btn-primary" style="width: 100%; margin-bottom: 10px;" data-action="unblockActiveContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}">Débloquer ce contact</button>
                 ` : `
-                    <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="blockActiveContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}">Bloquer ce contact</button>
+                    <button class="btn-secondary" style="width: 100%; margin-bottom: 10px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="blockActiveContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}">Bloquer ce contact</button>
                 `}
+                <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="deleteContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}" data-name="${escapeHtml(state.activeContact.name)}">Supprimer ce contact</button>
             </div>
         </div>
     `; },
@@ -692,7 +701,10 @@ const screens = {
                                 <div class="item-name">${escapeHtml(c.name)}</div>
                                 <div class="item-sub" style="color: var(--status-danger);">Bloqué</div>
                             </div>
-                            <button class="btn-secondary" style="font-size: 11px; padding: 6px 12px;" data-action="unblockActiveContact" data-peer-id="${escapeHtml(c.handle)}">Débloquer</button>
+                            <div style="display: flex; gap: 6px;">
+                                <button class="btn-secondary" style="font-size: 11px; padding: 6px 12px;" data-action="unblockActiveContact" data-peer-id="${escapeHtml(c.handle)}">Débloquer</button>
+                                <button class="btn-secondary" style="font-size: 11px; padding: 6px 12px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="deleteContact" data-peer-id="${escapeHtml(c.handle)}" data-name="${escapeHtml(c.name)}">Supprimer</button>
+                            </div>
                         </div>
                     `).join('')}
                 ` : ''}
@@ -887,8 +899,10 @@ const screens = {
 
                     <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px; font-size: 12px; color: ${state.torSettings.connected ? 'var(--status-success)' : 'var(--text-muted)'}; background: var(--bg-elevated); padding: 8px 12px; border-radius: var(--radius-md);">
                         <span style="width: 8px; height: 8px; border-radius: 50%; background: ${state.torSettings.connected ? 'var(--status-success)' : 'var(--status-danger)'}; display: inline-block;"></span>
-                        <span>Statut Tor : <strong>${state.torSettings.connected ? 'Circuit Actif (Connecté)' : 'Déconnecté / Proxy Local requis'}</strong></span>
+                        <span>Statut Tor : <strong>${state.torSettings.connected ? 'Circuit Actif (Connecté)' : (state.torSettings.enabled ? `Démarrage du circuit… (${state.torSettings.bootstrapPercent || 0}%)` : 'Désactivé')}</strong></span>
                     </div>
+
+                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 14px;">Tor est intégré directement dans NOVA — aucune application ni proxy externe n'est nécessaire, sur téléphone comme sur ordinateur.</div>
 
                     <label style="font-size: 12px; color: var(--text-muted);">Mode d'anonymisation</label>
                     <select id="tor-mode-select" style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; margin: 6px 0 14px; outline: none;">
@@ -896,11 +910,6 @@ const screens = {
                         <option value="hybrid" ${state.torSettings.mode === 'hybrid' ? 'selected' : ''}>Hybride (Direct LAN/Bootstrap, Tor pour .onion)</option>
                         <option value="tor_strict" ${state.torSettings.mode === 'tor_strict' ? 'selected' : ''}>Furtif Absolu (Tor Strict - 0 fuite IP garantie)</option>
                     </select>
-
-                    <label style="font-size: 12px; color: var(--text-muted);">Proxy SOCKS5 Tor (Local ou Orbot / Tor Expert)</label>
-                    <input id="tor-socks-input" type="text" value="${escapeHtml(state.torSettings.socksProxy)}"
-                        placeholder="127.0.0.1:9050"
-                        style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; font-family: monospace; margin: 6px 0 14px;">
 
                     <label style="font-size: 12px; color: var(--text-muted);">Pont Tor (Anti-censure / Contournement DPI)</label>
                     <select id="tor-bridge-select" style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; margin: 6px 0 16px; outline: none;">
@@ -997,8 +1006,23 @@ const screens = {
 
             <div style="padding: 24px 20px; overflow-y: auto; padding-bottom: 90px;">
                 <div style="text-align: center; margin-bottom: 20px;">
-                    <div style="background: white; width: 220px; height: 220px; border-radius: var(--radius-lg); margin: 0 auto 14px; display: flex; align-items: center; justify-content: center; box-shadow: 0 8px 32px rgba(0,0,0,0.5); overflow: hidden; padding: 10px;">
-                        <canvas id="my-qr-canvas" width="200" height="200"></canvas>
+                    <!-- The invitation ticket (signed bundle + rendezvous addresses) needs a fairly
+                         high-density QR (~120-140 modules/side) to fit its ~1.5-2KB of data. Showing it
+                         at only 200 CSS px (the previous size) put well under 2 physical pixels per
+                         module on a typical phone screen — too fine-grained for another phone's camera
+                         to resolve at all, which is what made the live scanner spin forever without ever
+                         detecting a code ("ça scanne à l'infini"). 300px, plus the lower error-correction
+                         level set in renderOwnQrCode(), meaningfully increases the physical size of each
+                         module. -->
+                    <div style="background: white; width: 300px; height: 300px; max-width: 100%; border-radius: var(--radius-lg); margin: 0 auto 14px; display: flex; align-items: center; justify-content: center; box-shadow: 0 8px 32px rgba(0,0,0,0.5); overflow: hidden; padding: 14px; box-sizing: border-box;">
+                        ${state.currentUser.linkGenerationError ? `
+                            <div style="color: #B91C1C; text-align: center; padding: 8px;">
+                                <div style="font-size: 28px; margin-bottom: 6px;">⚠️</div>
+                                <div style="font-size: 12px; font-weight: 600; margin-bottom: 6px;">Échec de génération du lien</div>
+                                <div style="font-size: 10px; color: #7F1D1D; word-break: break-word; margin-bottom: 8px; max-height: 70px; overflow-y: auto;">${escapeHtml(state.currentUser.linkGenerationError)}</div>
+                                <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px;" data-action="retryOwnBundle">Réessayer</button>
+                            </div>
+                        ` : `<canvas id="my-qr-canvas" width="640" height="640" style="width: 272px; height: 272px;"></canvas>`}
                     </div>
 
                     <div style="display: inline-flex; align-items: center; gap: 6px; background: rgba(168, 85, 247, 0.15); border: 1px solid var(--accent-purple-light); padding: 4px 12px; border-radius: 20px; font-size: 11px; color: var(--accent-purple-light); margin-bottom: 8px;">
@@ -1023,7 +1047,7 @@ const screens = {
 
                 <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; margin-bottom: 12px; border: 1px solid var(--border-subtle); text-align: left;">
                     <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; font-weight: 600;">Lien d'invitation sécurisé (pour SMS / messagerie) :</div>
-                    <textarea id="my-bundle-output" readonly rows="2" style="width: 100%; background: none; border: none; color: var(--accent-purple-light); font-family: monospace; font-size: 11px; resize: none; outline: none; word-break: break-all;">${escapeHtml(state.currentUser.invitationUri || state.currentUser.bundleHex) || (hasBackend ? 'Génération du lien sécurisé…' : 'Compte non créé.')}</textarea>
+                    <textarea id="my-bundle-output" readonly rows="2" style="width: 100%; background: none; border: none; color: var(--accent-purple-light); font-family: monospace; font-size: 11px; resize: none; outline: none; word-break: break-all;">${escapeHtml(state.currentUser.invitationUri || state.currentUser.bundleHex) || (state.currentUser.linkGenerationError ? `Échec : ${escapeHtml(state.currentUser.linkGenerationError)}` : (hasBackend ? 'Génération du lien sécurisé…' : 'Compte non créé.'))}</textarea>
                 </div>
                 <button class="btn-primary" style="width: 100%;" data-action="copyOwnBundle">Copier mon lien sécurisé</button>
 
@@ -1113,7 +1137,17 @@ const screens = {
 };
 
 // --- CONTROLLER & NAVIGATION ---
+// Every screen except these three requires a created/restored identity (state.currentUser.peerId).
+// Without this gate, a device with no account yet could still reach conversations/contacts/
+// settings/etc. — all rendering empty or non-functional since there is no peerId to act as —
+// instead of being told to create an account first.
+const PRE_AUTH_SCREENS = new Set(['onboarding', 'create_account', 'restore_account']);
 let conversationsPollInterval = null;
+// Set while replaying a browser/Android-back navigation (see the `popstate` listener below) so
+// navigateTo() doesn't push a *new* history entry on top of the one the back action just landed
+// on — that would turn one back-press into a no-op (pop one, push one right back).
+let suppressHistoryPush = false;
+
 async function navigateTo(screenKey) {
     closeQrCameraScanner();
     closeMediaPreviewModal();
@@ -1121,6 +1155,12 @@ async function navigateTo(screenKey) {
         document.activeElement.blur();
     }
     if (!screens[screenKey]) return;
+    if (!state.currentUser.peerId && !PRE_AUTH_SCREENS.has(screenKey)) {
+        if (state.currentScreen !== 'onboarding') {
+            alert('Vous devez d\'abord créer votre compte (ou en restaurer un) pour accéder à cette fonctionnalité.');
+        }
+        screenKey = 'onboarding';
+    }
     state.currentScreen = screenKey;
 
     // Refresh from the real backend *before* rendering, for screens whose content it owns —
@@ -1236,7 +1276,79 @@ async function navigateTo(screenKey) {
         clearInterval(conversationsPollInterval);
         conversationsPollInterval = null;
     }
+
+    // Record this screen in the browser/WebView history so the Android hardware/gesture back
+    // button has something to go back TO. Without this, the WebView's history stays completely
+    // empty (this SPA never used to call pushState), so Tauri's default Android back-button
+    // handling (go back in WebView history, else close the app) had nothing to go back to and
+    // closed the entire app from any screen — see the `popstate` listener below for the other
+    // half of this fix.
+    if (!suppressHistoryPush) {
+        if (history.state && history.state.screen === screenKey) {
+            // Re-render of the same screen (e.g. a poll refresh) — nothing to add to history.
+        } else if (history.state && history.state.screen) {
+            history.pushState({ screen: screenKey }, '', '#' + screenKey);
+        } else {
+            // First navigation since page load: replace rather than push, so this root screen
+            // is the one single back-press away from exiting the app, not two.
+            history.replaceState({ screen: screenKey }, '', '#' + screenKey);
+        }
+    }
 }
+
+// True while any modal/drawer/sheet is actually visible in the DOM — checked fresh at each
+// back-press rather than tracked via a separate counter, so it can never drift out of sync with
+// what's really on screen (e.g. an overlay closed by tapping outside it, or a "Annuler" button,
+// rather than by the back button).
+function isAnyOverlayOpen() {
+    const modalIds = ['qr-camera-modal', 'media-preview-modal', 'location-modal', 'mnemonic-auth-modal', 'edit-profile-modal'];
+    if (modalIds.some(id => {
+        const el = document.getElementById(id);
+        return el && el.classList.contains('show');
+    })) return true;
+    const drawer = document.getElementById('attachment-drawer');
+    const emojiPanel = document.getElementById('emoji-picker-panel');
+    return !!((drawer && drawer.classList.contains('show')) || (emojiPanel && emojiPanel.classList.contains('show')));
+}
+
+// Handles the Android hardware/gesture back button (and desktop browser back/forward, for free)
+// once there is real history to pop — see the pushState/replaceState call at the end of
+// navigateTo() above.
+let handlingPopState = false;
+window.addEventListener('popstate', (event) => {
+    // A second popstate firing while the first is still being processed (a back GESTURE can
+    // sometimes fire twice in quick succession) used to race two concurrent navigateTo() calls
+    // against each other, occasionally leaving the rendered screen out of sync with
+    // history.state. Simplest safe fix: the second one is a no-op — the user just needs one more
+    // back-press, instead of risking corrupted navigation state.
+    if (handlingPopState) return;
+
+    // If a modal/drawer/sheet was open, this back-press's only job is to close it — matching
+    // standard mobile app behavior (e.g. WhatsApp: one press closes the emoji picker/attachment
+    // drawer/a confirmation sheet, a *separate* second press leaves the screen), rather than
+    // closing it AND leaving the whole screen in a single press. None of these overlays push
+    // their own history entry, so the browser already popped a screen-level entry for this
+    // press — immediately pushing the current screen back restores it, so the *next* back-press
+    // still lands on the real previous screen instead of skipping past it.
+    if (isAnyOverlayOpen()) {
+        closeQrCameraScanner();
+        closeMediaPreviewModal();
+        closeLocationModal();
+        closeMnemonicAuthModal();
+        closeEditProfileModal();
+        closePanels();
+        history.pushState({ screen: state.currentScreen }, '', '#' + state.currentScreen);
+        return;
+    }
+
+    handlingPopState = true;
+    const targetScreen = (event.state && event.state.screen) || (state.currentUser.peerId ? 'conversations' : 'onboarding');
+    suppressHistoryPush = true;
+    navigateTo(targetScreen).finally(() => {
+        suppressHistoryPush = false;
+        handlingPopState = false;
+    });
+});
 
 // Applies the identity nova-engine just created/restored to local UI state.
 function applyAccountInfo(name, peerId, mnemonic, networkActive, bio, avatarDataUrl) {
@@ -1411,7 +1523,7 @@ async function logoutReal() {
     }
     state.currentUser = {
         name: '', username: '', handle: '', peerId: '', bio: '',
-        status: 'Compte non créé', publicKey: '', mnemonic: '', bundleHex: '',
+        status: 'Compte non créé', publicKey: '', mnemonic: '', bundleHex: '', linkGenerationError: '',
     };
     try {
         localStorage.removeItem('nova_pin_hash');
@@ -1519,16 +1631,28 @@ async function refreshOwnBundleHex() {
         const uri = await tauriInvoke('get_own_invitation_uri', { ttlSeconds: 86400 });
         state.currentUser.invitationUri = uri;
         state.currentUser.bundleHex = uri;
+        state.currentUser.linkGenerationError = '';
     } catch (e) {
         console.error('get_own_invitation_uri failed, fallback to raw prekey bundle', e);
         try {
             state.currentUser.bundleHex = await tauriInvoke('get_own_prekey_bundle_hex');
             state.currentUser.invitationUri = state.currentUser.bundleHex;
+            state.currentUser.linkGenerationError = '';
         } catch (e2) {
             console.error('refreshOwnBundleHex fallback failed', e2);
             state.currentUser.bundleHex = '';
             state.currentUser.invitationUri = '';
+            state.currentUser.linkGenerationError = String((e2 && e2.message) || e2 || e || 'erreur inconnue');
         }
+    }
+}
+
+// Re-runs refreshOwnBundleHex() from the "Réessayer" button shown when it previously failed,
+// then re-renders the Identity screen so the QR code / link / error state reflect the outcome.
+async function retryOwnBundleReal() {
+    await refreshOwnBundleHex();
+    if (state.currentScreen === 'identity') {
+        navigateTo('identity');
     }
 }
 
@@ -1579,13 +1703,15 @@ async function saveTorConfigReal() {
     if (!requireBackend()) return;
     const enabledChk = document.getElementById('tor-enabled-chk');
     const modeSelect = document.getElementById('tor-mode-select');
-    const socksInput = document.getElementById('tor-socks-input');
     const bridgeSelect = document.getElementById('tor-bridge-select');
     const statusEl = document.getElementById('tor-config-status');
 
     const enabled = enabledChk ? enabledChk.checked : false;
     const mode = modeSelect ? modeSelect.value : 'direct_only';
-    const socksProxy = (socksInput && socksInput.value.trim()) || '127.0.0.1:9050';
+    // Tor runs embedded (see Settings' "Tor est intégré directement dans NOVA" note) — there is
+    // no external SOCKS5 proxy to point at anymore. This value is only kept for backward
+    // compatibility with the `configure_tor`/storage layer's existing field and is unused.
+    const socksProxy = '127.0.0.1:9050';
     const bridgeType = bridgeSelect && bridgeSelect.value !== 'none' ? bridgeSelect.value : null;
 
     if (statusEl) statusEl.innerHTML = '<span style="color: var(--accent-purple-light);">Application de la configuration Tor...</span>';
@@ -1831,23 +1957,109 @@ function renderOwnQrCode() {
     const canvas = document.getElementById('my-qr-canvas');
     const textToEncode = state.currentUser.invitationUri || state.currentUser.bundleHex;
     if (!canvas || !textToEncode || typeof QRCode === 'undefined') return;
-    QRCode.toCanvas(canvas, textToEncode, { errorCorrectionLevel: 'M', margin: 1, width: 200 }, (err) => {
-        if (err) console.error('QR render failed', err);
+    // `scale` (integer pixels per module) is used instead of a fixed `width` on purpose: qrcode.js
+    // picks the scale as width/(moduleCount + 2*margin) and floor-rounds each module's pixel span
+    // independently, so a `width` that doesn't divide evenly into the module count (the overwhelmingly
+    // common case, since module count varies with invitation length) produces a jittery grid where
+    // modules are inconsistently 1px narrower/wider than their neighbors. That's invisible to the eye
+    // at a glance but breaks the uniform sampling grid both jsQR and real camera scanners rely on —
+    // this was the actual cause of QR codes that looked fine but scanned unreliably or not at all.
+    // `margin: 4` matches the ISO/IEC 18004 minimum quiet zone (the previous margin: 2 halved that,
+    // which independently hurt real-camera recognition). `scale: 4` keeps modules physically large.
+    // toCanvas() sets canvas.style.width/height to match the raster size it just produced, so the CSS
+    // display size (272px, chosen so live camera-scanning gets a consistently sized on-screen code
+    // regardless of how large the underlying raster ends up being for a given invitation's module
+    // count) is explicitly restored below after rendering. 'L' (7% redundancy) keeps the QR version —
+    // and so the module count — as low as this ~1.5-2KB invitation ticket allows, since fewer, larger
+    // modules is what actually makes live camera scanning reliable.
+    QRCode.toCanvas(canvas, textToEncode, { errorCorrectionLevel: 'L', margin: 4, scale: 4 }, (err) => {
+        if (err) {
+            // The link itself was fetched fine, but the QR library couldn't encode it (e.g. the
+            // invitation ticket's content — bundle + rendezvous addresses — exceeded the QR
+            // format's max capacity). Previously this left the canvas permanently blank with only
+            // a console.error, indistinguishable from "still loading" — surface it visibly instead,
+            // same as a link-fetch failure, so the user has a "Réessayer" instead of a dead screen.
+            console.error('QR render failed', err);
+            state.currentUser.linkGenerationError = String(err.message || err);
+            if (state.currentScreen === 'identity') {
+                const container = document.getElementById('screen-container');
+                if (container) container.innerHTML = screens.identity();
+            }
+            return;
+        }
+        canvas.style.width = '272px';
+        canvas.style.height = '272px';
     });
 }
 
-function saveQrImage() {
+// Saves/shares the rendered QR as a PNG. The synthetic `<a download>` click this used to rely on
+// exclusively works on desktop WebView2 but is silently a no-op on Android's WebView (there is no
+// download manager hook for a `data:` URI there) — exactly the "le bouton enregistré est
+// silencieux" symptom. Mobile gets the Web Share API (Level 2, file sharing) instead, which hands
+// the PNG to Android's native share sheet (Save to Files/Gallery, send in another app, etc.) — the
+// same mechanism `shareInvitation()` already uses for text, just extended with a `files` array.
+// Every path now also gives explicit success/failure feedback, since a platform-specific save
+// mechanism failing silently was the other half of the complaint, independent of *which*
+// mechanism was used.
+async function saveQrImage() {
     const canvas = document.getElementById('my-qr-canvas');
     if (!canvas) {
         alert('QR code indisponible.');
         return;
     }
-    const link = document.createElement('a');
-    link.download = `nova_invite_${(state.currentUser.username || 'contact')}.png`;
-    link.href = canvas.toDataURL('image/png');
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const filename = `nova_invite_${(state.currentUser.username || 'contact')}.png`;
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) {
+        alert("Échec de l'enregistrement : impossible de générer l'image du QR code.");
+        return;
+    }
+    const file = new File([blob], filename, { type: 'image/png' });
+
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try {
+            await navigator.share({ files: [file], title: 'QR code NOVA Chat' });
+            return;
+        } catch (e) {
+            if (e && e.name === 'AbortError') return; // user cancelled the share sheet — not a failure
+            console.error('navigator.share(files) failed, falling back', e);
+        }
+    }
+
+    // Under Tauri (desktop or Android), write the file for real via the fs plugin instead of the
+    // synthetic <a download> blob-URL click below — that click() never throws even when it
+    // silently does nothing, which is exactly what happens on Android's WebView (no
+    // download-manager hook for a blob:/data: URI there): the button used to claim "Image
+    // enregistrée" unconditionally regardless of whether anything was actually written to disk.
+    if (hasBackend && window.__TAURI__.fs && window.__TAURI__.path) {
+        try {
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            await window.__TAURI__.fs.writeFile(filename, bytes, {
+                baseDir: window.__TAURI__.path.BaseDirectory.Download,
+            });
+            alert(`Image enregistrée : dossier Téléchargements/${filename}`);
+        } catch (e) {
+            console.error('Native file save failed', e);
+            alert("Échec de l'enregistrement de l'image. Utilisez plutôt « Partager le lien ».");
+        }
+        return;
+    }
+
+    // Plain-browser fallback only (e.g. iterating on styling outside the Tauri shell, where
+    // hasBackend is false) — a real <a download> click reliably works in an actual browser tab.
+    try {
+        const link = document.createElement('a');
+        link.download = filename;
+        link.href = URL.createObjectURL(blob);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+        alert('Image enregistrée dans vos téléchargements.');
+    } catch (e) {
+        console.error('QR image save failed', e);
+        alert("Échec de l'enregistrement de l'image. Utilisez plutôt « Partager le lien ».");
+    }
 }
 
 async function shareInvitation() {
@@ -1957,6 +2169,29 @@ async function unblockActiveContact(peerId) {
         navigateTo('contacts');
     } catch (e) {
         alert('Échec du déblocage : ' + e);
+    }
+}
+
+// Permanently removes a contact — unlike block/unblock, this also wipes the entire conversation
+// history with them (see nova-storage's delete_contact), so it always asks for confirmation
+// first, same as logoutReal()'s "this is destructive" confirm() pattern.
+async function deleteContactReal(peerId, name) {
+    const targetPeerId = peerId || (state.activeContact && (state.activeContact.peerId || state.activeContact.handle));
+    if (!targetPeerId || !requireBackend()) return;
+    const displayName = name || (state.activeContact && state.activeContact.name) || 'ce contact';
+    if (!confirm(`Supprimer ${displayName} ? Tout l'historique de conversation avec ce contact sera aussi effacé définitivement. Cette action est irréversible.`)) {
+        return;
+    }
+    try {
+        await tauriInvoke('delete_contact', { peerId: targetPeerId });
+        await refreshContactsFromBackend();
+        await refreshConversationsFromBackend();
+        if (state.activeContact && (state.activeContact.peerId === targetPeerId || state.activeContact.handle === targetPeerId)) {
+            state.activeContact = null;
+        }
+        navigateTo('conversations');
+    } catch (e) {
+        alert('Échec de la suppression : ' + e);
     }
 }
 
@@ -2997,17 +3232,41 @@ function closePanels() {
 let qrScannerStream = null;
 let qrScannerAnimId = null;
 
+function showQrScannerError(message) {
+    const errBox = document.getElementById('qr-camera-error');
+    if (!errBox) return;
+    const msgEl = errBox.querySelector('span');
+    if (msgEl) msgEl.textContent = message;
+    errBox.style.display = 'flex';
+}
+
 async function openQrCameraScanner() {
     const modal = document.getElementById('qr-camera-modal');
     const video = document.getElementById('qr-scanner-video');
     const errBox = document.getElementById('qr-camera-error');
     if (!modal || !video) return;
 
+    // Ignore a second trigger while a scan session is already active (e.g. a rapid double-tap on
+    // the "Scanner" button before the first getUserMedia() promise settles) — without this, the
+    // first camera stream's tracks were never stopped (closeQrCameraScanner() was never called
+    // in between), leaking the camera lock and battery, and some mobile browsers reject the
+    // second concurrent getUserMedia() call outright even though permission was already granted.
+    if (qrScannerStream) return;
+
     modal.classList.add('show');
     if (errBox) errBox.style.display = 'none';
 
+    if (typeof jsQR === 'undefined') {
+        // The live per-frame scan loop below used to check this exact same condition silently
+        // and just loop forever doing nothing if it was ever true ("ça scanne à l'infini" with a
+        // camera that visibly works but never reacts) — checked once here instead, now failing
+        // exactly as visibly as the image-import path (handleQrImageSelect) already did.
+        showQrScannerError('Décodeur QR indisponible.');
+        return;
+    }
+
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        if (errBox) errBox.style.display = 'flex';
+        showQrScannerError('Caméra indisponible ou permission non accordée.');
         return;
     }
 
@@ -3015,8 +3274,14 @@ async function openQrCameraScanner() {
         qrScannerStream = await navigator.mediaDevices.getUserMedia({
             video: {
                 facingMode: { ideal: 'environment' },
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
+                // Higher than the previous 1280x720 ideal: the invitation QR's own module count
+                // is already at the low end error-correction can allow (see renderOwnQrCode), so
+                // squeezing more real camera pixels per module here is the other half of making a
+                // scan of another phone's on-screen code actually resolve instead of coming back
+                // empty every single frame ("ça scanne à l'infini"). Still just a hint — falls back
+                // to whatever the device actually offers, same as the plain getUserMedia retry below.
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
             }
         });
         video.srcObject = qrScannerStream;
@@ -3031,7 +3296,7 @@ async function openQrCameraScanner() {
             requestQrScanFrame();
         } catch (err2) {
             console.error('Camera access completely failed or denied', err2);
-            if (errBox) errBox.style.display = 'flex';
+            showQrScannerError('Caméra indisponible ou permission non accordée.');
         }
     }
 }
@@ -3137,6 +3402,10 @@ function handleQrImageSelect(event) {
 
         const bundleInput = document.getElementById('add-bundle-input');
         if (bundleInput) bundleInput.value = result.data.trim();
+        // Both entry points into this image-import path (the footer button and the camera-error
+        // fallback) live inside the qr-camera-modal — a successful decode here must close that
+        // modal too (and, if the live camera was still running underneath, stop its stream),
+        // exactly like a successful live-camera scan already does in scanQrCameraFrame().
         closeQrCameraScanner();
     };
     img.onerror = () => alert('Impossible de charger cette image.');
@@ -3342,3 +3611,20 @@ if (window.visualViewport) {
         }
     });
 }
+
+// Alerts the user when this device has no Wi-Fi/mobile data connectivity at all —
+// `navigator.onLine` reflects the OS's own network state (Android's ConnectivityManager
+// underneath the WebView, same on desktop), no native code needed. Without this, adding a
+// contact or sending a message while genuinely offline just queued silently in the outbox with
+// no feedback at all — indistinguishable from "the app is broken" until the outbox eventually
+// gives up, several minutes later (see OUTBOX_GIVE_UP_AFTER_SECS in nova-engine).  Note this only
+// detects "no network interface up at all" (no Wi-Fi, no mobile data) — a Wi-Fi connected to a
+// router with no internet uplink still reports online here, same as every browser; that's a
+// different, harder problem (real reachability, not link state) than what was asked for.
+function updateOfflineBanner() {
+    const banner = document.getElementById('offline-banner');
+    if (banner) banner.classList.toggle('show', !navigator.onLine);
+}
+window.addEventListener('online', updateOfflineBanner);
+window.addEventListener('offline', updateOfflineBanner);
+updateOfflineBanner();
