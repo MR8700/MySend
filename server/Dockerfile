@@ -10,7 +10,7 @@
 # gets compiled — none of the other members' build scripts or system dependencies (e.g. the
 # Tauri UI crate's webview/GTK requirements) are ever invoked for this build.
 
-FROM rust:1.82-slim-bookworm AS builder
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 
 # Layer-cache the dependency graph separately from this crate's own source: copy every manifest
