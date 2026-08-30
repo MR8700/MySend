@@ -1005,6 +1005,8 @@ const screens = {
                         <span style="font-size: 14px; color: white;">Cacher le contenu dans les notifications</span>
                         <input type="checkbox" id="notif-hide-content-chk" ${state.notificationPrefs.hideContent ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
                     </div>
+                </div>
+
                 <!-- Storage & Received Media Folder -->
                 <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">STOCKAGE & MÉDIAS</div>
                 <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
