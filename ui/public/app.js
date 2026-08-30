@@ -2621,8 +2621,12 @@ async function downloadCurrentImage() {
     if (currentPreviewImageData.msgId) {
         await saveAttachmentToDisk(currentPreviewImageData.msgId, currentPreviewImageData.filename);
     } else if (currentPreviewImageData.url) {
+        const dateStr = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+        const nameParts = (currentPreviewImageData.filename || 'photo.jpg').split('.');
+        const ext = nameParts.length > 1 ? nameParts.pop() : 'jpg';
+        const stem = nameParts.join('.') || 'photo';
         const link = document.createElement('a');
-        link.download = currentPreviewImageData.filename || 'photo_nova.jpg';
+        link.download = `${stem}_${dateStr}.${ext}`;
         link.href = currentPreviewImageData.url;
         link.click();
         showToastNotification('✓ Photo téléchargée');

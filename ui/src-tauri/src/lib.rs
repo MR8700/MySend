@@ -420,32 +420,42 @@ fn save_attachment_to_disk(
     std::fs::create_dir_all(&nova_media_dir)
         .map_err(|e| format!("Impossible de créer le dossier NOVA : {e}"))?;
 
+    let now_str = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+
     let raw_name = suggested_filename
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("nova_media_{}", message_id));
 
-    let sanitized_name: String = raw_name
+    let sanitized_raw: String = raw_name
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
         .collect();
 
-    let mut target_path = nova_media_dir.join(&sanitized_name);
-    let mut counter = 1;
-    let stem = std::path::Path::new(&sanitized_name)
+    let stem = std::path::Path::new(&sanitized_raw)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("fichier");
-    let ext = std::path::Path::new(&sanitized_name)
+    let ext = std::path::Path::new(&sanitized_raw)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
+    // Standardized format: <nom>_<horodatage>.<ext>
+    let timestamped_name = if ext.is_empty() {
+        format!("{}_{}", stem, now_str)
+    } else {
+        format!("{}_{}.{}", stem, now_str, ext)
+    };
+
+    let mut target_path = nova_media_dir.join(&timestamped_name);
+    let mut counter = 1;
+
     while target_path.exists() {
         let new_name = if ext.is_empty() {
-            format!("{}_{}", stem, counter)
+            format!("{}_{}_{}", stem, now_str, counter)
         } else {
-            format!("{}_{}.{}", stem, counter, ext)
+            format!("{}_{}_{}.{}", stem, now_str, counter, ext)
         };
         target_path = nova_media_dir.join(new_name);
         counter += 1;
