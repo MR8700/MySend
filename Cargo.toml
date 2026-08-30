@@ -25,7 +25,6 @@ x25519-dalek = { version = "2.0", features = ["static_secrets", "serde", "zeroiz
 chacha20poly1305 = { version = "0.10", features = ["alloc"] }
 hkdf = "0.12"
 sha2 = "0.10"
-sha3 = "0.10"
 blake3 = "1.5"
 bip39 = { version = "2.1", features = ["rand"] }
 rand = "0.8"
@@ -46,9 +45,12 @@ serde_bytes = "0.11"
 tokio = { version = "1.38", features = ["full"] }
 futures-util = "0.3"
 # rustls (not native-tls/OpenSSL) so `wss://` client connections cross-compile cleanly for
-# Android alongside the rest of this workspace's already-rustls-based TLS usage (arti-client,
-# libp2p-quic), with no system OpenSSL dev headers needed on any target.
+# Android alongside the rest of this workspace's already-rustls-based TLS usage (libp2p-quic),
+# with no system OpenSSL dev headers needed on any target.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# No "dcutr" feature — see nova-transport::dht_node's module doc comment: DCUtR's automatic
+# relayed-to-direct hole-punching upgrade is deliberately not wired in, since it would silently
+# defeat this project's LAN/relay-only IP-hiding dial policy the moment a hole-punch succeeded.
 libp2p = { version = "0.54", features = [
     "tokio",
     "quic",
@@ -57,7 +59,6 @@ libp2p = { version = "0.54", features = [
     "mdns",
     "identify",
     "relay",
-    "dcutr",
     "noise",
     "yamux",
     "request-response",

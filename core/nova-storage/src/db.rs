@@ -1,7 +1,7 @@
 use crate::field_crypto::FieldCipher;
 use crate::models::{
     AttachmentMeta, ContactRecord, ConversationRecord, DbMessageStatus, MessageRecord, OutboxItem,
-    TorSettingsRecord, UserProfileRecord,
+    UserProfileRecord,
 };
 use nova_crypto::{
     derive_storage_key, generate_storage_salt, DeviceIdentity, DoubleRatchetSession,
@@ -112,6 +112,7 @@ impl StorageEngine {
                 safety_number TEXT NOT NULL,
                 is_online INTEGER NOT NULL DEFAULT 0,
                 is_blocked INTEGER NOT NULL DEFAULT 0,
+                is_trusted INTEGER NOT NULL DEFAULT 0,
                 last_seen_utc INTEGER NOT NULL
             );
 
@@ -175,18 +176,12 @@ impl StorageEngine {
                 updated_at INTEGER NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS tor_settings (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                enabled INTEGER NOT NULL DEFAULT 0,
-                mode TEXT NOT NULL DEFAULT 'direct_only',
-                socks_proxy TEXT NOT NULL DEFAULT '127.0.0.1:9050',
-                bridge_type TEXT
-            );
-
             CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, timestamp_utc);
             CREATE INDEX IF NOT EXISTS idx_outbox_retry ON outbox_queue(next_retry_utc);
             ",
         )?;
+
+        conn.execute("ALTER TABLE contacts ADD COLUMN is_trusted INTEGER NOT NULL DEFAULT 0", []).ok();
 
         Ok(())
     }
@@ -485,14 +480,11 @@ impl StorageEngine {
             .load_active_signed_prekey()?
             .ok_or_else(|| StorageError::NotFound("no signed prekey generated yet".into()))?;
 
-        let onion_address = Some(nova_crypto::derive_onion_v3_address(&identity.verifying_key_bytes));
-
         Ok(PreKeyBundle {
             identity_ed25519_pub: identity.verifying_key_bytes,
             identity_x25519_pub: identity.dh_public_bytes,
             signed_prekey,
             one_time_prekey: None,
-            onion_address,
         })
     }
 
@@ -504,8 +496,8 @@ impl StorageEngine {
 
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO contacts (peer_id, username, display_name, prekey_bundle_json, safety_number, is_online, is_blocked, last_seen_utc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO contacts (peer_id, username, display_name, prekey_bundle_json, safety_number, is_online, is_blocked, is_trusted, last_seen_utc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 contact.peer_id,
                 contact.username,
@@ -514,6 +506,7 @@ impl StorageEngine {
                 contact.safety_number,
                 contact.is_online as i32,
                 contact.is_blocked as i32,
+                contact.is_trusted as i32,
                 contact.last_seen_utc
             ],
         )?;
@@ -523,11 +516,11 @@ impl StorageEngine {
     #[allow(clippy::type_complexity)]
     pub fn get_contact(&self, peer_id: &str) -> Result<Option<ContactRecord>, StorageError> {
         let conn = self.conn.lock();
-        let row: Option<(String, String, String, Vec<u8>, String, i32, i32, i64)> = conn
+        let row: Option<(String, String, String, Vec<u8>, String, i32, i32, i32, i64)> = conn
             .query_row(
-                "SELECT peer_id, username, display_name, prekey_bundle_json, safety_number, is_online, is_blocked, last_seen_utc FROM contacts WHERE peer_id = ?1",
+                "SELECT peer_id, username, display_name, prekey_bundle_json, safety_number, is_online, is_blocked, is_trusted, last_seen_utc FROM contacts WHERE peer_id = ?1",
                 params![peer_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
             )
             .optional()?;
 
@@ -536,7 +529,7 @@ impl StorageEngine {
 
     pub fn get_contacts(&self) -> Result<Vec<ContactRecord>, StorageError> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT peer_id, username, display_name, prekey_bundle_json, safety_number, is_online, is_blocked, last_seen_utc FROM contacts ORDER BY display_name ASC")?;
+        let mut stmt = conn.prepare("SELECT peer_id, username, display_name, prekey_bundle_json, safety_number, is_online, is_blocked, is_trusted, last_seen_utc FROM contacts ORDER BY display_name ASC")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -546,7 +539,8 @@ impl StorageEngine {
                 row.get::<_, String>(4)?,
                 row.get::<_, i32>(5)?,
                 row.get::<_, i32>(6)?,
-                row.get::<_, i64>(7)?,
+                row.get::<_, i32>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })?;
 
@@ -555,6 +549,16 @@ impl StorageEngine {
             list.push(row_to_contact(r?)?);
         }
         Ok(list)
+    }
+
+    /// Marks a contact as trusted (no more safety prompts).
+    pub fn trust_contact(&self, peer_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE contacts SET is_trusted = 1 WHERE peer_id = ?1",
+            params![peer_id],
+        )?;
+        Ok(())
     }
 
     /// Marks a contact as blocked.
@@ -610,6 +614,32 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Blocks a contact and deletes their entire conversation & message history, but keeps the contact in blocked state.
+    pub fn block_and_delete_conversation(&self, peer_id: &str) -> Result<(), StorageError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM message_attachments WHERE message_id IN (
+                SELECT id FROM messages WHERE conversation_id IN (
+                    SELECT id FROM conversations WHERE peer_id = ?1
+                )
+             )",
+            params![peer_id],
+        )?;
+        tx.execute(
+            "DELETE FROM messages WHERE conversation_id IN (
+                SELECT id FROM conversations WHERE peer_id = ?1
+             )",
+            params![peer_id],
+        )?;
+        tx.execute("DELETE FROM conversations WHERE peer_id = ?1", params![peer_id])?;
+        tx.execute("DELETE FROM outbox_queue WHERE recipient_id = ?1", params![peer_id])?;
+        tx.execute("DELETE FROM ratchet_sessions WHERE peer_id = ?1", params![peer_id])?;
+        tx.execute("UPDATE contacts SET is_blocked = 1 WHERE peer_id = ?1", params![peer_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Checks if a contact is currently blocked.
     pub fn is_contact_blocked(&self, peer_id: &str) -> Result<bool, StorageError> {
         let conn = self.conn.lock();
@@ -626,7 +656,7 @@ impl StorageEngine {
     /// Returns all currently blocked contacts.
     pub fn get_blocked_contacts(&self) -> Result<Vec<ContactRecord>, StorageError> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT peer_id, username, display_name, prekey_bundle_json, safety_number, is_online, is_blocked, last_seen_utc FROM contacts WHERE is_blocked = 1 ORDER BY display_name ASC")?;
+        let mut stmt = conn.prepare("SELECT peer_id, username, display_name, prekey_bundle_json, safety_number, is_online, is_blocked, is_trusted, last_seen_utc FROM contacts WHERE is_blocked = 1 ORDER BY display_name ASC")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -636,7 +666,8 @@ impl StorageEngine {
                 row.get::<_, String>(4)?,
                 row.get::<_, i32>(5)?,
                 row.get::<_, i32>(6)?,
-                row.get::<_, i64>(7)?,
+                row.get::<_, i32>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })?;
 
@@ -1075,43 +1106,6 @@ impl StorageEngine {
         }))
     }
 
-    /// Saves the Tor network and anonymization settings.
-    pub fn save_tor_settings(&self, settings: &TorSettingsRecord) -> Result<(), StorageError> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO tor_settings (id, enabled, mode, socks_proxy, bridge_type)
-             VALUES (1, ?1, ?2, ?3, ?4)",
-            params![
-                if settings.enabled { 1 } else { 0 },
-                settings.mode,
-                settings.socks_proxy,
-                settings.bridge_type
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Loads the saved Tor network and anonymization settings, returning defaults if not yet customized.
-    pub fn get_tor_settings(&self) -> Result<TorSettingsRecord, StorageError> {
-        let conn = self.conn.lock();
-        let row: Option<(i32, String, String, Option<String>)> = conn
-            .query_row(
-                "SELECT enabled, mode, socks_proxy, bridge_type FROM tor_settings WHERE id = 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-
-        match row {
-            Some((enabled, mode, socks_proxy, bridge_type)) => Ok(TorSettingsRecord {
-                enabled: enabled != 0,
-                mode,
-                socks_proxy,
-                bridge_type,
-            }),
-            None => Ok(TorSettingsRecord::default()),
-        }
-    }
 }
 
 // Only the pool-roundtrip test still needs a fresh key id — `get_own_prekey_bundle` no longer
@@ -1128,9 +1122,9 @@ fn to_array_32(bytes: &[u8]) -> Result<[u8; 32], StorageError> {
 
 #[allow(clippy::type_complexity)]
 fn row_to_contact(
-    row: (String, String, String, Vec<u8>, String, i32, i32, i64),
+    row: (String, String, String, Vec<u8>, String, i32, i32, i32, i64),
 ) -> Result<ContactRecord, StorageError> {
-    let (peer_id, username, display_name, bundle_json, safety_number, is_online, is_blocked, last_seen_utc) = row;
+    let (peer_id, username, display_name, bundle_json, safety_number, is_online, is_blocked, is_trusted, last_seen_utc) = row;
     let prekey_bundle: PreKeyBundle =
         serde_json::from_slice(&bundle_json).map_err(|e| StorageError::MalformedBundle(e.to_string()))?;
 
@@ -1142,6 +1136,7 @@ fn row_to_contact(
         safety_number,
         is_online: is_online != 0,
         is_blocked: is_blocked != 0,
+        is_trusted: is_trusted != 0,
         last_seen_utc,
     })
 }
@@ -1245,7 +1240,6 @@ mod tests {
             identity_x25519_pub: bob.dh_public_bytes,
             signed_prekey,
             one_time_prekey: None,
-            onion_address: None,
         };
 
         let contact = ContactRecord {
@@ -1256,6 +1250,7 @@ mod tests {
             safety_number: "4A9F-2B1C-88E0-9142".into(),
             is_online: true,
             is_blocked: false,
+            is_trusted: false,
             last_seen_utc: 1787119000,
         };
         storage.save_contact(&contact).unwrap();
@@ -1478,7 +1473,6 @@ mod tests {
             identity_x25519_pub: bob.dh_public_bytes,
             signed_prekey,
             one_time_prekey: None,
-            onion_address: None,
         };
 
         let contact = ContactRecord {
@@ -1489,12 +1483,17 @@ mod tests {
             safety_number: "1234-5678".into(),
             is_online: true,
             is_blocked: false,
+            is_trusted: false,
             last_seen_utc: 1787119000,
         };
         storage.save_contact(&contact).unwrap();
 
         assert!(!storage.is_contact_blocked(&contact.peer_id).unwrap());
         assert_eq!(storage.get_blocked_contacts().unwrap().len(), 0);
+
+        storage.trust_contact(&contact.peer_id).unwrap();
+        let loaded = storage.get_contact(&contact.peer_id).unwrap().unwrap();
+        assert!(loaded.is_trusted);
 
         storage.block_contact(&contact.peer_id).unwrap();
         assert!(storage.is_contact_blocked(&contact.peer_id).unwrap());
@@ -1524,7 +1523,6 @@ mod tests {
                 identity_x25519_pub: id.dh_public_bytes,
                 signed_prekey,
                 one_time_prekey: None,
-                onion_address: None,
             };
             ContactRecord {
                 peer_id: hex::encode(id.verifying_key_bytes),
@@ -1534,6 +1532,7 @@ mod tests {
                 safety_number: "1234-5678".into(),
                 is_online: false,
                 is_blocked: false,
+                is_trusted: false,
                 last_seen_utc: 1787119000,
             }
         };
@@ -1667,29 +1666,5 @@ mod tests {
         assert_eq!(after[0].attempt_count, 2, "two record_outbox_retry calls must mean two increments");
         assert_eq!(after[0].payload, b"original_payload", "retry bookkeeping must never touch the queued payload");
         assert_eq!(after[0].first_attempt_utc, first_attempt, "first_attempt_utc must survive retries — it anchors the give-up deadline");
-    }
-
-    #[test]
-    fn test_tor_settings_persistence() {
-        let storage = StorageEngine::open(":memory:", "unlock-pass").unwrap();
-        let initial = storage.get_tor_settings().unwrap();
-        // Enabled/hybrid by default — see TorSettingsRecord::default()'s doc comment.
-        assert!(initial.enabled);
-        assert_eq!(initial.mode, "hybrid");
-        assert_eq!(initial.socks_proxy, "127.0.0.1:9050");
-
-        let updated = TorSettingsRecord {
-            enabled: true,
-            mode: "tor_strict".to_string(),
-            socks_proxy: "127.0.0.1:9150".to_string(),
-            bridge_type: Some("snowflake".to_string()),
-        };
-        storage.save_tor_settings(&updated).unwrap();
-
-        let loaded = storage.get_tor_settings().unwrap();
-        assert!(loaded.enabled);
-        assert_eq!(loaded.mode, "tor_strict");
-        assert_eq!(loaded.socks_proxy, "127.0.0.1:9150");
-        assert_eq!(loaded.bridge_type, Some("snowflake".to_string()));
     }
 }

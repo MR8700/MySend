@@ -121,19 +121,13 @@ impl SignedContactInvitation {
         Ok(payload)
     }
 
-    /// Serializes to the standard NOVA URI format (`nova://invite?d=<hex>&onion=<address>`).
+    /// Serializes to the standard NOVA URI format (`nova://invite?d=<hex>`).
     pub fn to_uri(&self) -> Result<String, InvitationError> {
         let mut ticket_cbor = Vec::new();
         ciborium::into_writer(self, &mut ticket_cbor)
             .map_err(|e| InvitationError::Serialization(e.to_string()))?;
 
-        let onion_suffix = if let Ok(payload) = ciborium::from_reader::<ContactInvitationPayload, _>(self.payload_cbor.as_slice()) {
-            format!("&onion={}", payload.bundle.onion_address())
-        } else {
-            String::new()
-        };
-
-        Ok(format!("nova://invite?d={}{}", hex::encode(ticket_cbor), onion_suffix))
+        Ok(format!("nova://invite?d={}", hex::encode(ticket_cbor)))
     }
 }
 
@@ -206,7 +200,6 @@ mod tests {
             identity_x25519_pub: identity.dh_public_bytes,
             signed_prekey: spk_pub,
             one_time_prekey: None,
-            onion_address: None,
         };
         (identity, bundle)
     }
@@ -247,8 +240,8 @@ mod tests {
     ///
     /// Builds the same realistic, worst-case bundle `get_own_prekey_bundle`
     /// (nova-storage/src/db.rs) actually produces — unlike `test_identity_and_bundle` above, this
-    /// fills in `one_time_prekey` and `onion_address`, which every real invitation has — plus a
-    /// dual-stack (IPv4 + IPv6) rendezvous address list with the trailing `/p2p/<peer-id>` suffix
+    /// fills in `one_time_prekey`, which every real invitation has — plus a dual-stack (IPv4 +
+    /// IPv6) rendezvous address list with the trailing `/p2p/<peer-id>` suffix
     /// `own_full_listen_addrs` actually appends, then asserts the resulting URI stays well under
     /// a QR code's max byte-mode capacity (2331 bytes at error-correction level 'M', version 40 —
     /// see vendor/qrcode.js's `Version.getBestVersionForData`), with generous headroom for the
@@ -259,13 +252,11 @@ mod tests {
         let identity = DeviceIdentity::from_mnemonic(&mnemonic, "alice").unwrap();
         let (_spk_sec, spk_pub) = generate_signed_prekey(&identity, 1);
         let (_opk_sec, opk_pub) = nova_crypto::generate_one_time_prekey(2);
-        let onion = nova_crypto::derive_onion_v3_address(&identity.verifying_key_bytes);
         let bundle = PreKeyBundle {
             identity_ed25519_pub: identity.verifying_key_bytes,
             identity_x25519_pub: identity.dh_public_bytes,
             signed_prekey: spk_pub,
             one_time_prekey: Some(opk_pub),
-            onion_address: Some(onion),
         };
         let libp2p_peer_id = "12D3KooWGjMGZjJZgQjJZgQjJZgQjJZgQjJZgQjJZgQjJZgQjJZg"; // realistic length
         let addrs = vec![
@@ -277,9 +268,9 @@ mod tests {
         let uri = invitation.to_uri().unwrap();
 
         // 2200 leaves ~130 bytes of headroom below the hard 2331-byte cap (room for e.g. a
-        // slightly longer onion/multiaddr) while still catching a regression of the
-        // serde_bytes bug: without it, this same realistic bundle measured ~4x larger, several
-        // thousand bytes over the cap.
+        // slightly longer multiaddr) while still catching a regression of the serde_bytes bug:
+        // without it, this same realistic bundle measured ~4x larger, several thousand bytes
+        // over the cap.
         assert!(
             uri.len() < 2200,
             "invitation URI is {} bytes — too close to (or over) a QR code's ~2331-byte max \

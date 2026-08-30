@@ -98,10 +98,82 @@ impl SignedDrainRequest {
             .try_into()
             .map_err(|_| PresenceError::InvalidSignature)?;
 
-        let msg = drain_signing_input(&self.peer_id, self.timestamp_utc);
-        verify_signature(&peer_pub, &msg, &sig_bytes).map_err(|_| PresenceError::InvalidSignature)?;
+        let expected_input = drain_signing_input(&self.peer_id, self.timestamp_utc);
+        verify_signature(&peer_pub, &expected_input, &sig_bytes)
+            .map_err(|_| PresenceError::InvalidSignature)?;
         Ok(peer_pub)
     }
+}
+
+const DIRECTORY_SIG_DOMAIN: &[u8] = b"NOVA_DIRECTORY_PROFILE_V1";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryProfile {
+    pub peer_id: String,
+    pub username: String,
+    pub display_name: String,
+    pub avatar_data_url: Option<String>,
+    pub prekey_bundle_hex: String,
+}
+
+fn directory_signing_input(profile: &DirectoryProfile, timestamp_utc: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(DIRECTORY_SIG_DOMAIN);
+    buf.extend_from_slice(profile.peer_id.as_bytes());
+    buf.extend_from_slice(profile.username.as_bytes());
+    buf.extend_from_slice(profile.display_name.as_bytes());
+    buf.extend_from_slice(profile.avatar_data_url.as_deref().unwrap_or("").as_bytes());
+    buf.extend_from_slice(profile.prekey_bundle_hex.as_bytes());
+    buf.extend_from_slice(&timestamp_utc.to_be_bytes());
+    buf
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedDirectoryEntry {
+    pub profile: DirectoryProfile,
+    pub timestamp_utc: u64,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+impl SignedDirectoryEntry {
+    pub fn sign(identity: &DeviceIdentity, profile: DirectoryProfile, timestamp_utc: u64) -> Self {
+        let signature = identity.sign(&directory_signing_input(&profile, timestamp_utc)).to_vec();
+        Self {
+            profile,
+            timestamp_utc,
+            signature,
+        }
+    }
+
+    pub fn verify(&self) -> Result<[u8; 32], PresenceError> {
+        let peer_pub: [u8; 32] = hex::decode(&self.profile.peer_id)
+            .map_err(|_| PresenceError::InvalidPeerId)?
+            .try_into()
+            .map_err(|_| PresenceError::InvalidPeerId)?;
+
+        let sig_bytes: [u8; 64] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| PresenceError::InvalidSignature)?;
+
+        let expected_input = directory_signing_input(&self.profile, self.timestamp_utc);
+        verify_signature(&peer_pub, &expected_input, &sig_bytes)
+            .map_err(|_| PresenceError::InvalidSignature)?;
+        Ok(peer_pub)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectorySearchResult {
+    pub peer_id: String,
+    pub username: String,
+    pub display_name: String,
+    pub avatar_data_url: Option<String>,
+    pub prekey_bundle_hex: String,
+    pub is_online: bool,
+    pub last_seen_utc: u64,
 }
 
 impl SignedPresenceRegistration {

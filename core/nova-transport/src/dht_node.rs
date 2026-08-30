@@ -16,13 +16,16 @@
 //! Kademlia discovery + mDNS (LAN) + a direct QUIC connection (via libp2p's own QUIC transport,
 //! which — unlike the previous hand-rolled transport — ties the QUIC-layer TLS certificate to
 //! the node's real libp2p identity, so the transport handshake is cryptographically meaningful
-//! rather than skipped) is the happy path. For peers that cannot establish a direct connection
-//! (the common case on carrier-grade/symmetric mobile NAT — see the crate's original design
-//! notes on Ouagadougou/Bobo-Dioulasso connectivity), every node also runs circuit-relay-v2 +
-//! DCUtR: any reachable peer can act as a relay for another (opt-in, resource-limited by
-//! `relay::Config`'s defaults), and once a relayed connection exists, DCUtR automatically
-//! attempts to upgrade it to a direct one via coordinated hole-punching. The relay only ever
-//! forwards opaque bytes — it is not a trusted party, exactly like the discovery DHT above it.
+//! rather than skipped) is the happy path for peers on the same LAN. For a peer reached only
+//! through wide-area/DHT discovery, a direct dial is *never* attempted at all — see
+//! [`validate_outbound_dial`] — every such connection goes through circuit-relay-v2 instead: any
+//! reachable peer can act as a relay for another (opt-in, resource-limited by `relay::Config`'s
+//! defaults). This is the project's IP-hiding property (a contact never learns this device's
+//! real IP unless they're already on the same LAN as it): DCUtR — libp2p's automatic
+//! relayed-to-direct hole-punching upgrade — is deliberately NOT wired into this node's
+//! `NovaBehaviour`, since a successful hole-punch would silently defeat that property the moment
+//! it completed. The relay only ever forwards opaque bytes — it is not a trusted party, exactly
+//! like the discovery DHT above it.
 
 use crate::error::TransportError;
 use crate::udp_fallback::UdpFallbackClient;
@@ -32,14 +35,11 @@ use libp2p::core::multiaddr::Protocol;
 use libp2p::kad::store::MemoryStore;
 use libp2p::request_response::{OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{
-    dcutr, identify, identity, kad, mdns, relay, request_response, Multiaddr, PeerId, StreamProtocol, Swarm,
-};
+use libp2p::{identify, identity, kad, mdns, relay, request_response, Multiaddr, PeerId, StreamProtocol, Swarm};
 use nova_crypto::DeviceIdentity;
 use nova_protocol::SignedDhtPeerRecord;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -89,10 +89,10 @@ struct NovaBehaviour {
     messaging: request_response::cbor::Behaviour<NovaMessageRequest, DeliveryOutcome>,
     /// Lets this node act as a relay for other peers who can't reach each other directly.
     relay: relay::Behaviour,
-    /// Lets this node reserve a slot on (and dial through) another peer's relay.
+    /// Lets this node reserve a slot on (and dial through) another peer's relay. Deliberately
+    /// paired with no `dcutr::Behaviour` — see this module's doc comment on why an automatic
+    /// relayed-to-direct upgrade is not wanted here.
     relay_client: relay::client::Behaviour,
-    /// Attempts to upgrade an established relayed connection to a direct one via hole-punching.
-    dcutr: dcutr::Behaviour,
 }
 
 /// A resolved peer: their libp2p identity plus the addresses their signed DHT record claims to
@@ -147,6 +147,8 @@ enum Command {
         addrs: Vec<Multiaddr>,
         respond: oneshot::Sender<Result<(), TransportError>>,
     },
+    /// Dynamically updates or clears the fallback discovery/relay server client.
+    SetFallback(Option<Arc<UdpFallbackClient>>),
 }
 
 pub struct P2PNode {
@@ -155,22 +157,10 @@ pub struct P2PNode {
     listen_addrs: Vec<Multiaddr>,
     command_tx: mpsc::UnboundedSender<Command>,
     incoming_rx: Mutex<mpsc::UnboundedReceiver<IncomingMessage>>,
-    /// The sending half feeding `incoming_rx` — kept as a field (in addition to being moved into
-    /// `run_swarm_task` and cloned into the onion bridge at construction time) so
-    /// [`Self::ensure_onion_service_started`] can bridge the onion listener's own channel into it
-    /// later too, from [`Self::configure_tor`], not only at `start()` time.
-    incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
     pub supervisor: Arc<TransportSupervisor>,
-    pub tor_manager: Arc<tokio::sync::RwLock<crate::tor::TorManager>>,
-    /// Guards [`Self::ensure_onion_service_started`] against launching the onion service twice —
-    /// once true (via `swap`), it stays true for the node's lifetime; the service itself is never
-    /// torn down once started (see that method's doc comment for why).
-    onion_service_started: AtomicBool,
-    /// Secondary delivery path for when the DHT + relay-circuit path above cannot reach a peer
-    /// at all — see `crate::udp_fallback`'s module docs. `None` unless `NOVA_UDP_FALLBACK_ADDR`
-    /// is set: this path depends on a specific well-known `nova-server` instance being
-    /// configured, unlike the DHT path which needs no central service at all.
-    udp_fallback: Option<Arc<UdpFallbackClient>>,
+    /// Secondary delivery and discovery path for when the DHT + relay-circuit path above cannot reach a peer
+    /// at all — see `crate::udp_fallback`'s module docs.
+    udp_fallback: Arc<tokio::sync::RwLock<Option<Arc<UdpFallbackClient>>>>,
 }
 
 /// Where an [`IncomingMessage`] arrived from — determines whether [`IncomingMessage::respond`]
@@ -185,9 +175,6 @@ enum IncomingSource {
     /// Pulled from `nova-server`'s blind relay via [`crate::udp_fallback::UdpFallbackClient::drain_incoming`]
     /// — store-and-forward, not a live round-trip, so there is no sender waiting for an outcome.
     UdpFallback,
-    /// A live connection over `crate::onion_channel`'s embedded onion service: the sender's
-    /// `send_via_onion` call is holding the Tor stream open, waiting on this outcome.
-    OnionDirect(crate::onion_channel::OnionIncoming),
 }
 
 /// One raw wire packet received from a peer, still awaiting an application-level verdict from
@@ -210,7 +197,6 @@ impl IncomingMessage {
                 let _ = command_tx.send(Command::RespondIncoming { channel, outcome });
             }
             IncomingSource::UdpFallback => {}
-            IncomingSource::OnionDirect(onion_incoming) => onion_incoming.respond(outcome),
         }
     }
 }
@@ -249,7 +235,6 @@ impl P2PNode {
                     request_response::Config::default(),
                 );
                 let relay = relay::Behaviour::new(peer_id, relay::Config::default());
-                let dcutr = dcutr::Behaviour::new(peer_id);
                 Ok(NovaBehaviour {
                     kademlia,
                     mdns,
@@ -257,7 +242,6 @@ impl P2PNode {
                     messaging,
                     relay,
                     relay_client,
-                    dcutr,
                 })
             })
             .map_err(|e| TransportError::Setup(e.to_string()))?
@@ -406,42 +390,31 @@ impl P2PNode {
             return Err(TransportError::Setup("failed to resolve any listen address".into()));
         }
 
-        let own_onion_addr = nova_crypto::derive_onion_v3_address(&identity.verifying_key_bytes);
-        let mut initial_tor_config = crate::tor::TorConfig::default();
-        initial_tor_config.onion_address = Some(own_onion_addr);
-        // Where the embedded Tor client keeps its consensus cache, guard state, and onion-service
-        // keystore — a real, persistent directory is expected (set via `NOVA_TOR_STATE_DIR`, the
-        // same pattern as `NOVA_BOOTSTRAP_ADDR`/`NOVA_LISTEN_ADDR`/`NOVA_ONION_LISTEN_ADDR`), since
-        // rebuilding it from scratch means a fresh, slow Tor bootstrap on every launch. Falls back
-        // to a fixed subdirectory of the OS temp dir (fine for tests and ad-hoc runs, but not
-        // meant for a real install — `ui/src-tauri` sets this to a real app-data subdirectory).
-        let tor_state_dir = std::env::var("NOVA_TOR_STATE_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join("nova_tor_state"));
-        let tor_manager = Arc::new(tokio::sync::RwLock::new(crate::tor::TorManager::new(
-            initial_tor_config.clone(),
-            identity.signing_key_bytes,
-            tor_state_dir,
-        )));
-
-        // Opt-in secondary delivery path (see `crate::udp_fallback`) for networks where this
-        // node cannot reach the DHT/relay-circuit path at all yet — set by whoever operates a
-        // `nova-server` instance this deployment should fall back to, the same way
-        // `NOVA_BOOTSTRAP_ADDR` names a DHT bootstrap peer. Must be a full `ws://`/`wss://` URL
-        // (e.g. `wss://nova-discovery.onrender.com`) now that the fallback server speaks
-        // WebSocket rather than raw UDP — see `udp_fallback.rs`'s module doc comment for why.
-        let udp_fallback = std::env::var("NOVA_UDP_FALLBACK_ADDR")
-            .ok()
-            .and_then(|s| {
-                let parsed = url::Url::parse(&s).ok()?;
-                (parsed.scheme() == "ws" || parsed.scheme() == "wss").then_some(s)
-            })
-            .map(|url| Arc::new(UdpFallbackClient::new(url)));
-        if udp_fallback.is_none() {
-            if let Ok(raw) = std::env::var("NOVA_UDP_FALLBACK_ADDR") {
-                warn!("NOVA_UDP_FALLBACK_ADDR={raw} is not a valid ws:// or wss:// URL (expected e.g. wss://nova-discovery.onrender.com) — fallback relay disabled");
+        // Secondary delivery path (see `crate::udp_fallback`) for networks where this node
+        // cannot reach the DHT/relay-circuit path at all yet. Defaults to the project's own
+        // `nova-server` instance (a WebSocket-based presence registry + blind relay, deployed
+        // free-tier on Render — see `server/`) so every device works out of the box with no
+        // per-device setup, exactly like a browser ships with default STUN/bootstrap servers
+        // rather than requiring the user to find and paste one in. `NOVA_UDP_FALLBACK_ADDR`
+        // overrides this — set it to a self-hosted `nova-server` URL (`ws://`/`wss://`), or to
+        // the literal string `none` to disable this path entirely (e.g. for someone who trusts
+        // no third party with even reflexive-IP/relay metadata and would rather rely solely on
+        // direct DHT/mDNS discovery).
+        const DEFAULT_FALLBACK_SERVER_URL: &str = "wss://nova-discovery.onrender.com";
+        let fallback_env = std::env::var("NOVA_UDP_FALLBACK_ADDR").ok();
+        let udp_fallback_client = if fallback_env.as_deref() == Some("none") {
+            None
+        } else {
+            let url = fallback_env.unwrap_or_else(|| DEFAULT_FALLBACK_SERVER_URL.to_string());
+            match url::Url::parse(&url) {
+                Ok(parsed) if parsed.scheme() == "ws" || parsed.scheme() == "wss" => Some(Arc::new(UdpFallbackClient::new(url))),
+                _ => {
+                    warn!("NOVA_UDP_FALLBACK_ADDR={url} is not a valid ws:// or wss:// URL (expected e.g. wss://nova-discovery.onrender.com, or \"none\" to disable) — fallback relay disabled");
+                    None
+                }
             }
-        }
+        };
+        let udp_fallback = Arc::new(tokio::sync::RwLock::new(udp_fallback_client.clone()));
 
         let node = Arc::new(Self {
             own_peer_id,
@@ -449,31 +422,16 @@ impl P2PNode {
             listen_addrs: resolved_listen_addrs,
             command_tx,
             incoming_rx: Mutex::new(incoming_rx),
-            incoming_tx: incoming_tx.clone(),
             supervisor,
-            tor_manager: tor_manager.clone(),
-            onion_service_started: AtomicBool::new(false),
             udp_fallback: udp_fallback.clone(),
         });
-
-        // Onion service (see `crate::onion_channel`) — the receiving half of the Tor fallback
-        // path, hosted in-process under this device's real identity key (see `crate::tor`'s doc
-        // comment) so its `.onion` address matches `own_onion_addr` above exactly. Only launched
-        // when Tor is enabled in the device's saved settings: bootstrapping a real Tor circuit
-        // and publishing a hidden-service descriptor has real bandwidth/CPU/battery cost, which a
-        // user who never opted into Tor shouldn't pay on every launch. `configure_tor` calls
-        // `ensure_onion_service_started` too, so enabling Tor later (without restarting) also
-        // starts receiving over it, not just sending.
-        if initial_tor_config.enabled {
-            node.ensure_onion_service_started();
-        }
 
         // `identity` moves into the background task by value rather than being cloned: it holds
         // zeroized private key material and deliberately does not implement `Clone`. Only the
         // task itself needs it, for signing DHT presence records — the public `P2PNode` handle
         // only ever needs the already-derived, non-secret `own_peer_id`.
         let command_tx_for_task = node.command_tx.clone();
-        tokio::spawn(run_swarm_task(swarm, identity, local_peer_id, command_rx, command_tx_for_task, incoming_tx, udp_fallback, tor_manager));
+        tokio::spawn(run_swarm_task(swarm, identity, local_peer_id, command_rx, command_tx_for_task, incoming_tx, udp_fallback_client));
 
         Ok(node)
     }
@@ -482,77 +440,47 @@ impl P2PNode {
         &self.own_peer_id
     }
 
-    /// Returns the deterministic Tor Onion v3 address associated with this node's identity.
-    pub async fn own_onion_address(&self) -> String {
-        let mgr = self.tor_manager.read().await;
-        mgr.config().onion_address.clone().unwrap_or_default()
-    }
-
-    /// Returns the live status of the Tor subsystem.
-    pub async fn get_tor_status(&self) -> crate::tor::TorStatus {
-        let mgr = self.tor_manager.read().await;
-        let (connected, bootstrap_percent) = mgr.bootstrap_status().await;
-        let cfg = mgr.config();
-        crate::tor::TorStatus {
-            enabled: cfg.enabled,
-            connected,
-            bootstrap_percent,
-            onion_address: cfg.onion_address.clone().unwrap_or_default(),
-            socks_proxy: cfg.socks_proxy.clone(),
-            mode: cfg.mode,
-            bridge_type: cfg.bridge_type.clone(),
-        }
-    }
-
-    /// Reconfigures Tor operating mode, SOCKS proxy endpoint, and bridges. If this turns Tor on
-    /// for the first time (it was off, or never started, when this node was constructed), also
-    /// starts the onion-service receiving side right now — see
-    /// [`Self::ensure_onion_service_started`] — so enabling Tor from Settings makes this device
-    /// reachable via `.onion` immediately, with no app restart required.
-    pub async fn configure_tor(&self, config: crate::tor::TorConfig) {
-        let enabled = config.enabled;
-        {
-            let mut mgr = self.tor_manager.write().await;
-            mgr.update_config(config);
-        }
-        if enabled {
-            self.ensure_onion_service_started();
-        }
-    }
-
-    /// Launches the onion-service receiving side (see
-    /// [`crate::onion_channel::spawn_onion_service`]) exactly once for this node's lifetime — a
-    /// second or later call is a cheap no-op, guarded by `onion_service_started`. Once started,
-    /// the service is never torn down again even if Tor is later disabled in settings: turning it
-    /// off only stops new *outbound* dials from using Tor (`connect_onion_stream` isn't called);
-    /// leaving an already-launched onion service listening costs nothing extra worth the
-    /// complexity of tearing down and re-launching it, and a peer with this device's onion
-    /// address on file should still be able to reach it — being *listed* under `TorStrict`/
-    /// `Hybrid` mode is a sending-side policy, not a promise that this device stops receiving.
-    ///
-    /// Called both from `start()` (if Tor was already enabled when the node was constructed) and
-    /// from `configure_tor()` (if the user enables Tor afterward, without restarting) — the two
-    /// only ways `enabled` can ever become true.
-    fn ensure_onion_service_started(&self) {
-        if self.onion_service_started.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let (onion_incoming_tx, mut onion_incoming_rx) = mpsc::unbounded_channel::<crate::onion_channel::OnionIncoming>();
-        crate::onion_channel::spawn_onion_service(self.tor_manager.clone(), onion_incoming_tx);
-        // Bridges the onion listener's own channel into the unified `incoming_tx` stream
-        // `nova-engine::attach_network` reads from, so it has exactly one receive loop to run
-        // regardless of which of the three paths (libp2p, UDP fallback, onion) a packet arrived
-        // on — see `IncomingSource::OnionDirect`.
-        let incoming_tx_for_onion_bridge = self.incoming_tx.clone();
-        tokio::spawn(async move {
-            while let Some(onion_incoming) = onion_incoming_rx.recv().await {
-                let bytes = onion_incoming.bytes.clone();
-                let msg = IncomingMessage { bytes, source: IncomingSource::OnionDirect(onion_incoming) };
-                if incoming_tx_for_onion_bridge.send(msg).is_err() {
-                    break;
+    /// Dynamically sets or clears the fallback server URL (e.g. from the UI Settings).
+    pub async fn set_fallback_server_url(&self, url: Option<String>) {
+        let client = url.and_then(|u| {
+            let trimmed = u.trim().to_string();
+            if trimmed.is_empty() || trimmed == "none" {
+                return None;
+            }
+            match url::Url::parse(&trimmed) {
+                Ok(parsed) if parsed.scheme() == "ws" || parsed.scheme() == "wss" => {
+                    Some(Arc::new(UdpFallbackClient::new(trimmed)))
                 }
+                _ => None,
             }
         });
+        *self.udp_fallback.write().await = client.clone();
+        let _ = self.command_tx.send(Command::SetFallback(client));
+    }
+
+    /// Returns the currently active fallback server URL, if any.
+    pub async fn get_fallback_server_url(&self) -> Option<String> {
+        self.udp_fallback.read().await.as_ref().map(|c| c.server_url().to_string())
+    }
+
+    /// Publishes this device's public directory profile and PreKey bundle to the fallback server.
+    pub async fn register_directory_entry(&self, entry: nova_protocol::SignedDirectoryEntry) -> Result<(), TransportError> {
+        let fallback = self.udp_fallback.read().await.clone();
+        if let Some(client) = fallback {
+            client.register_directory_signed(entry).await
+        } else {
+            Err(TransportError::Setup("no fallback server configured".into()))
+        }
+    }
+
+    /// Searches the fallback directory for matching users by query (peer_id prefix, username, display name).
+    pub async fn search_directory(&self, query: &str) -> Result<Vec<nova_protocol::DirectorySearchResult>, TransportError> {
+        let fallback = self.udp_fallback.read().await.clone();
+        if let Some(client) = fallback {
+            client.search_directory(query).await
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// This node's primary actual (OS-resolved) listen multiaddr, e.g. for out-of-band bootstrap
@@ -602,10 +530,7 @@ impl P2PNode {
     /// both sides' Kademlia routing tables automatically, after which normal DHT discovery works
     /// between them.
     pub async fn bootstrap_dial(&self, addr: Multiaddr) -> Result<(), TransportError> {
-        {
-            let mgr = self.tor_manager.read().await;
-            mgr.validate_outbound_dial(&addr.to_string())?;
-        }
+        crate::dial_policy::validate_outbound_dial(&addr)?;
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(Command::DialAddr { addr, respond: tx })
@@ -670,6 +595,40 @@ impl P2PNode {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
+
+        // If DHT lookup didn't find the peer, check the fallback discovery server (e.g. Render)
+        let fallback = self.udp_fallback.read().await.clone();
+        if let Some(client) = fallback {
+            match client.lookup(nova_peer_id).await {
+                Ok(Some(endpoint)) => {
+                    if let Ok(pub_bytes) = hex::decode(nova_peer_id) {
+                        if let Ok(ed_pub) = libp2p::identity::ed25519::PublicKey::try_from_bytes(&pub_bytes) {
+                            let libp2p_peer_id = libp2p::identity::PublicKey::from(ed_pub).to_peer_id();
+                            let mut addrs = Vec::new();
+                            if let (Some(local_ip), Some(local_port)) = (&endpoint.local_ip, endpoint.local_port) {
+                                if let Ok(addr) = format!("/ip4/{local_ip}/udp/{local_port}/quic-v1").parse::<Multiaddr>() {
+                                    addrs.push(addr);
+                                }
+                            }
+                            if endpoint.public_port != 0 && !endpoint.public_ip.is_empty() && endpoint.public_ip != "0.0.0.0" {
+                                if let Ok(addr) = format!("/ip4/{}/udp/{}/quic-v1", endpoint.public_ip, endpoint.public_port).parse::<Multiaddr>() {
+                                    addrs.push(addr);
+                                }
+                            }
+                            if !addrs.is_empty() {
+                                debug!("Resolved peer {nova_peer_id} via fallback discovery server");
+                                return Ok(Some((libp2p_peer_id, addrs)));
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    debug!("Fallback lookup for {nova_peer_id} failed: {e}");
+                }
+            }
+        }
+
         last_result
     }
 
@@ -688,17 +647,14 @@ impl P2PNode {
     }
 
     async fn dial(&self, peer_id: PeerId, addrs: Vec<Multiaddr>) -> Result<(), TransportError> {
-        let filtered_addrs: Vec<Multiaddr> = {
-            let mgr = self.tor_manager.read().await;
-            addrs
-                .into_iter()
-                .filter(|addr| mgr.validate_outbound_dial(&addr.to_string()).is_ok())
-                .collect()
-        };
+        let filtered_addrs: Vec<Multiaddr> = addrs
+            .into_iter()
+            .filter(|addr| crate::dial_policy::validate_outbound_dial(addr).is_ok())
+            .collect();
 
         if filtered_addrs.is_empty() {
             return Err(TransportError::Setup(
-                "no dialable addresses permitted under current Tor privacy policy".into(),
+                "no dialable addresses permitted under the LAN/relay-only dial policy".into(),
             ));
         }
 
@@ -802,7 +758,7 @@ impl P2PNode {
             }
         };
         let Some((peer_id, addrs)) = found else {
-            self.spawn_udp_fallback_send_chunks(nova_peer_id, chunks);
+            self.spawn_udp_fallback_send_chunks(nova_peer_id, chunks).await;
             return Ok((P2PTransportMode::Disconnected, DeliveryOutcome::Rejected));
         };
         let mode = connection_mode_for(&addrs);
@@ -811,7 +767,7 @@ impl P2PNode {
             .await
             .is_err()
         {
-            self.spawn_udp_fallback_send_chunks(nova_peer_id, chunks);
+            self.spawn_udp_fallback_send_chunks(nova_peer_id, chunks).await;
             return Ok((P2PTransportMode::Disconnected, DeliveryOutcome::Rejected));
         }
 
@@ -844,22 +800,6 @@ impl P2PNode {
         Ok((mode, last_outcome))
     }
 
-    /// Sends `bytes` to a peer via their `.onion` address through a real, in-process Tor circuit
-    /// (see `crate::onion_channel`), bypassing the DHT/QUIC path entirely. The caller (`nova-
-    /// engine`, which knows a contact's onion address from their `PreKeyBundle`) decides when to
-    /// use this — as a fallback once `send_to_peer` reports `Disconnected`, or exclusively in
-    /// `TorStrict` mode. `port` should be the recipient's onion-service port, conventionally
-    /// `crate::onion_channel::DEFAULT_ONION_CHANNEL_PORT`.
-    pub async fn send_via_onion(
-        &self,
-        onion_address: &str,
-        port: u16,
-        bytes: Vec<u8>,
-    ) -> Result<DeliveryOutcome, TransportError> {
-        let mgr = self.tor_manager.read().await;
-        crate::onion_channel::send_via_onion(&mgr, onion_address, port, bytes).await
-    }
-
     /// Waits for the next raw packet received from any peer over a direct connection. Returns
     /// `None` only if the node's background task has stopped. The caller MUST call
     /// [`IncomingMessage::respond`] on the result exactly once, or the sender's `send_to_peer`
@@ -877,8 +817,9 @@ impl P2PNode {
     /// this must never add latency to a call that has already decided the primary path failed,
     /// and a slow/unreachable fallback server must not block it either. A no-op if no fallback
     /// server is configured.
-    fn spawn_udp_fallback_send_chunks(&self, nova_peer_id: &str, chunks: Vec<Vec<u8>>) {
-        let Some(fallback) = self.udp_fallback.clone() else { return };
+    async fn spawn_udp_fallback_send_chunks(&self, nova_peer_id: &str, chunks: Vec<Vec<u8>>) {
+        let fallback = self.udp_fallback.read().await.clone();
+        let Some(fallback) = fallback else { return };
         let nova_peer_id = nova_peer_id.to_string();
         tokio::spawn(async move {
             for chunk in chunks {
@@ -948,8 +889,7 @@ async fn run_swarm_task(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     command_tx: mpsc::UnboundedSender<Command>,
     incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
-    udp_fallback: Option<Arc<UdpFallbackClient>>,
-    tor_manager: Arc<tokio::sync::RwLock<crate::tor::TorManager>>,
+    mut udp_fallback: Option<Arc<UdpFallbackClient>>,
 ) {
     let mut pending_lookups: PendingLookups = HashMap::new();
     let mut pending_dials: HashMap<PeerId, Vec<oneshot::Sender<Result<(), TransportError>>>> = HashMap::new();
@@ -964,7 +904,7 @@ async fn run_swarm_task(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if let Err(e) = do_announce(&mut swarm, &identity, local_peer_id) {
+                if let Err(e) = do_announce(&mut swarm, &identity, local_peer_id, &udp_fallback) {
                     warn!("Presence heartbeat failed: {e}");
                 }
             }
@@ -991,7 +931,7 @@ async fn run_swarm_task(
                 let Some(cmd) = maybe_cmd else { break };
                 match cmd {
                     Command::Announce(respond) => {
-                        let _ = respond.send(do_announce(&mut swarm, &identity, local_peer_id));
+                        let _ = respond.send(do_announce(&mut swarm, &identity, local_peer_id, &udp_fallback));
                     }
                     Command::Lookup { nova_peer_id, respond } => {
                         let key_bytes = match hex::decode(&nova_peer_id) {
@@ -1007,17 +947,18 @@ async fn run_swarm_task(
                     Command::Dial { peer_id, addrs, respond } => {
                         // Hard gate, not just the advisory pre-filter `P2PNode::dial` already
                         // applies before ever sending this command: this is the actual point
-                        // `swarm.dial` gets called, so it is the one place a TorStrict violation
-                        // cannot slip through regardless of which caller constructed this
+                        // `swarm.dial` gets called, so it is the one place the LAN/relay-only
+                        // policy cannot slip through regardless of which caller constructed this
                         // command. See the 2026-08-22 audit's "TorStrict mode is not actually
-                        // enforced" finding — the pre-filter alone was exactly that weakness.
-                        let addrs: Vec<Multiaddr> = {
-                            let mgr = tor_manager.read().await;
-                            addrs.into_iter().filter(|a| mgr.validate_outbound_dial(&a.to_string()).is_ok()).collect()
-                        };
+                        // enforced" finding — the pre-filter alone was exactly that weakness, and
+                        // the same reasoning applies to this policy's unconditional replacement.
+                        let addrs: Vec<Multiaddr> = addrs
+                            .into_iter()
+                            .filter(|a| crate::dial_policy::validate_outbound_dial(a).is_ok())
+                            .collect();
                         if addrs.is_empty() {
                             let _ = respond.send(Err(TransportError::Setup(
-                                "no dialable addresses permitted under the current Tor privacy policy".into(),
+                                "no dialable addresses permitted under the LAN/relay-only dial policy".into(),
                             )));
                             continue;
                         }
@@ -1056,6 +997,14 @@ async fn run_swarm_task(
                         pending_requests.insert(request_id, respond);
                     }
                     Command::DialAddr { addr, respond } => {
+                        // Same hard gate as `Command::Dial` above, and for the same reason: the
+                        // advisory pre-filter `P2PNode::bootstrap_dial` already applies before
+                        // ever sending this command is not itself enforcement — this is the
+                        // actual `swarm.dial` call site.
+                        if let Err(e) = crate::dial_policy::validate_outbound_dial(&addr) {
+                            let _ = respond.send(Err(e));
+                            continue;
+                        }
                         let result = swarm.dial(addr).map_err(|e| TransportError::Dial(e.to_string()));
                         let _ = respond.send(result);
                     }
@@ -1075,6 +1024,9 @@ async fn run_swarm_task(
                     Command::RespondIncoming { channel, outcome } => {
                         let _ = swarm.behaviour_mut().messaging.send_response(channel, outcome);
                     }
+                    Command::SetFallback(new_fallback) => {
+                        udp_fallback = new_fallback;
+                    }
                 }
             }
             event = swarm.select_next_some() => {
@@ -1093,7 +1045,12 @@ async fn run_swarm_task(
     }
 }
 
-fn do_announce(swarm: &mut Swarm<NovaBehaviour>, identity: &DeviceIdentity, local_peer_id: PeerId) -> Result<(), TransportError> {
+fn do_announce(
+    swarm: &mut Swarm<NovaBehaviour>,
+    identity: &DeviceIdentity,
+    local_peer_id: PeerId,
+    udp_fallback: &Option<Arc<UdpFallbackClient>>,
+) -> Result<(), TransportError> {
     let mut addrs: Vec<String> = swarm
         .external_addresses()
         .chain(swarm.listeners())
@@ -1101,7 +1058,44 @@ fn do_announce(swarm: &mut Swarm<NovaBehaviour>, identity: &DeviceIdentity, loca
         .collect();
     addrs.sort();
     addrs.dedup();
-    publish_record(swarm, identity, local_peer_id, addrs)
+
+    let dht_result = publish_record(swarm, identity, local_peer_id, addrs);
+
+    // Announce to the fallback server (e.g. Render) if configured
+    if let Some(fallback) = udp_fallback.clone() {
+        let local_udp_port = swarm.listeners().find_map(|a| {
+            a.iter().find_map(|p| match p {
+                Protocol::Udp(port) => Some(port),
+                _ => None,
+            })
+        }).unwrap_or(0);
+
+        let local_ip = swarm.listeners().find_map(|a| {
+            a.iter().find_map(|p| match p {
+                Protocol::Ip4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+                _ => None,
+            })
+        });
+
+        let endpoint = nova_protocol::PeerEndpoint {
+            peer_id: identity.public_id_hex(),
+            public_ip: "0.0.0.0".to_string(), // Replaced by server with observed/proxy IP
+            public_port: local_udp_port,
+            local_ip,
+            local_port: Some(local_udp_port),
+        };
+
+        let registration = nova_protocol::SignedPresenceRegistration::sign(identity, endpoint, now_secs());
+        tokio::spawn(async move {
+            if let Err(e) = fallback.register_presence_signed(registration).await {
+                debug!("Fallback presence registration failed: {e}");
+            } else {
+                debug!("Fallback presence registration succeeded");
+            }
+        });
+    }
+
+    dht_result
 }
 
 fn publish_record(
@@ -1168,10 +1162,6 @@ fn handle_event(
         })) => {
             info!("Relay reservation accepted by {relay_peer_id}");
         }
-        SwarmEvent::Behaviour(NovaBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result })) => match result {
-            Ok(_) => info!("DCUtR upgraded {remote_peer_id} to a direct connection"),
-            Err(e) => debug!("DCUtR could not upgrade the connection to {remote_peer_id} to direct: {e}"),
-        },
         SwarmEvent::Behaviour(NovaBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
             for (peer_id, addr) in list {
                 debug!("mDNS discovered {peer_id} at {addr}");
@@ -1398,13 +1388,42 @@ mod tests {
         }
     }
 
-    /// Regression test for the 2026-08-22 audit's core "TorStrict does not actually enforce
-    /// anything" finding. Alice successfully resolves Bob's real direct QUIC address via the DHT
-    /// (proving the lookup path works), then enables TorStrict — the dial itself must still be
-    /// refused, because the enforcement now lives at the actual `swarm.dial` call site in
-    /// `run_swarm_task`, not just an advisory pre-filter a caller could bypass.
+    /// Regression test for the 2026-08-22 audit's core "an advisory pre-filter alone is not
+    /// enforcement" finding, adapted for the LAN/relay-only dial policy that replaced Tor (see
+    /// `crate::dial_policy`): a WAN address must be refused at the actual `swarm.dial` call site
+    /// inside `run_swarm_task`'s `Command::Dial` handler — not merely by a caller-side check that
+    /// a differently-written caller could skip. Calls the crate-private `dial()` directly (this
+    /// test lives in the same module) with a fabricated public multiaddr for a `PeerId` that
+    /// doesn't need to correspond to a real peer: the policy block happens purely from inspecting
+    /// the address, before any real network I/O is attempted, so nothing needs to actually be
+    /// listening there for this to prove the block fires at the swarm level.
     #[tokio::test]
-    async fn test_tor_strict_mode_blocks_direct_dial_at_the_swarm_level() {
+    async fn test_wan_direct_dial_is_blocked_at_the_swarm_level() {
+        let alice_id = identity("alice");
+        let alice = P2PNode::start(alice_id, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
+
+        let fake_peer_id = PeerId::random();
+        let wan_addr: Multiaddr = "/ip4/203.0.113.9/udp/4001/quic-v1".parse().unwrap();
+
+        let err = alice.dial(fake_peer_id, vec![wan_addr]).await.unwrap_err();
+        match err {
+            // `dial()` filters the address list through `dial_policy::validate_outbound_dial`
+            // and, finding it empty, returns its own generic message rather than propagating the
+            // per-address rejection reason — see `dial_policy`'s own unit tests for coverage of
+            // that underlying per-address message.
+            TransportError::Setup(msg) => assert!(
+                msg.contains("dial policy"),
+                "expected the LAN/relay-only dial policy rejection, got: {msg}"
+            ),
+            other => panic!("expected TransportError::Setup from the dial policy, got: {other:?}"),
+        }
+    }
+
+    /// The same policy must permit a same-LAN (here: loopback, standing in for any private/LAN
+    /// address) direct dial — there is no privacy benefit to routing local traffic through a
+    /// remote relay, and blocking it would break the documented "same Wi-Fi, zero config" path.
+    #[tokio::test]
+    async fn test_lan_direct_dial_is_permitted_end_to_end() {
         let alice_id = identity("alice");
         let bob_id = identity("bob");
         let bob_peer_id = bob_id.public_id_hex();
@@ -1417,33 +1436,24 @@ mod tests {
         bob.announce_presence().await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // `enabled: false` is deliberate, not an oversight: `validate_outbound_dial` — the thing
-        // this test actually exercises, at the real `swarm.dial` call site — is driven purely by
-        // `mode`, never by `enabled` (see `TorManager::validate_outbound_dial`). `enabled: true`
-        // would additionally make `configure_tor` launch a real, in-process onion service (see
-        // `P2PNode::ensure_onion_service_started`), which tries to bootstrap a genuine Tor
-        // circuit over the real network — pointless network I/O this test doesn't need, and, on a
-        // host with no route to the Tor network (e.g. a sandboxed CI runner), a real multi-minute
-        // delay this test shouldn't be paying for just to prove a direct dial gets refused.
-        alice
-            .configure_tor(crate::tor::TorConfig {
-                enabled: false,
-                mode: crate::tor::TorMode::TorStrict,
-                socks_proxy: "127.0.0.1:9050".to_string(),
-                onion_address: None,
-                bridge_type: None,
-            })
-            .await;
+        // Bob must actively receive and respond, or Alice's `send_to_peer` below just times out
+        // waiting for the request/response round-trip — see `test_two_independent_nodes_discover_
+        // via_dht_and_exchange_bytes` above, which this mirrors.
+        let bob_recv = bob.clone();
+        let recv_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(10), bob_recv.recv_next())
+                .await
+                .expect("bob should receive the message before the timeout")
+                .expect("incoming channel should not be closed");
+            incoming.respond(DeliveryOutcome::Processed);
+        });
 
         let (mode, _) = alice
-            .send_to_peer(&bob_peer_id, b"should never leave loopback".to_vec())
+            .send_to_peer(&bob_peer_id, b"loopback is LAN, must go through".to_vec())
             .await
             .unwrap();
-        assert_eq!(
-            mode,
-            P2PTransportMode::Disconnected,
-            "TorStrict must refuse the direct dial even though Bob's real address was successfully resolved via the DHT"
-        );
+        assert_eq!(mode, P2PTransportMode::DirectQuic, "a loopback/LAN address must be dialed directly, not blocked");
+        recv_task.await.expect("bob's receive task must not panic");
     }
 
     /// Looking up a peer nobody has ever announced must resolve to "not found", not hang or

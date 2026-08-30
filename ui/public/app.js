@@ -110,12 +110,23 @@ const CLICK_ACTIONS = {
     confirmAndSendLocation: (el) => runPendingAction(el, confirmAndSendLocation),
     closeMediaPreviewModal: () => closeMediaPreviewModal(),
     confirmAndSendPendingMedia: (el) => runPendingAction(el, confirmAndSendPendingMedia),
+    trustActiveContact: (el) => runPendingAction(el, () => trustActiveContact(el.dataset.peerId)),
+    openBlockModal: (el) => openBlockModal(el.dataset.peerId, el.dataset.name),
+    closeBlockModal: () => closeBlockModal(),
+    confirmBlockOnly: (el) => runPendingAction(el, confirmBlockOnly),
+    confirmBlockAndDelete: (el) => runPendingAction(el, confirmBlockAndDelete),
     blockActiveContact: (el) => runPendingAction(el, blockActiveContact),
     unblockActiveContact: (el) => runPendingAction(el, () => unblockActiveContact(el.dataset.peerId)),
     deleteContact: (el) => runPendingAction(el, () => deleteContactReal(el.dataset.peerId, el.dataset.name)),
     addContact: (el) => runPendingAction(el, addContactReal),
     retryFailedMessage: (el) => runPendingAction(el, () => retryFailedMessageReal(el.dataset.msgId, el.dataset.convId, el.dataset.recipientId)),
     saveBootstrapAddr: (el) => runPendingAction(el, saveBootstrapAddr),
+    saveFallbackServerUrl: (el) => runPendingAction(el, saveFallbackServerUrl),
+    inspectDirectoryUser: (el) => inspectDirectoryUser(el.dataset.peerId),
+    closeInspectUserModal: () => closeInspectUserModal(),
+    addInspectedUser: (el) => runPendingAction(el, addInspectedUser),
+    addDirectUser: (el) => runPendingAction(el, () => addDirectUser(el.dataset.peerId, el.dataset.username, el.dataset.name, el.dataset.bundle)),
+    toggleManualInviteAccordion: () => toggleManualInviteAccordion(),
     openMnemonicAuthModal: () => openMnemonicAuthModal(),
     closeMnemonicAuthModal: () => closeMnemonicAuthModal(),
     confirmMnemonicPin: () => confirmMnemonicPin(),
@@ -126,8 +137,6 @@ const CLICK_ACTIONS = {
     saveQrImage: () => saveQrImage(),
     shareInvitation: () => shareInvitation(),
     copyOwnBundle: () => copyOwnBundle(),
-    copyOnionAddress: (el) => copyOnionAddressReal(el),
-    saveTorConfig: (el) => runPendingAction(el, saveTorConfigReal),
     openQrCameraScanner: () => openQrCameraScanner(),
     closeQrCameraScanner: () => closeQrCameraScanner(),
     openImagePreview: (el) => openImagePreviewEl(el),
@@ -152,6 +161,8 @@ const ENTER_SUBMIT_MAP = {
     'mnemonic-auth-pin': () => confirmMnemonicPin(),
     'edit-display-name-input': () => saveProfileChanges(),
     'media-caption-input': () => confirmAndSendPendingMedia(),
+    'bootstrap-addr-input': () => saveBootstrapAddr(),
+    'fallback-server-url-input': () => saveFallbackServerUrl(),
 };
 document.addEventListener('keydown', (event) => {
     const handler = event.key === 'Enter' && ENTER_SUBMIT_MAP[event.target.id];
@@ -161,6 +172,7 @@ document.addEventListener('keydown', (event) => {
 const INPUT_HANDLERS = {
     'contacts-search-input': filterContactsList,
     'global-search-input': handleStrictSearch,
+    'contact-search-query': handleContactDirectorySearch,
 };
 document.addEventListener('input', (event) => {
     const handler = INPUT_HANDLERS[event.target.id];
@@ -237,20 +249,17 @@ const state = {
     // set_bootstrap_addr) — populated by refreshBootstrapAddr(), edited on the Settings screen.
     // '' means none configured (mDNS/LAN-only discovery).
     bootstrapAddr: '',
+    // Fallback discovery and relay server URL (e.g. wss://nova-discovery.onrender.com)
+    fallbackServerUrl: '',
+    // Search results from public directory query
+    directorySearchResults: [],
+    // User currently inspected in the directory modal
+    inspectedDirectoryUser: null,
     // This device's own dialable multiaddrs (see get_own_full_listen_addrs) — typically one IPv4
     // and, when available, one IPv6 — shown read-only on Settings so the operator can copy one to
     // other devices when this one plays the rendezvous role. [] until the network has started.
     ownFullListenAddrs: [],
     // Pure 1-to-1 Sovereign Conversations — populated only by real contact/message activity.
-    torSettings: {
-        enabled: false,
-        connected: false,
-        bootstrapPercent: 0,
-        onionAddress: '',
-        socksProxy: '127.0.0.1:9050',
-        mode: 'direct_only',
-        bridgeType: null,
-    },
     conversations: [],
     messages: [],
     contacts: [],
@@ -276,8 +285,9 @@ const screens = {
                 <div class="header-title">Aucune conversation</div>
                 <div style="width: 38px;"></div>
             </header>
-            <div style="padding: 40px 24px; text-align: center; color: var(--text-muted);">
-                <p style="font-size: 14px; line-height: 1.5;">Aucune conversation n'est ouverte. Ouvrez-en une depuis la liste des conversations ou ajoutez un contact.</p>
+            <div style="padding: 40px 24px; text-align: center; color: var(--text-muted); display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1;">
+                <img src="logo.png" alt="Logo" style="width: 100px; height: 100px; object-fit: contain; opacity: 0.22; filter: blur(1.5px) drop-shadow(0 0 20px rgba(139, 92, 246, 0.4)); margin-bottom: 20px;">
+                <p style="font-size: 14px; line-height: 1.5; max-width: 300px;">Aucune conversation n'est ouverte. Ouvrez-en une depuis la liste des conversations ou ajoutez un contact.</p>
                 <button class="btn-primary" style="margin-top: 20px;" data-action="navigate" data-screen="conversations">Voir mes conversations</button>
             </div>
         </div>
@@ -286,18 +296,14 @@ const screens = {
     // 1. Écran de bienvenue
     onboarding: () => `
         <div class="screen-view" style="justify-content: space-between; padding: 40px 24px; text-align: center; background: radial-gradient(circle at 50% 30%, #171A24 0%, #080A10 70%);">
-            <div style="margin-top: 30px;">
-                <div class="rail-logo" style="width: 72px; height: 72px; margin: 0 auto 20px; box-shadow: 0 8px 30px var(--accent-purple-glow);">
-                    ${icons.shield}
-                </div>
+            <div style="margin-top: 24px;">
                 <div style="font-size: 13px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 2px; font-weight: 600;">Bienvenue</div>
-                <h1 style="font-size: 32px; font-weight: 800; color: white; margin: 8px 0 12px; letter-spacing: -0.5px;">NOVA Chat</h1>
-                <p style="font-size: 14px; color: var(--text-muted); line-height: 1.5; max-width: 300px; margin: 0 auto;">Discutez en privé : vos messages vont directement à votre contact, sans passer par un serveur qui pourrait les stocker ou les lire.</p>
+                <p style="font-size: 14px; color: var(--text-muted); line-height: 1.5; max-width: 300px; margin: 12px auto 0;">Discutez en privé : vos messages vont directement à votre contact, sans passer par un serveur qui pourrait les stocker ou les lire.</p>
             </div>
 
-            <div style="width: 210px; height: 210px; margin: 20px auto; border-radius: 50%; border: 1px dashed rgba(139, 92, 246, 0.4); display: flex; align-items: center; justify-content: center; position: relative;">
-                <div style="width: 150px; height: 150px; border-radius: 50%; background: radial-gradient(circle, rgba(139,92,246,0.25) 0%, transparent 70%);"></div>
-                <div style="position: absolute; font-size: 12px; color: var(--accent-purple-light); font-weight: 600; display: flex; align-items: center; gap: 6px;">
+            <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 20px auto;">
+                <img src="logo.png" alt="Logo" style="width: 128px; height: 128px; object-fit: contain; filter: drop-shadow(0 8px 30px rgba(139, 92, 246, 0.45)); margin-bottom: 18px;">
+                <div style="font-size: 12px; color: var(--accent-purple-light); font-weight: 600; display: flex; align-items: center; gap: 6px;">
                     <div class="p2p-badge-pulse"></div> Connexion directe et privée
                 </div>
             </div>
@@ -443,6 +449,25 @@ const screens = {
                 </div>
             </header>
 
+            ${!state.activeContact.isTrusted ? `
+                <div id="trust-contact-banner" style="background: rgba(245, 158, 11, 0.12); border-bottom: 1px solid rgba(245, 158, 11, 0.3); padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 10px; z-index: 10;">
+                    <div style="display: flex; align-items: center; gap: 8px; flex: 1;">
+                        <span style="font-size: 16px;">⚠️</span>
+                        <div style="font-size: 11px; color: #fbbf24; line-height: 1.3;">
+                            Faites-vous confiance à <strong>${escapeHtml(state.activeContact.name)}</strong> ?
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 6px;">
+                        <button class="btn-secondary" style="font-size: 11px; padding: 5px 9px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.3);" data-action="openBlockModal" data-peer-id="${escapeHtml(state.activeContact.handle)}" data-name="${escapeHtml(state.activeContact.name)}">
+                            Bloquer...
+                        </button>
+                        <button class="btn-primary" style="font-size: 11px; padding: 5px 11px; background: #d97706; border-color: #f59e0b;" data-action="trustActiveContact" data-peer-id="${escapeHtml(state.activeContact.handle)}">
+                            ✓ Faire confiance
+                        </button>
+                    </div>
+                </div>
+            ` : ''}
+
             <div class="chat-body" id="chat-body">
                 <div style="text-align: center; margin: 10px 0;">
                     <span style="background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.2); border-radius: var(--radius-full); padding: 4px 12px; font-size: 11px; color: var(--accent-purple-light); display: inline-flex; align-items: center; gap: 6px;">
@@ -450,7 +475,13 @@ const screens = {
                     </span>
                 </div>
 
-                ${state.messages.filter(m => m.conversationId === state.activeContact.conversationId).map(m => buildMessageHtml(m)).join('')}
+                ${state.messages.filter(m => m.conversationId === state.activeContact.conversationId).length === 0 ? `
+                    <div class="empty-chat-placeholder" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 60%; margin: auto 0; text-align: center; pointer-events: none; user-select: none;">
+                        <img src="logo.png" alt="Logo" style="width: 120px; height: 120px; object-fit: contain; opacity: 0.18; filter: blur(2px) drop-shadow(0 0 24px rgba(139, 92, 246, 0.5)); margin-bottom: 18px;">
+                        <div style="font-size: 13px; color: var(--text-dim); font-weight: 500; opacity: 0.65;">Aucun message pour l'instant</div>
+                        <div style="font-size: 11px; color: var(--text-dim); opacity: 0.45; margin-top: 4px;">Envoyez un message pour démarrer la discussion</div>
+                    </div>
+                ` : state.messages.filter(m => m.conversationId === state.activeContact.conversationId).map(m => buildMessageHtml(m)).join('')}
             </div>
 
             <!-- Drawer for Multimedia Attachments -->
@@ -534,6 +565,34 @@ const screens = {
                     <!-- Send button -->
                     <button class="rec-send-btn" data-action="stopAndSendVoiceRecording" title="Envoyer la note vocale">
                         ${icons.send}
+                    </button>
+                </div>
+            </div>
+
+            <!-- Block & Delete Options Modal -->
+            <div class="location-modal-overlay" id="block-contact-modal">
+                <div class="location-modal-card" style="max-width: 360px; padding: 20px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;">
+                        <div style="font-size: 16px; font-weight: 700; color: white;" id="block-modal-title">
+                            Bloquer ce contact ?
+                        </div>
+                        <button class="icon-btn" data-action="closeBlockModal" style="width: 28px; height: 28px;">✕</button>
+                    </div>
+                    <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 18px;" id="block-modal-desc">
+                        Les futurs messages et appels de ce contact seront immédiatement rejetés. Vous pourrez le retrouver dans l'onglet Contacts pour le débloquer si nécessaire.
+                    </p>
+
+                    <div style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px;">
+                        <button class="btn-secondary" style="width: 100%; padding: 12px; font-size: 12px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.3); text-align: center;" data-action="confirmBlockOnly">
+                            🚫 Bloquer uniquement
+                        </button>
+                        <button class="btn-secondary" style="width: 100%; padding: 12px; font-size: 12px; color: var(--status-danger); background: rgba(239, 68, 68, 0.12); border-color: rgba(239, 68, 68, 0.4); text-align: center;" data-action="confirmBlockAndDelete">
+                            🗑️ Bloquer et supprimer la conversation
+                        </button>
+                    </div>
+
+                    <button class="btn-secondary" style="width: 100%; font-size: 12px; padding: 10px;" data-action="closeBlockModal">
+                        Annuler
                     </button>
                 </div>
             </div>
@@ -623,6 +682,11 @@ const screens = {
                     <div style="font-size: 13px; color: ${state.currentDiagnostics && state.currentDiagnostics.is_connected ? 'var(--status-success)' : 'var(--text-muted)'}; margin-top: 4px; display: flex; align-items: center; justify-content: center; gap: 6px;">
                         <span class="p2p-badge-pulse" style="width:8px;height:8px;"></span> ${contactConnectionStatusText()}
                     </div>
+                    <div style="margin-top: 6px;">
+                        <span style="font-size: 11px; padding: 3px 8px; border-radius: var(--radius-full); ${state.activeContact.isTrusted ? 'background: rgba(34, 197, 94, 0.15); color: var(--status-success);' : 'background: rgba(245, 158, 11, 0.15); color: #fbbf24;'}">
+                            ${state.activeContact.isTrusted ? '✓ Contact de confiance' : '⚠️ Non vérifié'}
+                        </span>
+                    </div>
                 </div>
 
                 <div style="display: flex; justify-content: space-around; margin-bottom: 24px;">
@@ -642,10 +706,14 @@ const screens = {
                     <p style="font-size: 11px; color: var(--text-dim); margin: 6px 0 0; line-height: 1.4;">Pour être totalement sûr(e) que personne ne s'est glissé dans votre conversation, comparez ce code avec ${escapeHtml(state.activeContact.name)} en personne ou par un autre moyen (téléphone, message).</p>
                 </div>
 
+                ${!state.activeContact.isTrusted && !state.activeContact.isBlocked ? `
+                    <button class="btn-primary" style="width: 100%; margin-bottom: 10px; background: #d97706; border-color: #f59e0b;" data-action="trustActiveContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}">✓ Faire confiance à ce contact</button>
+                ` : ''}
+
                 ${state.activeContact.isBlocked ? `
                     <button class="btn-primary" style="width: 100%; margin-bottom: 10px;" data-action="unblockActiveContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}">Débloquer ce contact</button>
                 ` : `
-                    <button class="btn-secondary" style="width: 100%; margin-bottom: 10px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="blockActiveContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}">Bloquer ce contact</button>
+                    <button class="btn-secondary" style="width: 100%; margin-bottom: 10px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="openBlockModal" data-peer-id="${escapeHtml(state.activeContact.peerId)}" data-name="${escapeHtml(state.activeContact.name)}">Bloquer ce contact...</button>
                 `}
                 <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="deleteContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}" data-name="${escapeHtml(state.activeContact.name)}">Supprimer ce contact</button>
             </div>
@@ -712,7 +780,7 @@ const screens = {
         </div>
     `,
 
-    // 7. Ajouter un contact
+    // 7. Ajouter un contact (Zero-Config 4G/5G/Wi-Fi + Recherche Instantanée)
     add_contact: () => `
         <div class="screen-view">
             <header class="app-header">
@@ -721,32 +789,63 @@ const screens = {
                 <div style="width: 38px;"></div>
             </header>
 
-            <div style="padding: 24px; overflow-y: auto; padding-bottom: 90px;">
-                <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 16px;">Il n'y a pas d'annuaire de contacts : demandez à la personne son code d'invitation (écran « Mon identité »), puis scannez-le en direct ou collez-le ci-dessous.</p>
-
-                <label style="font-size: 13px; color: var(--text-muted);">Comment voulez-vous l'appeler ?</label>
-                <div class="search-input-box" style="margin: 8px 0 16px;">
-                    <input type="text" id="add-display-name-input" placeholder="ex: Bob">
+            <div style="padding: 20px 16px; overflow-y: auto; padding-bottom: 90px;">
+                <!-- Main Zero-Config Search Bar -->
+                <div style="margin-bottom: 16px;">
+                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 6px;">Rechercher sur le réseau (4G / 5G / Wi-Fi)</div>
+                    <div class="search-input-box">
+                        ${icons.search}
+                        <input type="text" id="contact-search-query" placeholder="Entrez un identifiant (8f4b2...) ou @pseudo..." autofocus>
+                    </div>
                 </div>
 
-                <label style="font-size: 13px; color: var(--text-muted);">Lien sécurisé ou code (collé, scanné ou importé)</label>
-                <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; margin: 8px 0 12px; border: 1px solid var(--border-subtle);">
-                    <textarea id="add-bundle-input" placeholder="Collez ici le lien nova://invite... ou le code de votre contact" rows="3" style="width: 100%; background: none; border: none; color: white; font-size: 12px; font-family: monospace; resize: none; outline: none; word-break: break-all;"></textarea>
+                <!-- Dynamic Search Results -->
+                <div id="directory-search-results" style="margin-bottom: 24px;">
+                    <div style="text-align: center; color: var(--text-dim); padding: 30px 16px; font-size: 13px;">
+                        <div style="font-size: 28px; margin-bottom: 8px;">🔍</div>
+                        <div style="color: white; font-weight: 600; margin-bottom: 4px;">Recherche globale Zero-Config</div>
+                        <div>Tapez un identifiant (ex: 8f4b2...) ou un @pseudo pour trouver et ajouter un contact instantanément.</div>
+                    </div>
                 </div>
 
-                <button class="btn-secondary" style="width: 100%; margin-bottom: 16px; padding: 13px; font-size: 13px; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="openQrCameraScanner">
+                <!-- Manual fallback methods in collapsible accordion -->
+                <div style="border-top: 1px solid var(--border-subtle); padding-top: 16px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer; padding: 6px 0;" data-action="toggleManualInviteAccordion">
+                        <span style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Méthode manuelle (QR Code / Lien hors-ligne)</span>
+                        <span id="manual-invite-chevron" style="color: var(--text-muted); font-size: 12px;">▼</span>
+                    </div>
+                    <div id="manual-invite-body" style="display: none; margin-top: 14px;">
+                        <label style="font-size: 12px; color: var(--text-muted);">Nom du contact</label>
+                        <div class="search-input-box" style="margin: 6px 0 12px;">
+                            <input type="text" id="add-display-name-input" placeholder="ex: Bob">
+                        </div>
+                        <label style="font-size: 12px; color: var(--text-muted);">Lien sécurisé ou code d'invitation</label>
+                        <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 10px; margin: 6px 0 12px; border: 1px solid var(--border-subtle);">
+                            <textarea id="add-bundle-input" placeholder="Collez le lien nova://invite... ou le code brut" rows="2" style="width: 100%; background: none; border: none; color: white; font-size: 11px; font-family: monospace; resize: none; outline: none; word-break: break-all;"></textarea>
+                        </div>
+                        <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+                            <button class="btn-secondary" style="flex: 1; padding: 10px; font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 6px;" data-action="openQrCameraScanner">
+                                ${icons.qr}
+                                <span>Scanner QR</span>
+                            </button>
+                            <button class="btn-primary" style="flex: 1; padding: 10px; font-size: 12px;" data-action="addContact">Ajouter manuellement</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="height: 1px; background: var(--border-subtle); margin: 20px 0;"></div>
+
+                <button class="btn-secondary" style="width: 100%; padding: 12px; font-size: 13px;" data-action="navigate" data-screen="identity">
                     ${icons.qr}
-                    <span>Ouvrir l'appareil photo pour scanner</span>
+                    <span>Afficher mon propre identifiant et QR code</span>
                 </button>
+            </div>
 
-                <button class="btn-primary" data-action="addContact">Ajouter ce contact</button>
-
-                <div style="height: 1px; background: var(--border-subtle); margin: 24px 0;"></div>
-
-                <button class="btn-secondary" style="width: 100%; padding: 14px;" data-action="navigate" data-screen="identity">
-                    ${icons.qr}
-                    <span>Afficher mon propre code d'invitation</span>
-                </button>
+            <!-- Inspect Directory User Profile Modal -->
+            <div class="location-modal-overlay" id="inspect-user-modal">
+                <div class="location-modal-card" style="max-width: 360px;" id="inspect-user-card">
+                    <!-- Injected dynamically by inspectDirectoryUser() -->
+                </div>
             </div>
 
             <!-- Live Camera QR Scanner Modal Overlay -->
@@ -886,52 +985,6 @@ const screens = {
                     </div>
                 </div>
 
-                <!-- Tor Anonymous Routing & Onion Services -->
-                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">ROUTAGE ANONYME & TOR ONION</div>
-                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 18px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
-                        <div>
-                            <div style="font-size: 14px; font-weight: 600; color: white;">Activer le Routage Tor</div>
-                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Masque totalement votre adresse IP lors des échanges</div>
-                        </div>
-                        <input type="checkbox" id="tor-enabled-chk" ${state.torSettings.enabled ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 20px; height: 20px; cursor: pointer;">
-                    </div>
-
-                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px; font-size: 12px; color: ${state.torSettings.connected ? 'var(--status-success)' : 'var(--text-muted)'}; background: var(--bg-elevated); padding: 8px 12px; border-radius: var(--radius-md);">
-                        <span style="width: 8px; height: 8px; border-radius: 50%; background: ${state.torSettings.connected ? 'var(--status-success)' : 'var(--status-danger)'}; display: inline-block;"></span>
-                        <span>Statut Tor : <strong>${state.torSettings.connected ? 'Circuit Actif (Connecté)' : (state.torSettings.enabled ? `Démarrage du circuit… (${state.torSettings.bootstrapPercent || 0}%)` : 'Désactivé')}</strong></span>
-                    </div>
-
-                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 14px;">Tor est intégré directement dans NOVA — aucune application ni proxy externe n'est nécessaire, sur téléphone comme sur ordinateur.</div>
-
-                    <label style="font-size: 12px; color: var(--text-muted);">Mode d'anonymisation</label>
-                    <select id="tor-mode-select" style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; margin: 6px 0 14px; outline: none;">
-                        <option value="direct_only" ${state.torSettings.mode === 'direct_only' ? 'selected' : ''}>Standard (Direct P2P, débit maximal)</option>
-                        <option value="hybrid" ${state.torSettings.mode === 'hybrid' ? 'selected' : ''}>Hybride (Direct LAN/Bootstrap, Tor pour .onion)</option>
-                        <option value="tor_strict" ${state.torSettings.mode === 'tor_strict' ? 'selected' : ''}>Furtif Absolu (Tor Strict - 0 fuite IP garantie)</option>
-                    </select>
-
-                    <label style="font-size: 12px; color: var(--text-muted);">Pont Tor (Anti-censure / Contournement DPI)</label>
-                    <select id="tor-bridge-select" style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; margin: 6px 0 16px; outline: none;">
-                        <option value="none" ${!state.torSettings.bridgeType ? 'selected' : ''}>Aucun (Connexion directe aux relais Tor)</option>
-                        <option value="snowflake" ${state.torSettings.bridgeType === 'snowflake' ? 'selected' : ''}>Snowflake (WebRTC éphémère - Très résistant)</option>
-                        <option value="obfs4" ${state.torSettings.bridgeType === 'obfs4' ? 'selected' : ''}>obfs4 (Trafic brouillé)</option>
-                    </select>
-
-                    ${state.torSettings.onionAddress ? `
-                    <div style="margin-bottom: 16px;">
-                        <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">Mon adresse souveraine .onion (Tor v3)</div>
-                        <div style="font-size: 11px; font-family: monospace; color: var(--accent-purple-light); word-break: break-all; background: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
-                            <span>${escapeHtml(state.torSettings.onionAddress)}</span>
-                            <button class="btn-secondary" style="font-size: 11px; padding: 4px 10px; white-space: nowrap;" data-action="copyOnionAddress">Copier</button>
-                        </div>
-                    </div>
-                    ` : ''}
-
-                    <button class="btn-primary" style="width: 100%;" data-action="saveTorConfig">Appliquer la configuration Tor</button>
-                    <div id="tor-config-status" style="font-size: 11px; margin-top: 8px; text-align: center;"></div>
-                </div>
-
                 <!-- Advanced: connecting across two different networks (most people never need this) -->
                 <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">AVANCÉ</div>
                 <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 12px;">
@@ -945,16 +998,28 @@ const screens = {
                         `).join('') : `<div style="font-size: 11px; color: var(--text-muted); background: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 12px;">Pas encore disponible.</div>`}
                     </div>
                 </div>
-                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
-                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 4px;">Rejoindre quelqu'un sur un autre réseau</div>
+                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 12px;">
+                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 4px;">Rejoindre quelqu'un sur un autre réseau (DHT Direct)</div>
                     <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 10px;">
-                        Si un contact ne vous trouve pas automatiquement (vous n'êtes pas sur le même Wi-Fi), il peut vous donner une adresse à coller ici.
+                        Si un contact ne vous trouve pas automatiquement (vous n'êtes pas sur le même Wi-Fi), il peut vous donner une adresse multiaddr à coller ici.
                     </div>
                     <input id="bootstrap-addr-input" type="text" value="${escapeHtml(state.bootstrapAddr)}"
-                        placeholder="Adresse fournie par un contact"
+                        placeholder="Adresse multiaddr (/ip4/...)"
                         style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; font-family: monospace; margin-bottom: 10px;">
                     <button class="btn-secondary" style="width: 100%;" data-action="saveBootstrapAddr">Enregistrer et connecter</button>
                     <div id="bootstrap-addr-status" style="font-size: 11px; color: var(--text-muted); margin-top: 8px;"></div>
+                </div>
+
+                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
+                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 4px;">Point de rendez-vous / Secours Render (WebSocket)</div>
+                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 10px;">
+                        Serveur de découverte et de relais de secours (ex: blueprint Render). Permet aux appareils de se localiser mutuellement sans configuration réseau avancée.
+                    </div>
+                    <input id="fallback-server-url-input" type="text" value="${escapeHtml(state.fallbackServerUrl)}"
+                        placeholder="wss://votre-service.onrender.com"
+                        style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; font-family: monospace; margin-bottom: 10px;">
+                    <button class="btn-secondary" style="width: 100%;" data-action="saveFallbackServerUrl">Enregistrer l'URL de secours</button>
+                    <div id="fallback-server-url-status" style="font-size: 11px; color: var(--text-muted); margin-top: 8px;"></div>
                 </div>
 
                 <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="logout">Supprimer mon compte de cet appareil</button>
@@ -1050,19 +1115,6 @@ const screens = {
                     <textarea id="my-bundle-output" readonly rows="2" style="width: 100%; background: none; border: none; color: var(--accent-purple-light); font-family: monospace; font-size: 11px; resize: none; outline: none; word-break: break-all;">${escapeHtml(state.currentUser.invitationUri || state.currentUser.bundleHex) || (state.currentUser.linkGenerationError ? `Échec : ${escapeHtml(state.currentUser.linkGenerationError)}` : (hasBackend ? 'Génération du lien sécurisé…' : 'Compte non créé.'))}</textarea>
                 </div>
                 <button class="btn-primary" style="width: 100%;" data-action="copyOwnBundle">Copier mon lien sécurisé</button>
-
-                ${state.torSettings.onionAddress ? `
-                <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 14px; margin-top: 16px; border: 1px solid var(--border-subtle);">
-                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
-                        <div style="font-size: 13px; font-weight: 600; color: white;">Adresse Tor Onion v3 (Furtive)</div>
-                        <span style="font-size: 10px; color: var(--accent-purple-light); background: rgba(168, 85, 247, 0.15); padding: 2px 8px; border-radius: 10px;">0 fuite IP</span>
-                    </div>
-                    <div style="font-size: 11px; font-family: monospace; color: var(--accent-purple-light); word-break: break-all; background: var(--bg-elevated); border-radius: var(--radius-sm); padding: 8px 10px; margin-bottom: 8px;">
-                        ${escapeHtml(state.torSettings.onionAddress)}
-                    </div>
-                    <button class="btn-secondary" style="width: 100%; font-size: 11px; padding: 6px 12px;" data-action="copyOnionAddress">Copier l'adresse .onion</button>
-                </div>
-                ` : ''}
 
                 <div style="height: 1px; background: var(--border-subtle); margin: 24px 0;"></div>
 
@@ -1188,11 +1240,10 @@ async function navigateTo(screenKey) {
             await refreshMessagesFromBackend(state.activeContact.conversationId);
         } else if (screenKey === 'identity') {
             await refreshOwnBundleHex();
-            await refreshTorStatusFromBackend();
         } else if (screenKey === 'settings') {
             await refreshBootstrapAddr();
+            await refreshFallbackServerUrl();
             await refreshOwnFullListenAddr();
-            await refreshTorStatusFromBackend();
         }
     }
 
@@ -1229,10 +1280,16 @@ async function navigateTo(screenKey) {
             messagePollInterval = setInterval(async () => {
                 const newOnes = await refreshMessagesFromBackend(conversationId);
                 await refreshDiagnostics(peerId);
-                // Only touch the DOM if this conversation is still the one open — the user may
-                // have navigated away while the fetches were in flight.
+                // Only touch the DOM if this conversation is still the one open
                 if (state.currentScreen === 'chat' && state.activeContact && state.activeContact.conversationId === conversationId) {
-                    newOnes.forEach(appendChatMessageToBody);
+                    if (newOnes.length > 0) {
+                        const chatBody = document.getElementById('chat-body');
+                        const isNearBottom = chatBody ? (chatBody.scrollHeight - chatBody.scrollTop - chatBody.clientHeight < 140) : true;
+                        newOnes.forEach(appendChatMessageToBody);
+                        if (chatBody && isNearBottom) {
+                            chatBody.scrollTo({ top: chatBody.scrollHeight, behavior: 'smooth' });
+                        }
+                    }
                     const statusEl = document.getElementById('chat-header-status');
                     if (statusEl) statusEl.innerHTML = chatHeaderStatusHtml();
                 }
@@ -1257,9 +1314,7 @@ async function navigateTo(screenKey) {
         messagePollInterval = null;
     }
 
-    // Keep the conversations list (unread badges, last-message previews) live while it's the
-    // active screen, so messages arriving in the background over P2P/Tor don't require leaving
-    // and re-entering the screen to show up.
+    // Keep the conversations list (unread badges, last-message previews) live without destructive re-renders
     if (screenKey === 'conversations') {
         if (conversationsPollInterval) clearInterval(conversationsPollInterval);
         if (hasBackend) {
@@ -1267,10 +1322,9 @@ async function navigateTo(screenKey) {
                 await refreshConversationsFromBackend();
                 updateGlobalUnreadBadges();
                 if (state.currentScreen === 'conversations') {
-                    const container = document.getElementById('screen-container');
-                    if (container) container.innerHTML = screens.conversations();
+                    updateConversationsListDom();
                 }
-            }, 3000);
+            }, 2500);
         }
     } else if (conversationsPollInterval) {
         clearInterval(conversationsPollInterval);
@@ -1301,7 +1355,7 @@ async function navigateTo(screenKey) {
 // what's really on screen (e.g. an overlay closed by tapping outside it, or a "Annuler" button,
 // rather than by the back button).
 function isAnyOverlayOpen() {
-    const modalIds = ['qr-camera-modal', 'media-preview-modal', 'location-modal', 'mnemonic-auth-modal', 'edit-profile-modal'];
+    const modalIds = ['qr-camera-modal', 'media-preview-modal', 'location-modal', 'mnemonic-auth-modal', 'edit-profile-modal', 'inspect-user-modal', 'block-contact-modal'];
     if (modalIds.some(id => {
         const el = document.getElementById(id);
         return el && el.classList.contains('show');
@@ -1336,6 +1390,8 @@ window.addEventListener('popstate', (event) => {
         closeLocationModal();
         closeMnemonicAuthModal();
         closeEditProfileModal();
+        closeInspectUserModal();
+        closeBlockModal();
         closePanels();
         history.pushState({ screen: state.currentScreen }, '', '#' + state.currentScreen);
         return;
@@ -1555,6 +1611,7 @@ function openChatWith(name, handle) {
         isOnline: !!(contact && contact.online),
         p2pMode: (contact && contact.p2pMode) || 'Non connecté',
         isBlocked: !!(contact && contact.isBlocked),
+        isTrusted: !!(contact && contact.isTrusted),
     };
     // Reset stale diagnostics from whatever contact was previously open — navigateTo('chat')
     // below fetches fresh ones for this contact before rendering.
@@ -1678,84 +1735,6 @@ async function refreshOwnFullListenAddr() {
     }
 }
 
-// Loads the current Tor connectivity and configuration status.
-async function refreshTorStatusFromBackend() {
-    if (!hasBackend) return;
-    try {
-        const status = await tauriInvoke('get_tor_status');
-        if (status) {
-            state.torSettings = {
-                enabled: !!status.enabled,
-                connected: !!status.connected,
-                bootstrapPercent: status.bootstrap_percent || 0,
-                onionAddress: status.onion_address || '',
-                socksProxy: status.socks_proxy || '127.0.0.1:9050',
-                mode: status.mode || 'direct_only',
-                bridgeType: status.bridge_type || null,
-            };
-        }
-    } catch (e) {
-        console.error('get_tor_status failed', e);
-    }
-}
-
-async function saveTorConfigReal() {
-    if (!requireBackend()) return;
-    const enabledChk = document.getElementById('tor-enabled-chk');
-    const modeSelect = document.getElementById('tor-mode-select');
-    const bridgeSelect = document.getElementById('tor-bridge-select');
-    const statusEl = document.getElementById('tor-config-status');
-
-    const enabled = enabledChk ? enabledChk.checked : false;
-    const mode = modeSelect ? modeSelect.value : 'direct_only';
-    // Tor runs embedded (see Settings' "Tor est intégré directement dans NOVA" note) — there is
-    // no external SOCKS5 proxy to point at anymore. This value is only kept for backward
-    // compatibility with the `configure_tor`/storage layer's existing field and is unused.
-    const socksProxy = '127.0.0.1:9050';
-    const bridgeType = bridgeSelect && bridgeSelect.value !== 'none' ? bridgeSelect.value : null;
-
-    if (statusEl) statusEl.innerHTML = '<span style="color: var(--accent-purple-light);">Application de la configuration Tor...</span>';
-
-    try {
-        await tauriInvoke('configure_tor', {
-            enabled,
-            mode,
-            socksProxy,
-            bridgeType,
-        });
-        await refreshTorStatusFromBackend();
-        if (statusEl) {
-            statusEl.innerHTML = '<span style="color: var(--status-success);">✓ Configuration Tor appliquée avec succès.</span>';
-            setTimeout(() => { if (statusEl) statusEl.innerText = ''; }, 4000);
-        }
-    } catch (e) {
-        console.error('configure_tor failed', e);
-        if (statusEl) {
-            statusEl.innerHTML = `<span style="color: var(--status-danger);">Erreur : ${escapeHtml(String(e.message || e))}</span>`;
-        }
-    }
-}
-
-function copyOnionAddressReal(el) {
-    if (!state.torSettings.onionAddress) {
-        alert('Adresse Onion non disponible pour l\'instant.');
-        return;
-    }
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(state.torSettings.onionAddress).then(() => {
-            if (el) {
-                const original = el.innerText;
-                el.innerText = 'Copié !';
-                setTimeout(() => { if (el) el.innerText = original; }, 2000);
-            }
-        }).catch(() => {
-            alert('Mon adresse Onion : ' + state.torSettings.onionAddress);
-        });
-    } else {
-        alert('Mon adresse Onion : ' + state.torSettings.onionAddress);
-    }
-}
-
 // Persists the bootstrap/rendezvous multiaddr entered on the Settings screen — the mechanism a
 // device with no shell (i.e. Android, launched from the home screen rather than a terminal that
 // could export NOVA_BOOTSTRAP_ADDR) uses to configure this at all. Takes effect on the next app
@@ -1783,6 +1762,40 @@ async function saveBootstrapAddr() {
     }
 }
 
+// Loads the currently configured fallback/rendezvous server URL (Render / WebSocket).
+async function refreshFallbackServerUrl() {
+    if (!hasBackend) return;
+    try {
+        state.fallbackServerUrl = (await tauriInvoke('get_fallback_server_url')) || '';
+    } catch (e) {
+        console.error('refreshFallbackServerUrl failed', e);
+    }
+}
+
+// Persists the fallback server URL entered on the Settings screen.
+async function saveFallbackServerUrl() {
+    if (!requireBackend()) return;
+    const input = document.getElementById('fallback-server-url-input');
+    const statusEl = document.getElementById('fallback-server-url-status');
+    if (!input) return;
+    const val = input.value.trim();
+    if (statusEl) statusEl.innerHTML = '<span style="color: var(--accent-purple-light);">Enregistrement...</span>';
+    try {
+        await tauriInvoke('set_fallback_server_url', { url: val });
+        state.fallbackServerUrl = val;
+        if (statusEl) {
+            if (val) {
+                statusEl.innerHTML = '<span style="color: var(--status-success);">✓ URL de secours enregistrée et active.</span>';
+            } else {
+                statusEl.innerHTML = '<span style="color: var(--text-muted);">Serveur de secours désactivé.</span>';
+            }
+        }
+    } catch (e) {
+        console.error('saveFallbackServerUrl failed', e);
+        if (statusEl) statusEl.innerHTML = `<span style="color: var(--status-danger);">Erreur : ${escapeHtml(String(e.message || e))}</span>`;
+    }
+}
+
 function formatMessageTime(timestampUtc) {
     return new Date(timestampUtc * 1000).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
 }
@@ -1807,6 +1820,47 @@ async function refreshConversationsFromBackend() {
     } catch (e) {
         console.error('refreshConversationsFromBackend failed', e);
     }
+}
+
+function updateConversationsListDom() {
+    const scrollList = document.querySelector('.screen-view .scroll-list');
+    if (!scrollList || state.currentScreen !== 'conversations') return;
+    const previousScroll = scrollList.scrollTop;
+    
+    if (state.conversations.length === 0) {
+        scrollList.innerHTML = `
+            <div style="text-align: center; color: var(--text-muted); padding: 60px 24px;">
+                <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--text-dim);">
+                    ${icons.chat}
+                </div>
+                <div style="font-size: 15px; font-weight: 600; color: white;">Aucune conversation</div>
+                <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">Ajoutez un contact pour démarrer votre première conversation.</p>
+                <button class="btn-primary" style="margin-top: 18px;" data-action="navigate" data-screen="add_contact">Ajouter un contact</button>
+            </div>
+        `;
+        return;
+    }
+
+    scrollList.innerHTML = state.conversations.map(c => `
+        <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
+            <div class="avatar">
+                ${escapeHtml(c.name.charAt(0))}
+                <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
+            </div>
+            <div class="item-content">
+                <div class="item-header">
+                    <span class="item-name" style="${c.unread > 0 ? 'font-weight: 700; color: white;' : ''}">${escapeHtml(c.name)}</span>
+                    <span class="item-time" style="${c.unread > 0 ? 'color: var(--accent-purple-light); font-weight: 600;' : ''}">${escapeHtml(c.time)}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 2px;">
+                    <span class="item-sub" style="${c.unread > 0 ? 'color: var(--text-main); font-weight: 600;' : ''}">${escapeHtml(c.lastMsg)}</span>
+                    ${c.unread > 0 ? `<span class="badge-unread">${escapeHtml(String(c.unread))}</span>` : `<span class="status-tick-read" style="margin-left: 6px;">${icons.checkCheck}</span>`}
+                </div>
+            </div>
+        </div>
+    `).join('');
+
+    scrollList.scrollTop = previousScroll;
 }
 
 // --- LOCATION SHARING (small JSON envelope over the text pipeline) ---
@@ -2126,7 +2180,8 @@ async function refreshContactsFromBackend() {
             peerId: c.peer_id,
             online: c.is_online,
             isBlocked: c.is_blocked,
-            p2pMode: c.is_blocked ? 'Contact bloqué' : 'Contact vérifié',
+            isTrusted: c.is_trusted,
+            p2pMode: c.is_blocked ? 'Contact bloqué' : (c.is_trusted ? 'Contact de confiance' : 'Contact non vérifié'),
             key: c.peer_id,
             safetyNumber: c.safety_number,
         }));
@@ -2135,11 +2190,53 @@ async function refreshContactsFromBackend() {
     }
 }
 
-async function blockActiveContact() {
-    if (!state.activeContact || !requireBackend()) return;
-    const peerId = state.activeContact.peerId || state.activeContact.handle;
+async function trustActiveContact(peerId) {
+    const targetPeerId = peerId || (state.activeContact && (state.activeContact.peerId || state.activeContact.handle));
+    if (!targetPeerId || !requireBackend()) return;
+    try {
+        await tauriInvoke('trust_contact', { peerId: targetPeerId });
+        if (state.activeContact && (state.activeContact.peerId === targetPeerId || state.activeContact.handle === targetPeerId)) {
+            state.activeContact.isTrusted = true;
+            const banner = document.getElementById('trust-contact-banner');
+            if (banner) banner.remove();
+        }
+        await refreshContactsFromBackend();
+        alert('Contact marqué comme de confiance avec succès.');
+        if (state.currentScreen === 'contact_profile') {
+            navigateTo('contact_profile');
+        }
+    } catch (e) {
+        alert('Échec de la validation de confiance : ' + e);
+    }
+}
+
+function openBlockModal(peerId, name) {
+    const targetPeerId = peerId || (state.activeContact && (state.activeContact.peerId || state.activeContact.handle));
+    const targetName = name || (state.activeContact && state.activeContact.name) || 'ce contact';
+    state.pendingBlockPeerId = targetPeerId;
+    state.pendingBlockName = targetName;
+
+    const modal = document.getElementById('block-contact-modal');
+    const title = document.getElementById('block-modal-title');
+    const desc = document.getElementById('block-modal-desc');
+    if (title) title.innerText = `Bloquer ${targetName} ?`;
+    if (desc) desc.innerHTML = `Les futurs messages et appels de <strong>${escapeHtml(targetName)}</strong> seront immédiatement rejetés. Vous pourrez retrouver ce contact dans l'onglet Contacts pour le débloquer si nécessaire.`;
+    if (modal) modal.classList.add('show');
+}
+
+function closeBlockModal() {
+    const modal = document.getElementById('block-contact-modal');
+    if (modal) modal.classList.remove('show');
+    state.pendingBlockPeerId = null;
+    state.pendingBlockName = null;
+}
+
+async function confirmBlockOnly() {
+    const peerId = state.pendingBlockPeerId || (state.activeContact && (state.activeContact.peerId || state.activeContact.handle));
+    if (!peerId || !requireBackend()) return;
     try {
         await tauriInvoke('block_contact', { peerId });
+        closeBlockModal();
         await refreshContactsFromBackend();
         await refreshConversationsFromBackend();
         alert('Ce contact a été bloqué au niveau du moteur Rust. Ses paquets seront désormais ignorés.');
@@ -2148,6 +2245,26 @@ async function blockActiveContact() {
     } catch (e) {
         alert('Échec du blocage : ' + e);
     }
+}
+
+async function confirmBlockAndDelete() {
+    const peerId = state.pendingBlockPeerId || (state.activeContact && (state.activeContact.peerId || state.activeContact.handle));
+    if (!peerId || !requireBackend()) return;
+    try {
+        await tauriInvoke('block_and_delete_conversation', { peerId });
+        closeBlockModal();
+        await refreshContactsFromBackend();
+        await refreshConversationsFromBackend();
+        alert('Contact bloqué et conversation supprimée définitivement.');
+        state.activeContact = null;
+        navigateTo('conversations');
+    } catch (e) {
+        alert('Échec du blocage et suppression : ' + e);
+    }
+}
+
+async function blockActiveContact() {
+    openBlockModal();
 }
 
 async function unblockActiveContact(peerId) {
@@ -2480,9 +2597,11 @@ function appendChatMessageToBody(msg) {
         return;
     }
     
-    // Remove typing indicator if present before appending message
+    // Remove typing indicator or empty chat placeholder if present before appending message
     const typingRow = document.getElementById('typing-indicator-row');
     if (typingRow) typingRow.remove();
+    const emptyPlaceholder = chatBody.querySelector('.empty-chat-placeholder');
+    if (emptyPlaceholder) emptyPlaceholder.remove();
 
     const wrapper = document.createElement('div');
     wrapper.innerHTML = buildMessageHtml(msg).trim();
@@ -3444,6 +3563,177 @@ async function addContactReal() {
     }
 }
 
+// --- ZERO-CONFIG DIRECTORY SEARCH & USER PROFILE INSPECTION ---
+let contactSearchDebounceTimer = null;
+
+function handleContactDirectorySearch(query) {
+    if (contactSearchDebounceTimer) clearTimeout(contactSearchDebounceTimer);
+    contactSearchDebounceTimer = setTimeout(async () => {
+        const container = document.getElementById('directory-search-results');
+        if (!container) return;
+        const q = (query || '').trim();
+        if (!q) {
+            container.innerHTML = `
+                <div style="text-align: center; color: var(--text-dim); padding: 30px 16px; font-size: 13px;">
+                    <div style="font-size: 28px; margin-bottom: 8px;">🔍</div>
+                    <div style="color: white; font-weight: 600; margin-bottom: 4px;">Recherche globale Zero-Config</div>
+                    <div>Tapez un identifiant (ex: 8f4b2...) ou un @pseudo pour trouver et ajouter un contact instantanément.</div>
+                </div>
+            `;
+            state.directorySearchResults = [];
+            return;
+        }
+
+        container.innerHTML = `
+            <div style="text-align: center; color: var(--accent-purple-light); padding: 24px 16px; font-size: 13px;">
+                Recherche de « ${escapeHtml(q)} » sur le serveur de découverte...
+            </div>
+        `;
+
+        let results = [];
+        if (hasBackend) {
+            try {
+                results = await tauriInvoke('search_directory', { query: q }) || [];
+            } catch (e) {
+                console.error('search_directory failed', e);
+            }
+        }
+        state.directorySearchResults = results;
+
+        if (results.length === 0) {
+            container.innerHTML = `
+                <div style="text-align: center; color: var(--text-muted); padding: 24px 16px; font-size: 13px; background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
+                    <div style="color: white; font-weight: 600; margin-bottom: 4px;">Aucun utilisateur trouvé</div>
+                    <div>Aucun pair correspondant à « ${escapeHtml(q)} ». Vérifiez l'orthographe ou utilisez un code d'invitation ci-dessous.</div>
+                </div>
+            `;
+            return;
+        }
+
+        container.innerHTML = results.map(u => {
+            const shortId = u.peer_id.slice(0, 8) + '…' + u.peer_id.slice(-6);
+            const isSelf = u.peer_id === state.currentUser.peerId;
+            const isAlreadyContact = state.contacts.some(c => c.handle === u.peer_id || c.peerId === u.peer_id);
+            return `
+                <div class="item-card" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); margin-bottom: 8px; padding: 12px 14px;">
+                    <div class="avatar" style="width: 44px; height: 44px; font-size: 18px; position: relative;">
+                        ${u.avatar_data_url ? `<img src="${u.avatar_data_url}" style="width: 100%; height: 100%; object-fit: cover;">` : escapeHtml(u.display_name.charAt(0) || u.username.charAt(0) || '?')}
+                        <div class="status-dot ${u.is_online ? 'status-online' : 'status-offline'}" style="position: absolute; bottom: -2px; right: -2px;"></div>
+                    </div>
+                    <div class="item-content" style="cursor: pointer;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">
+                        <div class="item-name" style="font-size: 14px; font-weight: 600; color: white;">${escapeHtml(u.display_name)}</div>
+                        <div class="item-sub" style="color: var(--accent-purple-light); font-size: 12px;">@${escapeHtml(u.username)} • <span style="font-family: monospace; font-size: 10px; color: var(--text-dim);">${shortId}</span></div>
+                    </div>
+                    <div style="display: flex; gap: 6px;">
+                        <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">Afficher</button>
+                        ${isSelf ? `
+                            <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px; opacity: 0.6;" disabled>C'est vous</button>
+                        ` : isAlreadyContact ? `
+                            <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px; color: var(--status-success);" data-action="openChat" data-name="${escapeHtml(u.display_name)}" data-handle="${escapeHtml(u.peer_id)}">Discuter</button>
+                        ` : `
+                            <button class="btn-primary" style="font-size: 11px; padding: 6px 12px;" data-action="addDirectUser" data-peer-id="${escapeHtml(u.peer_id)}" data-username="${escapeHtml(u.username)}" data-name="${escapeHtml(u.display_name)}" data-bundle="${escapeHtml(u.prekey_bundle_hex)}">Ajouter</button>
+                        `}
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }, 250);
+}
+
+function inspectDirectoryUser(peerId) {
+    const user = state.directorySearchResults.find(u => u.peer_id === peerId);
+    if (!user) return;
+    state.inspectedDirectoryUser = user;
+    const modal = document.getElementById('inspect-user-modal');
+    const card = document.getElementById('inspect-user-card');
+    if (!modal || !card) return;
+
+    const isSelf = user.peer_id === state.currentUser.peerId;
+    const isAlreadyContact = state.contacts.some(c => c.handle === user.peer_id || c.peerId === user.peer_id);
+
+    card.innerHTML = `
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+            <div style="font-size: 16px; font-weight: 700; color: white;">Profil de l'utilisateur</div>
+            <button class="icon-btn" data-action="closeInspectUserModal" style="width: 28px; height: 28px;">✕</button>
+        </div>
+
+        <div style="text-align: center; margin-bottom: 18px;">
+            <div class="avatar" style="width: 72px; height: 72px; font-size: 28px; margin: 0 auto 10px; position: relative;">
+                ${user.avatar_data_url ? `<img src="${user.avatar_data_url}" style="width: 100%; height: 100%; object-fit: cover;">` : escapeHtml(user.display_name.charAt(0) || '?')}
+                <div class="status-dot ${user.is_online ? 'status-online' : 'status-offline'}" style="position: absolute; bottom: 2px; right: 2px; width: 14px; height: 14px;"></div>
+            </div>
+            <div style="font-size: 18px; font-weight: 700; color: white;">${escapeHtml(user.display_name)}</div>
+            <div style="font-size: 13px; color: var(--accent-purple-light); margin-top: 2px;">@${escapeHtml(user.username)}</div>
+            <div style="font-size: 11px; color: ${user.is_online ? 'var(--status-success)' : 'var(--text-muted)'}; margin-top: 4px;">
+                ${user.is_online ? '🟢 En ligne sur le réseau NOVA' : '⚪ Vu récemment'}
+            </div>
+        </div>
+
+        <div style="background: var(--bg-elevated); border-radius: var(--radius-md); padding: 12px; margin-bottom: 14px; border: 1px solid var(--border-subtle);">
+            <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; font-weight: 600;">Identifiant public cryptographique :</div>
+            <div style="font-size: 11px; font-family: monospace; color: var(--text-dim); word-break: break-all;">${escapeHtml(user.peer_id)}</div>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 8px; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.25); border-radius: var(--radius-md); padding: 10px 12px; margin-bottom: 18px;">
+            <span style="font-size: 16px;">🔐</span>
+            <div style="font-size: 11px; color: var(--status-success); line-height: 1.3;">
+                Clé d'identité signée et vérifiée. Chiffrement de bout en bout X3DH & Double Ratchet garanti.
+            </div>
+        </div>
+
+        <div style="display: flex; gap: 10px;">
+            <button class="btn-secondary" style="flex: 1;" data-action="closeInspectUserModal">Fermer</button>
+            ${isSelf ? `
+                <button class="btn-secondary" style="flex: 1; opacity: 0.6;" disabled>C'est vous</button>
+            ` : isAlreadyContact ? `
+                <button class="btn-primary" style="flex: 1;" data-action="openChat" data-name="${escapeHtml(user.display_name)}" data-handle="${escapeHtml(user.peer_id)}">Ouvrir la discussion</button>
+            ` : `
+                <button class="btn-primary" style="flex: 1;" data-action="addInspectedUser">Ajouter aux contacts</button>
+            `}
+        </div>
+    `;
+
+    modal.classList.add('show');
+}
+
+function closeInspectUserModal() {
+    const modal = document.getElementById('inspect-user-modal');
+    if (modal) modal.classList.remove('show');
+    state.inspectedDirectoryUser = null;
+}
+
+async function addInspectedUser() {
+    const user = state.inspectedDirectoryUser;
+    if (!user) return;
+    closeInspectUserModal();
+    await addDirectUser(user.peer_id, user.username, user.display_name, user.prekey_bundle_hex);
+}
+
+async function addDirectUser(peerId, username, displayName, bundleHex) {
+    if (!requireBackend()) return;
+    try {
+        await tauriInvoke('add_contact', {
+            username: username || displayName || 'contact',
+            displayName: displayName || username || 'Contact',
+            bundleHex: bundleHex || peerId,
+        });
+        await refreshContactsFromBackend();
+        await refreshConversationsFromBackend();
+        openChatWith(displayName || username, peerId);
+    } catch (e) {
+        alert('Échec de l\'ajout du contact : ' + e);
+    }
+}
+
+function toggleManualInviteAccordion() {
+    const body = document.getElementById('manual-invite-body');
+    const chevron = document.getElementById('manual-invite-chevron');
+    if (!body) return;
+    const isHidden = body.style.display === 'none';
+    body.style.display = isHidden ? 'block' : 'none';
+    if (chevron) chevron.innerText = isHidden ? '▲' : '▼';
+}
+
 function filterContactsList(query) {
     const container = document.getElementById('contacts-list-container');
     if (!container) return;
@@ -3574,7 +3864,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         );
         await refreshContactsFromBackend();
         await refreshConversationsFromBackend();
-        await refreshTorStatusFromBackend();
     }
 
     navigateTo(state.currentUser.peerId ? 'conversations' : 'onboarding');

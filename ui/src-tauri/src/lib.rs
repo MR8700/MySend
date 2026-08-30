@@ -34,6 +34,8 @@ struct AppState {
     bootstrap_addr: Mutex<Option<libp2p::Multiaddr>>,
     /// Where `bootstrap_addr`'s value is persisted across restarts (`<app-data-dir>/bootstrap_addr.txt`).
     bootstrap_addr_file: PathBuf,
+    /// Where `fallback_server_url` is persisted across restarts (`<app-data-dir>/fallback_server_url.txt`).
+    fallback_server_url_file: PathBuf,
     /// Local QUIC listen multiaddr. Defaults to an OS-assigned UDP port
     /// (`/ip4/0.0.0.0/udp/0/quic-v1`); override with `NOVA_LISTEN_ADDR` to bind a fixed port,
     /// which is what a device acting as the reachable rendezvous point for other physical test
@@ -165,9 +167,8 @@ async fn start_network_once(state: &State<'_, AppState>, mnemonic_str: &str, use
     // *hang* rather than fail fast (no network error to catch, just nothing ever answering the
     // oneshot channel these wait on). That turns "best-effort" into "blocks account creation
     // forever" for exactly the offline case this fallback exists to handle. Bounding each step
-    // the same way the Tor-reapply step below already is keeps the intended behavior (account
-    // creation always succeeds locally; network_active just ends up false) even when there's no
-    // network to fail against quickly.
+    // keeps the intended behavior (account creation always succeeds locally; network_active just
+    // ends up false) even when there's no network to fail against quickly.
     const NETWORK_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     let node = match tokio::time::timeout(NETWORK_STEP_TIMEOUT, P2PNode::start(identity, &state.listen_addr)).await {
@@ -196,47 +197,6 @@ async fn start_network_once(state: &State<'_, AppState>, mnemonic_str: &str, use
     }
 
     state.engine.attach_network(node).await;
-
-    // The `P2PNode`/`TorManager` just created above always starts from `TorConfig::default()`
-    // (Tor disabled — see `nova_transport::dht_node::P2PNode::start`), with no knowledge of
-    // whatever the user previously saved via `configure_tor`/the Settings screen. Without this,
-    // a user who had explicitly enabled Tor in a past session would find it silently back to
-    // disabled on every relaunch/resume (`get_tor_status` reflects the *live* node once the
-    // network is attached, not the saved settings) — the Tor toggle looked "stuck disabled"
-    // every time the app reconnected. Re-apply the saved settings now so they actually take
-    // effect again immediately after the network comes up.
-    match state.engine.storage.get_tor_settings() {
-        Ok(saved) => {
-            // Bounded defensively: this locks `NovaEngine::network` and `NovaEngine::identity`,
-            // the same two locks `attach_network`'s just-spawned outbox-pump task (re-encrypting/
-            // resending anything left over from a previous session, e.g. a message that never
-            // got delivered before the app was last closed) also needs, in the opposite order.
-            // `try_resume_session`/`create_account`/`restore_account` all block the UI on this
-            // whole function returning — if this ever contends against that background task
-            // instead of racing it harmlessly, the entire app would be stuck on a permanently
-            // blank screen (nothing after this point, including the very first screen render,
-            // ever runs) rather than failing visibly. A real, reproducible instance of exactly
-            // this symptom (blank screen forever after a relaunch with a stuck pending message
-            // in the outbox) is what prompted adding this bound.
-            let tor_reapply = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                state
-                    .engine
-                    .configure_tor(saved.enabled, &saved.mode, &saved.socks_proxy, saved.bridge_type),
-            )
-            .await;
-            match tor_reapply {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!("Failed to re-apply saved Tor settings on network start: {e}"),
-                Err(_) => tracing::warn!(
-                    "Re-applying saved Tor settings on network start did not complete within 5s \
-                     (likely lock contention with the outbox pump) — continuing without it; Tor \
-                     settings can still be changed from the Settings screen"
-                ),
-            }
-        }
-        Err(e) => tracing::warn!("Failed to load saved Tor settings on network start: {e}"),
-    }
 
     *started = true;
     true
@@ -292,14 +252,33 @@ async fn add_contact(
         .await
         .map_err(engine_err)
 }
+
+#[tauri::command]
+async fn search_directory(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<Vec<nova_protocol::DirectorySearchResult>, String> {
+    state.engine.search_directory(&query).await.map_err(engine_err)
+}
+
 #[tauri::command]
 fn get_contacts(state: State<'_, AppState>) -> Result<Vec<nova_storage::ContactRecord>, String> {
     state.engine.get_contacts().map_err(engine_err)
 }
 
 #[tauri::command]
+fn trust_contact(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
+    state.engine.trust_contact(&peer_id).map_err(engine_err)
+}
+
+#[tauri::command]
 fn block_contact(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
     state.engine.block_contact(&peer_id).map_err(engine_err)
+}
+
+#[tauri::command]
+fn block_and_delete_conversation(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
+    state.engine.block_and_delete_conversation(&peer_id).map_err(engine_err)
 }
 
 #[tauri::command]
@@ -492,29 +471,40 @@ async fn set_bootstrap_addr(state: State<'_, AppState>, addr: String) -> Result<
     Ok(())
 }
 
+/// Current fallback/rendezvous server URL, if one is configured (env var, storage file, or active node).
 #[tauri::command]
-async fn get_own_onion_address(state: State<'_, AppState>) -> Result<String, String> {
-    state.engine.own_onion_address().await.map_err(engine_err)
+async fn get_fallback_server_url(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    if let Some(url) = state.engine.get_fallback_server_url().await {
+        return Ok(Some(url));
+    }
+    let fallback_url = std::fs::read_to_string(&state.fallback_server_url_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("NOVA_UDP_FALLBACK_ADDR").ok());
+    Ok(fallback_url)
 }
 
+/// Sets (or clears, with an empty string) the fallback discovery/relay server URL (e.g. Render WebSocket endpoint).
 #[tauri::command]
-async fn get_tor_status(state: State<'_, AppState>) -> Result<nova_transport::TorStatus, String> {
-    state.engine.get_tor_status().await.map_err(engine_err)
-}
-
-#[tauri::command]
-async fn configure_tor(
-    state: State<'_, AppState>,
-    enabled: bool,
-    mode: String,
-    socks_proxy: String,
-    bridge_type: Option<String>,
-) -> Result<(), String> {
-    state
-        .engine
-        .configure_tor(enabled, &mode, &socks_proxy, bridge_type)
-        .await
-        .map_err(engine_err)
+async fn set_fallback_server_url(state: State<'_, AppState>, url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        let _ = std::fs::remove_file(&state.fallback_server_url_file);
+        std::env::remove_var("NOVA_UDP_FALLBACK_ADDR");
+        state.engine.set_fallback_server_url(None).await;
+        return Ok(());
+    }
+    if trimmed != "none" {
+        if !trimmed.starts_with("ws://") && !trimmed.starts_with("wss://") {
+            return Err("Le schéma de l'URL de secours doit être ws:// ou wss://".to_string());
+        }
+    }
+    std::fs::write(&state.fallback_server_url_file, trimmed).map_err(|e| e.to_string())?;
+    std::env::set_var("NOVA_UDP_FALLBACK_ADDR", trimmed);
+    state.engine.set_fallback_server_url(Some(trimmed.to_string())).await;
+    tracing::info!("Updated fallback discovery/relay server URL to {trimmed}");
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -537,13 +527,6 @@ pub fn run() {
                     .expect("no app data directory available on this platform"),
             };
             std::fs::create_dir_all(&data_dir).expect("failed to create app data directory");
-
-            // Persistent home for the embedded Tor client's consensus cache, guard state, and
-            // onion-service keystore (see `nova_transport::tor`) — a real, durable subdirectory
-            // of this device's own app data, so Tor doesn't have to re-bootstrap from scratch
-            // (a real, user-visible delay) on every app launch. Read directly by `dht_node.rs`
-            // via `NOVA_TOR_STATE_DIR`, the same env-var pattern as `NOVA_BOOTSTRAP_ADDR`.
-            std::env::set_var("NOVA_TOR_STATE_DIR", data_dir.join("tor_state"));
 
             let db_path = data_dir.join("nova.db");
             let passphrase = load_or_create_storage_passphrase(&data_dir.join("storage.key"));
@@ -573,6 +556,14 @@ pub fn run() {
                 );
             }
 
+            let fallback_server_url_file = data_dir.join("fallback_server_url.txt");
+            if let Ok(saved_fallback) = std::fs::read_to_string(&fallback_server_url_file) {
+                let trimmed = saved_fallback.trim();
+                if !trimmed.is_empty() && std::env::var("NOVA_UDP_FALLBACK_ADDR").is_err() {
+                    std::env::set_var("NOVA_UDP_FALLBACK_ADDR", trimmed);
+                }
+            }
+
             let listen_addr = std::env::var("NOVA_LISTEN_ADDR")
                 .unwrap_or_else(|_| "/ip4/0.0.0.0/udp/0/quic-v1".to_string());
 
@@ -580,6 +571,7 @@ pub fn run() {
                 engine,
                 bootstrap_addr: Mutex::new(bootstrap_addr),
                 bootstrap_addr_file,
+                fallback_server_url_file,
                 listen_addr,
                 network_started: Mutex::new(false),
             });
@@ -596,7 +588,9 @@ pub fn run() {
             get_own_invitation_uri,
             add_contact,
             get_contacts,
+            trust_contact,
             block_contact,
+            block_and_delete_conversation,
             unblock_contact,
             delete_contact,
             send_message,
@@ -610,11 +604,11 @@ pub fn run() {
             get_own_full_listen_addrs,
             get_bootstrap_addr,
             set_bootstrap_addr,
+            get_fallback_server_url,
+            set_fallback_server_url,
+            search_directory,
             get_user_profile,
             update_user_profile,
-            get_own_onion_address,
-            get_tor_status,
-            configure_tor,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the NOVA Chat desktop app");

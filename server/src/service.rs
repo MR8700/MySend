@@ -13,9 +13,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-/// Same ceiling the old UDP endpoint used — this is still signaling/control-plane traffic
-/// (presence registration, lookups, small relayed blobs), not a bulk transfer channel.
-pub const MAX_DATAGRAM_SIZE: usize = 16 * 1024;
+/// Ceiling for control-plane datagrams (presence registration, lookups, directory profiles with avatars, small relayed blobs).
+pub const MAX_DATAGRAM_SIZE: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -191,5 +190,13 @@ pub async fn handle_request(
             }
             Err(e) => ServerResponse::Error(e.to_string()),
         },
+        ServerRequest::RegisterDirectory(entry) => match registry.register_directory(entry).await {
+            Ok(()) => ServerResponse::DirectoryRegistered,
+            Err(e) => ServerResponse::Error(e.to_string()),
+        },
+        ServerRequest::SearchDirectory { query } => {
+            let results = registry.search_directory(&query).await;
+            ServerResponse::DirectorySearchResults(results)
+        }
     }
 }

@@ -54,9 +54,6 @@ async fn main() {
         }
     };
     eprintln!("[{role}] account ready, peer_id={peer_id}");
-    // Only for standing up a matching Tor hidden service (see tor_hs_keygen) — never do this for
-    // a real account, the mnemonic is the entire key to the identity.
-    std::fs::write(std::env::temp_dir().join(format!("nova_lan_test_{role}_mnemonic.txt")), &mnemonic).ok();
 
     let identity = DeviceIdentity::from_mnemonic(&MnemonicPhrase::from_phrase(&mnemonic).unwrap(), &role).unwrap();
     let node = nova_transport::P2PNode::start(identity, LISTEN_ADDR)

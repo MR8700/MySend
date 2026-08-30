@@ -7,10 +7,10 @@ overflow in a size calculation, an unexpected CBOR structure) but a fuzzer finds
 
 | Target                         | What it fuzzes                              | Who can reach it                                  |
 |---------------------------------|----------------------------------------------|----------------------------------------------------|
-| `nova_packet_from_cbor`         | `NovaPacket::from_cbor`                       | Any connected libp2p/onion/UDP-fallback peer        |
+| `nova_packet_from_cbor`         | `NovaPacket::from_cbor`                       | Any connected libp2p/WebSocket-relay-fallback peer  |
 | `message_payload_from_bytes`    | `MessagePayload::from_bytes`                  | Any peer with an established (or attacker-controlled) Double Ratchet session |
 | `dht_peer_record_from_bytes`    | `SignedDhtPeerRecord::from_bytes`             | Any node storing/serving a Kademlia DHT record      |
-| `server_request_from_bytes`     | `ServerRequest::from_bytes` (`nova-server`)   | Anyone who can send a UDP datagram to the fallback server — no prior relationship needed at all |
+| `server_request_from_bytes`     | `ServerRequest::from_bytes` (`nova-server`)   | Anyone who can open a WebSocket connection to the fallback server — no prior relationship needed at all |
 
 ## Running locally
 

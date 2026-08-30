@@ -18,23 +18,6 @@ hex.workspace = true
 igd-next.workspace = true
 tokio-tungstenite.workspace = true
 url = "2.5"
-arti-client = { version = "0.45.0", default-features = false, features = ["tokio", "onion-service-client", "onion-service-service", "keymgr", "rustls", "experimental-api"] }
-tor-cell = "0.45.0"
-tor-llcrypto = "0.45.0"
-tor-hscrypto = "0.45.0"
-tor-rtcompat = { version = "0.45.0", features = ["tokio"] }
-futures = "0.3.34"
-tor-hsservice = "0.45.0"
-# Never called directly by this crate's own code — arti-client's `tor-dirmgr`/`tor-keymgr` (its
-# consensus cache and onion-service keystore) depend on `rusqlite` too, but request it without the
-# "bundled" feature. Cargo unifies features per resolved package version across a build, so
-# without this line, whichever binary links `nova-transport` alone (no other dependency already
-# requesting "bundled", e.g. `cargo test -p nova-transport` in isolation) would build
-# `libsqlite3-sys` expecting a *system* SQLite dev library to link against — absent on a normal
-# Windows/Android machine, producing a `LNK1181: cannot open sqlite3.lib` link failure. Declaring
-# it here with "bundled" (matching `nova-storage`'s own declaration, so both agree either way)
-# guarantees the statically-compiled SQLite that ships is always the one actually linked.
-rusqlite = { workspace = true }
 
 [dev-dependencies]
 # Only for udp_fallback's integration tests, which run a real nova-server in-process to verify

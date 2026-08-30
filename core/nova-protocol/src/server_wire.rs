@@ -1,5 +1,8 @@
 use crate::packet::{ProtocolError, MAX_PACKET_SIZE};
-use crate::presence::{PeerEndpoint, SignedDrainRequest, SignedPresenceRegistration};
+use crate::presence::{
+    DirectorySearchResult, PeerEndpoint, SignedDirectoryEntry, SignedDrainRequest,
+    SignedPresenceRegistration,
+};
 use serde::{Deserialize, Serialize};
 
 /// Requests understood by the discovery/signaling server's UDP endpoint.
@@ -16,6 +19,10 @@ pub enum ServerRequest {
     /// Fetch and purge all packets queued for the caller. Must be signed to prove ownership of
     /// the peer_id being drained — see [`SignedDrainRequest`].
     RelayDrain(SignedDrainRequest),
+    /// Register or update directory profile and PreKey bundle.
+    RegisterDirectory(SignedDirectoryEntry),
+    /// Search directory users by peer_id (full or prefix), @username, or display name.
+    SearchDirectory { query: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,6 +31,8 @@ pub enum ServerResponse {
     LookupResult(Option<PeerEndpoint>),
     RelayForwarded,
     RelayDrained(Vec<Vec<u8>>),
+    DirectoryRegistered,
+    DirectorySearchResults(Vec<DirectorySearchResult>),
     Error(String),
 }
 

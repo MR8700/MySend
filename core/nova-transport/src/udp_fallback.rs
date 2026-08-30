@@ -45,14 +45,20 @@
 use crate::error::TransportError;
 use futures_util::{SinkExt, StreamExt};
 use nova_crypto::DeviceIdentity;
-use nova_protocol::{PeerEndpoint, ServerRequest, ServerResponse, SignedDrainRequest, SignedPresenceRegistration};
+use nova_protocol::{
+    DirectorySearchResult, PeerEndpoint, ServerRequest, ServerResponse, SignedDirectoryEntry,
+    SignedDrainRequest, SignedPresenceRegistration,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::Message;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
-/// Matches `nova_server::service::MAX_DATAGRAM_SIZE` — the signaling endpoint is control-plane
-/// traffic, not bulk transfer, so a reply never needs to be larger than this.
-const MAX_RESPONSE_SIZE: usize = 16 * 1024;
+/// Timeout for establishing the initial WebSocket connection. A generous 30s allows
+/// waking up sleeping containers on free PaaS tiers (e.g. Render spin-down after 15m).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for individual message send/receive roundtrips once connected.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Matches `nova_server::service::MAX_DATAGRAM_SIZE` — signaling / profile search endpoint limit.
+const MAX_RESPONSE_SIZE: usize = 64 * 1024;
 /// Also matches `nova_server::service::MAX_DATAGRAM_SIZE`: `relay_forward` checks this up front
 /// so an oversized `RelayForward { payload, .. }` — e.g. one of `nova-engine`'s
 /// `MEDIA_CHUNK_SIZE` chunks, sized for the primary DHT/QUIC transport's ~1 MiB request ceiling,
@@ -90,7 +96,7 @@ impl UdpFallbackClient {
     /// layer for replies. This is a deliberately simple/low-frequency fallback path, not the hot
     /// path, so a full connection handshake per call is an acceptable cost for that simplicity.
     async fn roundtrip(&self, request: &ServerRequest) -> Result<ServerResponse, TransportError> {
-        let (mut ws, _response) = tokio::time::timeout(REQUEST_TIMEOUT, tokio_tungstenite::connect_async(&self.server_url))
+        let (mut ws, _response) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(&self.server_url))
             .await
             .map_err(|_| TransportError::Timeout)?
             .map_err(|e| TransportError::Setup(format!("failed to connect to fallback server at {}: {e}", self.server_url)))?;
@@ -185,6 +191,24 @@ impl UdpFallbackClient {
         match self.roundtrip(&ServerRequest::RelayDrain(drain_request)).await? {
             ServerResponse::RelayDrained(items) => Ok(items),
             ServerResponse::Error(e) => Err(TransportError::Setup(format!("fallback relay rejected drain: {e}"))),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// Registers or updates this device's public directory profile (avatar, display name, username, prekey bundle).
+    pub async fn register_directory_signed(&self, entry: SignedDirectoryEntry) -> Result<(), TransportError> {
+        match self.roundtrip(&ServerRequest::RegisterDirectory(entry)).await? {
+            ServerResponse::DirectoryRegistered => Ok(()),
+            ServerResponse::Error(e) => Err(TransportError::Setup(format!("fallback directory registration rejected: {e}"))),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// Searches the fallback directory for matching users by peer_id prefix, @username, or display name.
+    pub async fn search_directory(&self, query: &str) -> Result<Vec<DirectorySearchResult>, TransportError> {
+        match self.roundtrip(&ServerRequest::SearchDirectory { query: query.to_string() }).await? {
+            ServerResponse::DirectorySearchResults(results) => Ok(results),
+            ServerResponse::Error(e) => Err(TransportError::Setup(format!("fallback directory search failed: {e}"))),
             other => Err(unexpected_response(other)),
         }
     }

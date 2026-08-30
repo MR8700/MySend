@@ -43,6 +43,8 @@ pub struct ContactRecord {
     pub safety_number: String,
     pub is_online: bool,
     pub is_blocked: bool,
+    #[serde(default)]
+    pub is_trusted: bool,
     pub last_seen_utc: i64,
 }
 
@@ -110,31 +112,3 @@ pub struct UserProfileRecord {
     pub avatar_data_url: Option<String>,
 }
 
-/// Configuration for Tor anonymous routing and SOCKS5 proxying stored in the local database.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TorSettingsRecord {
-    pub enabled: bool,
-    pub mode: String, // "direct_only", "hybrid", "tor_strict"
-    pub socks_proxy: String,
-    pub bridge_type: Option<String>,
-}
-
-impl Default for TorSettingsRecord {
-    fn default() -> Self {
-        // Enabled by default in Hybrid mode: this is a serverless P2P app with no rendezvous
-        // relay of its own, so two devices with no manually-configured bootstrap address (the
-        // common case — nothing pre-fills it on a launcher-started app, notably Android) can only
-        // ever reach each other directly when they happen to share the same LAN. Hybrid still
-        // prefers a direct connection whenever one exists (same LAN/bootstrap) and only falls back
-        // to the embedded Tor onion path (see `NovaEngine::try_onion_fallback_for_item`) for a
-        // peer that direct dialing can't reach — e.g. two phones on different Wi-Fi/cellular
-        // networks — rather than forcing every connection through Tor (that's `tor_strict`, still
-        // opt-in). The user can still turn Tor off entirely from Settings.
-        Self {
-            enabled: true,
-            mode: "hybrid".to_string(),
-            socks_proxy: "127.0.0.1:9050".to_string(),
-            bridge_type: None,
-        }
-    }
-}

@@ -224,6 +224,7 @@ impl NovaEngine {
         // table on a cold start — see `PRESENCE_ANNOUNCE_INTERVAL`'s doc comment) or simply expire
         // on the DHT, so this keeps retrying/refreshing for the lifetime of the attached network.
         let announce_node = node.clone();
+        let announce_engine = self.clone();
         tokio::spawn(async move {
             // `tokio::time::interval` fires its first tick immediately, not after one full
             // period — an explicit sleep first is what actually gives mDNS/bootstrap discovery
@@ -234,6 +235,9 @@ impl NovaEngine {
             loop {
                 if let Err(e) = announce_node.announce_presence().await {
                     debug!("announce_presence failed, will retry: {e}");
+                }
+                if let Err(e) = announce_engine.publish_directory_profile().await {
+                    debug!("publish_directory_profile failed, will retry: {e}");
                 }
                 interval.tick().await;
             }
@@ -272,21 +276,14 @@ impl NovaEngine {
         let now = chrono::Utc::now().timestamp();
         for (item, send_res) in results {
             match send_res {
-                // Peer unreachable via the DHT/QUIC path — before giving up, try the peer's own
-                // advertised .onion address (if any) through Tor as a second, independent path.
-                // Real deployments where the DHT path fails outright (no reachable bootstrap yet,
-                // restrictive/CGNAT-only networking) are exactly the case this exists for; in
-                // TorStrict mode the DHT dial never even leaves loopback (enforced in
-                // `nova-transport::run_swarm_task`'s Command::Dial handler), so this is also the
-                // *only* path a message can go out on while TorStrict is active.
+                // Peer unreachable via the DHT/relay path — defer and retry later. A second,
+                // independent delivery attempt is still made via `spawn_udp_fallback_send_chunks`
+                // (the WebSocket discovery/relay server, see `crate::udp_fallback`) inside
+                // `send_chunks_to_peer` itself on this same failure, so this isn't the only path
+                // a message can go out on.
                 Ok((nova_transport::P2PTransportMode::Disconnected, _)) => {
-                    match self.try_onion_fallback_send(&node, &item).await {
-                        Some(onion_outcome) => self.apply_send_outcome(&item, onion_outcome, &mut delivered, now)?,
-                        None => {
-                            debug!("Outbox item {} deferred: peer unreachable", item.message_id);
-                            self.back_off_or_give_up(&item, now)?;
-                        }
-                    }
+                    debug!("Outbox item {} deferred: peer unreachable", item.message_id);
+                    self.back_off_or_give_up(&item, now)?;
                 }
                 Ok((_, outcome)) => self.apply_send_outcome(&item, outcome, &mut delivered, now)?,
                 Err(e) => {
@@ -298,10 +295,9 @@ impl NovaEngine {
         Ok(delivered)
     }
 
-    /// Records the outcome of a successful send attempt (over whichever path produced it — DHT
-    /// direct/relay, or the Tor onion fallback) against `item`: only `Processed` ever earns
-    /// "Delivered"; `Blocked` stops retrying without ever claiming delivery (see the 2026-08-22
-    /// audit); `Rejected` backs off and retries like any other failure.
+    /// Records the outcome of a successful send attempt against `item`: only `Processed` ever
+    /// earns "Delivered"; `Blocked` stops retrying without ever claiming delivery (see the
+    /// 2026-08-22 audit); `Rejected` backs off and retries like any other failure.
     fn apply_send_outcome(
         &self,
         item: &nova_storage::OutboxItem,
@@ -326,48 +322,6 @@ impl NovaEngine {
             }
         }
         Ok(())
-    }
-
-    /// Best-effort fallback: if `item`'s recipient has a known `.onion` address (from their
-    /// stored `PreKeyBundle`), attempts delivery through it directly via Tor. Returns `None` —
-    /// meaning "fall through to the normal backoff/retry path" — whenever this fallback itself
-    /// could not be attempted or failed (unknown contact, no onion address on file, dial/timeout
-    /// error); returns `Some(outcome)` only for a completed round-trip with a real verdict.
-    async fn try_onion_fallback_send(
-        &self,
-        node: &nova_transport::P2PNode,
-        item: &nova_storage::OutboxItem,
-    ) -> Option<nova_transport::DeliveryOutcome> {
-        // Respect the user's own Tor setting — don't spend a dial attempt (and its timeout) on
-        // a SOCKS5 proxy the user never asked to use.
-        if !node.tor_manager.read().await.config().enabled {
-            return None;
-        }
-        let contact = self.storage.get_contact(&item.recipient_id).ok().flatten()?;
-        let onion_address = contact.prekey_bundle.onion_address();
-        let chunks = unwrap_chunks_for_outbox(&item.payload).ok()?;
-
-        // One onion-channel connection per chunk (see `crate::onion_channel`'s single-frame
-        // design) rather than one connection for the whole batch — simpler than adding
-        // multi-frame support there, at the cost of a fresh SOCKS5 dial per chunk. Acceptable:
-        // this fallback path is already the exception, not the common case.
-        let mut last_outcome = None;
-        for chunk in chunks {
-            match node
-                .send_via_onion(&onion_address, nova_transport::onion_channel::DEFAULT_ONION_CHANNEL_PORT, chunk)
-                .await
-            {
-                Ok(outcome) => last_outcome = Some(outcome),
-                Err(e) => {
-                    debug!("Outbox item {} onion fallback to {onion_address} failed: {e}", item.message_id);
-                    return None;
-                }
-            }
-        }
-        if let Some(outcome) = last_outcome {
-            debug!("Outbox item {} sent via Tor onion fallback to {onion_address}: {outcome:?}", item.message_id);
-        }
-        last_outcome
     }
 
     /// Applies exponential backoff to `item` for another retry, or — once it has been failing
@@ -518,75 +472,6 @@ impl NovaEngine {
         Ok(invitation.to_uri()?)
     }
 
-    /// Returns the deterministic Tor Onion v3 address of this device identity.
-    pub async fn own_onion_address(&self) -> Result<String, EngineError> {
-        let id_lock = self.identity.lock().await;
-        let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
-        Ok(nova_crypto::derive_onion_v3_address(&identity.verifying_key_bytes))
-    }
-
-    /// Queries the live Tor connectivity and circuit status.
-    pub async fn get_tor_status(&self) -> Result<nova_transport::TorStatus, EngineError> {
-        let net_lock = self.network.lock().await;
-        if let Some(node) = net_lock.as_ref() {
-            Ok(node.get_tor_status().await)
-        } else {
-            let saved = self.storage.get_tor_settings()?;
-            let own_onion = self.own_onion_address().await.unwrap_or_default();
-            let mode = match saved.mode.as_str() {
-                "hybrid" => nova_transport::TorMode::Hybrid,
-                "tor_strict" => nova_transport::TorMode::TorStrict,
-                _ => nova_transport::TorMode::DirectOnly,
-            };
-            Ok(nova_transport::TorStatus {
-                enabled: saved.enabled,
-                connected: false,
-                bootstrap_percent: 0,
-                onion_address: own_onion,
-                socks_proxy: saved.socks_proxy,
-                mode,
-                bridge_type: saved.bridge_type,
-            })
-        }
-    }
-
-    /// Configures the Tor privacy mode, proxy endpoint, and bridges, updating storage and active transport.
-    pub async fn configure_tor(
-        &self,
-        enabled: bool,
-        mode_str: &str,
-        socks_proxy: &str,
-        bridge_type: Option<String>,
-    ) -> Result<(), EngineError> {
-        let mode = match mode_str {
-            "hybrid" => nova_transport::TorMode::Hybrid,
-            "tor_strict" => nova_transport::TorMode::TorStrict,
-            _ => nova_transport::TorMode::DirectOnly,
-        };
-
-        let record = nova_storage::TorSettingsRecord {
-            enabled,
-            mode: mode_str.to_string(),
-            socks_proxy: socks_proxy.to_string(),
-            bridge_type: bridge_type.clone(),
-        };
-        self.storage.save_tor_settings(&record)?;
-
-        let net_lock = self.network.lock().await;
-        if let Some(node) = net_lock.as_ref() {
-            let own_onion = self.own_onion_address().await.ok();
-            node.configure_tor(nova_transport::TorConfig {
-                enabled,
-                mode,
-                socks_proxy: socks_proxy.to_string(),
-                onion_address: own_onion,
-                bridge_type,
-            }).await;
-        }
-
-        Ok(())
-    }
-
     /// Adds a new contact from their invitation URI or serialized prekey bundle.
     /// The ticket's signature, expiry deadline, and cryptographic bundle are verified
     /// before adding. Any embedded rendezvous addresses are automatically dialed in the background.
@@ -607,9 +492,32 @@ impl NovaEngine {
                     verify_prekey_bundle(&bundle)?;
                     (bundle, Vec::new())
                 }
-                // Not a recognizable invitation code at all (e.g. raw CBOR bytes that happen to
-                // be valid UTF-8) — last resort: try it as an unwrapped PreKeyBundle directly.
-                Err(_) => (bundle_from_raw_bytes(invitation_code_or_bytes)?, Vec::new()),
+                // Not a recognizable invitation code at all (e.g. raw CBOR bytes, peer_id, or @username)
+                Err(_) => {
+                    let trimmed = inv_str.trim();
+                    let resolved_bundle = if !trimmed.is_empty() {
+                        let search_res = self.search_directory(trimmed).await.unwrap_or_default();
+                        if let Some(matching) = search_res.into_iter().find(|u| {
+                            u.peer_id.eq_ignore_ascii_case(trimmed)
+                                || u.username.eq_ignore_ascii_case(trimmed.trim_start_matches('@'))
+                        }) {
+                            if let Ok(bytes) = hex::decode(&matching.prekey_bundle_hex) {
+                                bundle_from_raw_bytes(&bytes).ok()
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    match resolved_bundle {
+                        Some(b) => (b, Vec::new()),
+                        None => (bundle_from_raw_bytes(invitation_code_or_bytes)?, Vec::new()),
+                    }
+                }
             },
             // Raw CBOR bytes are usually not valid UTF-8 at all (e.g. the output of
             // `get_own_prekey_bundle_bytes` passed through unmodified) — go straight to the
@@ -628,6 +536,9 @@ impl NovaEngine {
         let peer_id = hex::encode(bundle.identity_ed25519_pub);
         let safety_number = compute_safety_number(&own_pub, &bundle.identity_ed25519_pub)?;
 
+        let existing_contact = self.storage.get_contact(&peer_id).ok().flatten();
+        let is_trusted = existing_contact.map(|c| c.is_trusted).unwrap_or(false);
+
         let contact = ContactRecord {
             peer_id: peer_id.clone(),
             username: username.to_string(),
@@ -636,6 +547,7 @@ impl NovaEngine {
             safety_number,
             is_online: true,
             is_blocked: false,
+            is_trusted,
             last_seen_utc: now_utc,
         };
         self.storage.save_contact(&contact)?;
@@ -662,11 +574,12 @@ impl NovaEngine {
         // currently unreachable to them, e.g. no network at all), but a failure here used to be
         // discarded with no trace whatsoever, not even a log line — impossible to diagnose why a
         // freshly-added contact never connects (this address is almost always the peer's own LAN
-        // IP, which is simply unreachable across different Wi-Fi/cellular networks; see the Tor
-        // Hybrid fallback, which is what actually recovers that case now).
+        // IP, which is simply unreachable across different Wi-Fi/cellular networks; see the
+        // WebSocket discovery/relay fallback in `crate::udp_fallback`, which is what actually
+        // recovers that case now).
         for addr in rendezvous_addrs {
             if let Err(e) = self.bootstrap_dial(&addr).await {
-                tracing::warn!("Initial rendezvous dial to {addr} failed (will retry via the outbox/Tor fallback when a message is sent): {e}");
+                tracing::warn!("Initial rendezvous dial to {addr} failed (will retry via the outbox/relay fallback when a message is sent): {e}");
             }
         }
 
@@ -1506,14 +1419,42 @@ impl NovaEngine {
         Ok(())
     }
 
+    /// Sets or clears the fallback server URL (e.g. Render WebSocket discovery/relay server).
+    pub async fn set_fallback_server_url(&self, url: Option<String>) {
+        if let Some(node) = self.network.lock().await.clone() {
+            node.set_fallback_server_url(url).await;
+        }
+    }
+
+    /// Retrieves the active fallback server URL, if any.
+    pub async fn get_fallback_server_url(&self) -> Option<String> {
+        if let Some(node) = self.network.lock().await.clone() {
+            node.get_fallback_server_url().await
+        } else {
+            None
+        }
+    }
+
     /// Retrieves the local user profile metadata.
     pub fn get_user_profile(&self) -> Result<Option<nova_storage::UserProfileRecord>, EngineError> {
         Ok(self.storage.get_user_profile()?)
     }
 
+    /// Marks a contact as trusted.
+    pub fn trust_contact(&self, peer_id: &str) -> Result<(), EngineError> {
+        self.storage.trust_contact(peer_id)?;
+        Ok(())
+    }
+
     /// Blocks a contact so that incoming messages from them are dropped.
     pub fn block_contact(&self, peer_id: &str) -> Result<(), EngineError> {
         self.storage.block_contact(peer_id)?;
+        Ok(())
+    }
+
+    /// Blocks a contact and completely wipes their conversation & message history.
+    pub fn block_and_delete_conversation(&self, peer_id: &str) -> Result<(), EngineError> {
+        self.storage.block_and_delete_conversation(peer_id)?;
         Ok(())
     }
 
@@ -1526,6 +1467,11 @@ impl NovaEngine {
     /// Checks if a contact is currently blocked.
     pub fn is_contact_blocked(&self, peer_id: &str) -> Result<bool, EngineError> {
         Ok(self.storage.is_contact_blocked(peer_id)?)
+    }
+
+    /// Retrieves all currently blocked contacts.
+    pub fn get_blocked_contacts(&self) -> Result<Vec<ContactRecord>, EngineError> {
+        Ok(self.storage.get_blocked_contacts()?)
     }
 
     /// Permanently removes a contact and their entire message history — see
@@ -1545,6 +1491,66 @@ impl NovaEngine {
     pub fn save_user_profile(&self, profile: &nova_storage::UserProfileRecord) -> Result<(), EngineError> {
         self.storage.save_user_profile(profile)?;
         Ok(())
+    }
+
+    /// Publishes this user's profile and PreKey bundle to the fallback directory.
+    pub async fn publish_directory_profile(&self) -> Result<(), EngineError> {
+        let Some(node) = self.network.lock().await.clone() else {
+            return Ok(());
+        };
+
+        let (identity_pub, username) = {
+            let id_lock = self.identity.lock().await;
+            let Some(id) = id_lock.as_ref() else {
+                return Ok(());
+            };
+            (id.public_id_hex(), id.username.clone())
+        };
+
+        let user_profile = self.storage.get_user_profile().ok().flatten();
+        let display_name = user_profile
+            .as_ref()
+            .map(|p| p.display_name.clone())
+            .unwrap_or_else(|| username.clone());
+        let avatar_data_url = user_profile.and_then(|p| p.avatar_data_url);
+        let bundle_bytes = self.get_own_prekey_bundle_bytes().await?;
+        let bundle_hex = hex::encode(bundle_bytes);
+
+        let profile = nova_protocol::DirectoryProfile {
+            peer_id: identity_pub,
+            username,
+            display_name,
+            avatar_data_url,
+            prekey_bundle_hex: bundle_hex,
+        };
+
+        let signed_entry = {
+            let id_lock = self.identity.lock().await;
+            let Some(id) = id_lock.as_ref() else {
+                return Ok(());
+            };
+            let now_utc = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            nova_protocol::SignedDirectoryEntry::sign(id, profile, now_utc)
+        };
+
+        if let Err(e) = node.register_directory_entry(signed_entry).await {
+            tracing::warn!("Failed to publish directory profile to fallback server: {e}");
+        } else {
+            tracing::info!("Directory profile published to fallback server successfully");
+        }
+
+        Ok(())
+    }
+
+    /// Searches the public fallback directory for users matching `query` (by peer_id, @username, or display name).
+    pub async fn search_directory(&self, query: &str) -> Result<Vec<nova_protocol::DirectorySearchResult>, EngineError> {
+        let Some(node) = self.network.lock().await.clone() else {
+            return Ok(Vec::new());
+        };
+        Ok(node.search_directory(query).await.unwrap_or_default())
     }
 }
 
