@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Voice notes: WebView getUserMedia({audio:true}) needs this Android-level grant too. -->
+    <!-- Voice notes & P2P Real-Time Calls: WebView getUserMedia needs audio grants -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- QR camera scanner: WebView getUserMedia({video:true}) needs this Android-level grant too
          — without it, the WebView's permission bridge denies the request outright before Android
          ever shows the "Allow NOVA Chat to use the camera?" runtime prompt, which is exactly what
