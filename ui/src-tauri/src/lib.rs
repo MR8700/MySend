@@ -394,6 +394,83 @@ fn get_attachment_data(state: State<'_, AppState>, message_id: String) -> Result
     Ok(bytes.map(|b| base64_encode(&b)))
 }
 
+/// Saves an attachment to the user's dedicated NOVA media folder (e.g. `Downloads/NOVA` or
+/// `Pictures/NOVA`) on disk, making it easily accessible outside the app (e.g. in file explorer or gallery).
+#[tauri::command]
+fn save_attachment_to_disk(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    message_id: String,
+    suggested_filename: Option<String>,
+) -> Result<String, String> {
+    let bytes = state
+        .engine
+        .get_attachment_data(&message_id)
+        .map_err(engine_err)?
+        .ok_or_else(|| "Pièce jointe introuvable".to_string())?;
+
+    let base_dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().picture_dir())
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|e| format!("Impossible d'accéder au dossier de téléchargement : {e}"))?;
+
+    let nova_media_dir = base_dir.join("NOVA");
+    std::fs::create_dir_all(&nova_media_dir)
+        .map_err(|e| format!("Impossible de créer le dossier NOVA : {e}"))?;
+
+    let raw_name = suggested_filename
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("nova_media_{}", message_id));
+
+    let sanitized_name: String = raw_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+
+    let mut target_path = nova_media_dir.join(&sanitized_name);
+    let mut counter = 1;
+    let stem = std::path::Path::new(&sanitized_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fichier");
+    let ext = std::path::Path::new(&sanitized_name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    while target_path.exists() {
+        let new_name = if ext.is_empty() {
+            format!("{}_{}", stem, counter)
+        } else {
+            format!("{}_{}.{}", stem, counter, ext)
+        };
+        target_path = nova_media_dir.join(new_name);
+        counter += 1;
+    }
+
+    std::fs::write(&target_path, &bytes)
+        .map_err(|e| format!("Erreur lors de l'enregistrement du fichier : {e}"))?;
+
+    Ok(target_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn get_media_folder_path(app: tauri::AppHandle) -> Result<String, String> {
+    let base_dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().picture_dir())
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|e| format!("Impossible d'accéder au dossier : {e}"))?;
+
+    let nova_media_dir = base_dir.join("NOVA");
+    let _ = std::fs::create_dir_all(&nova_media_dir);
+    Ok(nova_media_dir.to_string_lossy().to_string())
+}
+
 fn parse_content_type(s: &str) -> Result<nova_protocol::MessageContentType, String> {
     match s {
         "image" | "Image" => Ok(nova_protocol::MessageContentType::Image),
@@ -596,6 +673,8 @@ pub fn run() {
             send_message,
             send_media,
             get_attachment_data,
+            save_attachment_to_disk,
+            get_media_folder_path,
             retry_failed_message,
             get_conversations,
             get_messages,

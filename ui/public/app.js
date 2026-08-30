@@ -26,6 +26,8 @@ const icons = {
     trash: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>`,
     mapPin: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>`,
     chevronRight: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>`,
+    download: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>`,
+    copy: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`,
 };
 
 // --- SECURITY: HTML ESCAPING ---
@@ -146,7 +148,13 @@ const CLICK_ACTIONS = {
     openQrCameraScanner: () => openQrCameraScanner(),
     closeQrCameraScanner: () => closeQrCameraScanner(),
     openImagePreview: (el) => openImagePreviewEl(el),
+    closeImagePreview: () => closeImagePreview(),
+    downloadCurrentImage: () => runPendingAction(null, downloadCurrentImage),
+    saveAttachment: (el) => runPendingAction(el, () => saveAttachmentToDisk(el.dataset.msgId, el.dataset.filename)),
     showFileAlert: (el) => showFileAlertEl(el),
+    closeMnemonicDisplayModal: () => closeMnemonicDisplayModal(),
+    copyMnemonicPhrase: () => copyMnemonicPhrase(),
+    confirmMnemonicSaved: () => closeMnemonicDisplayModal(),
     triggerQrImagePicker: () => document.getElementById('qr-image-input').click(),
     logout: (el) => runPendingAction(el, logoutReal),
     retryOwnBundle: (el) => runPendingAction(el, retryOwnBundleReal),
@@ -997,6 +1005,19 @@ const screens = {
                         <span style="font-size: 14px; color: white;">Cacher le contenu dans les notifications</span>
                         <input type="checkbox" id="notif-hide-content-chk" ${state.notificationPrefs.hideContent ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
                     </div>
+                <!-- Storage & Received Media Folder -->
+                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">STOCKAGE & MÉDIAS</div>
+                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+                        <div style="font-size: 13px; font-weight: 600; color: white;">Dossier des médias reçus</div>
+                        <span style="font-size: 11px; background: rgba(34, 197, 94, 0.15); color: var(--status-success); padding: 2px 8px; border-radius: var(--radius-full); font-weight: 600;">Dédié</span>
+                    </div>
+                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 10px;">
+                        Les photos, vidéos, documents et notes vocales enregistrés sont automatiquement exportés dans le dossier <strong>Téléchargements/NOVA</strong> de votre appareil pour être consultables à tout moment.
+                    </div>
+                    <div style="font-size: 11px; font-family: monospace; color: var(--accent-purple-light); background: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 12px; word-break: break-all;" id="settings-media-folder-path">
+                        Téléchargements/NOVA
+                    </div>
                 </div>
 
                 <!-- Advanced: connecting across two different networks (most people never need this) -->
@@ -1258,6 +1279,7 @@ async function navigateTo(screenKey) {
             await refreshBootstrapAddr();
             await refreshFallbackServerUrl();
             await refreshOwnFullListenAddr();
+            await refreshMediaFolderPath();
         }
     }
 
@@ -1369,7 +1391,7 @@ async function navigateTo(screenKey) {
 // what's really on screen (e.g. an overlay closed by tapping outside it, or a "Annuler" button,
 // rather than by the back button).
 function isAnyOverlayOpen() {
-    const modalIds = ['qr-camera-modal', 'media-preview-modal', 'location-modal', 'mnemonic-auth-modal', 'edit-profile-modal', 'inspect-user-modal', 'block-contact-modal'];
+    const modalIds = ['qr-camera-modal', 'media-preview-modal', 'location-modal', 'mnemonic-auth-modal', 'mnemonic-display-modal', 'image-preview-modal', 'edit-profile-modal', 'inspect-user-modal', 'block-contact-modal'];
     if (modalIds.some(id => {
         const el = document.getElementById(id);
         return el && el.classList.contains('show');
@@ -1403,6 +1425,8 @@ window.addEventListener('popstate', (event) => {
         closeMediaPreviewModal();
         closeLocationModal();
         closeMnemonicAuthModal();
+        closeMnemonicDisplayModal();
+        closeImagePreview();
         closeEditProfileModal();
         closeInspectUserModal();
         closeBlockModal();
@@ -1537,9 +1561,10 @@ async function createAccountReal() {
         const networkNote = info.network_active
             ? ''
             : '\n\n(Pas de connexion réseau détectée pour l\'instant — votre compte est bien créé et sauvegardé, l\'app réessaiera de se connecter automatiquement.)';
-        alert('Votre compte est prêt ! Notez ces 12 mots quelque part de sûr (papier, gestionnaire de mots de passe...) — c\'est la seule façon de retrouver votre compte plus tard :\n\n' + info.mnemonic + networkNote);
-        await refreshConversationsFromBackend();
-        navigateTo('conversations');
+        showMnemonicDisplayModal(info.mnemonic, async () => {
+            await refreshConversationsFromBackend();
+            navigateTo('conversations');
+        });
     } catch (e) {
         alert(String(e).includes('already exists')
             ? 'Vous avez déjà un compte sur cet appareil. Pour en créer un nouveau, supprimez d\'abord l\'actuel (Réglages → Mon identité).'
@@ -2455,9 +2480,11 @@ async function confirmMnemonicPin() {
 
         mnemonicAuthAttempts = 0;
         closeMnemonicAuthModal();
-        alert(state.currentUser.mnemonic
-            ? 'Code de sécurité enregistré avec succès !\n\nVotre phrase secrète :\n\n' + state.currentUser.mnemonic
-            : 'Code de sécurité configuré.');
+        if (state.currentUser.mnemonic) {
+            showMnemonicDisplayModal(state.currentUser.mnemonic);
+        } else {
+            showToastNotification('Code de sécurité configuré.');
+        }
         return;
     }
 
@@ -2466,9 +2493,11 @@ async function confirmMnemonicPin() {
     if (computedHash === storedHash) {
         mnemonicAuthAttempts = 0;
         closeMnemonicAuthModal();
-        alert(state.currentUser.mnemonic
-            ? 'Votre phrase secrète :\n\n' + state.currentUser.mnemonic
-            : 'Créez d\'abord votre compte pour obtenir une phrase secrète.');
+        if (state.currentUser.mnemonic) {
+            showMnemonicDisplayModal(state.currentUser.mnemonic);
+        } else {
+            showToastNotification('Créez d\'abord votre compte pour obtenir une phrase secrète.');
+        }
         return;
     }
 
@@ -2484,6 +2513,157 @@ async function confirmMnemonicPin() {
     if (input) {
         input.value = '';
         input.focus();
+    }
+}
+
+// --- FLOATING TOAST NOTIFICATION ---
+let toastTimer = null;
+function showToastNotification(message) {
+    const toast = document.getElementById('toast-notification');
+    if (!toast) return;
+    toast.textContent = message;
+    toast.classList.add('show');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+        toast.classList.remove('show');
+    }, 2800);
+}
+
+// --- 12-WORD MNEMONIC MODAL & CLIPBOARD COPY ---
+let pendingMnemonicConfirmCallback = null;
+
+function showMnemonicDisplayModal(mnemonic, onConfirm) {
+    const modal = document.getElementById('mnemonic-display-modal');
+    const grid = document.getElementById('mnemonic-words-grid');
+    const btnLabel = document.getElementById('copy-mnemonic-btn-label');
+    if (!modal || !grid) {
+        if (onConfirm) onConfirm();
+        return;
+    }
+    pendingMnemonicConfirmCallback = onConfirm || null;
+    const cleanMnemonic = (mnemonic || state.currentUser.mnemonic || '').trim();
+    const words = cleanMnemonic.split(/\s+/).filter(Boolean);
+
+    grid.innerHTML = words.map((word, i) => `
+        <div class="mnemonic-chip">
+            <span class="mnemonic-chip-num">${i + 1}.</span>
+            <span class="mnemonic-chip-word">${escapeHtml(word)}</span>
+        </div>
+    `).join('');
+
+    if (btnLabel) btnLabel.textContent = 'Copier la phrase secrète (12 mots)';
+    modal.classList.add('show');
+}
+
+function closeMnemonicDisplayModal() {
+    const modal = document.getElementById('mnemonic-display-modal');
+    if (modal) modal.classList.remove('show');
+    if (pendingMnemonicConfirmCallback) {
+        const cb = pendingMnemonicConfirmCallback;
+        pendingMnemonicConfirmCallback = null;
+        cb();
+    }
+}
+
+async function copyMnemonicPhrase() {
+    const mnemonic = (state.currentUser.mnemonic || '').trim();
+    if (!mnemonic) {
+        showToastNotification('Aucune phrase secrète disponible');
+        return;
+    }
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(mnemonic);
+        } else {
+            const textarea = document.createElement('textarea');
+            textarea.value = mnemonic;
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+        }
+        const btnLabel = document.getElementById('copy-mnemonic-btn-label');
+        if (btnLabel) btnLabel.textContent = '✓ 12 mots copiés !';
+        showToastNotification('✓ Phrase de récupération (12 mots) copiée !');
+    } catch (e) {
+        showToastNotification('Phrase : ' + mnemonic);
+    }
+}
+
+// --- IMAGE PREVIEW & MEDIA DISK STORAGE ---
+let currentPreviewImageData = null;
+
+function openImagePreviewEl(el) {
+    const url = el.getAttribute('data-url') || el.src;
+    const msgId = el.getAttribute('data-msg-id') || '';
+    const filename = el.getAttribute('data-filename') || 'photo.jpg';
+    if (!url) return;
+
+    currentPreviewImageData = { url, msgId, filename };
+    const modal = document.getElementById('image-preview-modal');
+    const img = document.getElementById('image-preview-img');
+    const title = document.getElementById('image-preview-filename');
+    if (modal && img) {
+        img.src = url;
+        if (title) title.textContent = filename;
+        modal.classList.add('show');
+    }
+}
+
+function closeImagePreview() {
+    const modal = document.getElementById('image-preview-modal');
+    if (modal) modal.classList.remove('show');
+    currentPreviewImageData = null;
+}
+
+async function downloadCurrentImage() {
+    if (!currentPreviewImageData) return;
+    if (currentPreviewImageData.msgId) {
+        await saveAttachmentToDisk(currentPreviewImageData.msgId, currentPreviewImageData.filename);
+    } else if (currentPreviewImageData.url) {
+        const link = document.createElement('a');
+        link.download = currentPreviewImageData.filename || 'photo_nova.jpg';
+        link.href = currentPreviewImageData.url;
+        link.click();
+        showToastNotification('✓ Photo téléchargée');
+    }
+}
+
+async function saveAttachmentToDisk(msgId, suggestedFilename) {
+    if (!hasBackend) {
+        showToastNotification('Enregistrement réservé à l\'application native');
+        return;
+    }
+    try {
+        const savedPath = await tauriInvoke('save_attachment_to_disk', {
+            messageId: String(msgId),
+            suggestedFilename: suggestedFilename || null
+        });
+        const basename = savedPath.split(/[\\/]/).pop();
+        showToastNotification(`✓ Enregistré dans Téléchargements/NOVA/${basename}`);
+    } catch (e) {
+        showToastNotification(`Erreur d'enregistrement : ${e}`);
+    }
+}
+
+function showFileAlertEl(el) {
+    const msgId = el.getAttribute('data-msg-id');
+    const filename = el.getAttribute('data-filename') || 'fichier';
+    if (msgId) {
+        saveAttachmentToDisk(msgId, filename);
+    } else {
+        showToastNotification(`Document : ${filename}`);
+    }
+}
+
+async function refreshMediaFolderPath() {
+    if (!hasBackend) return;
+    try {
+        const folderPath = await tauriInvoke('get_media_folder_path');
+        const el = document.getElementById('settings-media-folder-path');
+        if (el) el.textContent = folderPath;
+    } catch (e) {
+        // Non critical
     }
 }
 
@@ -2506,66 +2686,77 @@ function updateGlobalUnreadBadges() {
 
 // --- CHAT RENDERING & DOM MUTATION HELPERS ---
 function buildMessageHtml(m) {
-    // m.text / m.meta / m.url ultimately come from a remote peer (message content, a shared
-    // filename, a shared image) — every one is escaped before it touches innerHTML, and none
-    // is ever spliced into an executable JS attribute (see the data-* + named-handler pattern
-    // below), so a hostile value can only ever render as inert text.
     const safeText = escapeHtml(m.text);
     const safeMeta = escapeHtml(m.meta);
+    const safeId = escapeHtml(m.id);
 
     let contentHtml = '';
     if (m.type === 'image') {
         contentHtml = `
             <div class="msg-photo-card">
-                ${m.url ? `<img src="${escapeHtml(m.url)}" class="msg-image-thumb" data-url="${escapeHtml(m.url)}" data-action="openImagePreview" title="Cliquer pour agrandir" />` : `
+                ${m.url ? `<img src="${escapeHtml(m.url)}" class="msg-image-thumb" data-url="${escapeHtml(m.url)}" data-msg-id="${safeId}" data-filename="${safeText || 'photo.jpg'}" data-action="openImagePreview" title="Cliquer pour agrandir" />` : `
                     <div class="msg-photo-preview">
                         ${icons.image}
                         <span style="font-size: 11px; font-weight: 600; color: white;">${safeText || 'Photo'}</span>
                         <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || '1,8 Mo'}</span>
                     </div>
                 `}
-                <div style="padding: 6px 10px; font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center;">
-                    <span style="font-weight: 600; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px;">${safeText}</span>
-                    <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || 'Envoyé'}</span>
+                <div style="padding: 6px 10px; font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+                    <span style="font-weight: 600; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px;">${safeText || 'Photo'}</span>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || ''}</span>
+                        <button class="icon-btn" style="width: 24px; height: 24px; color: var(--accent-purple-light); padding: 0;" data-action="saveAttachment" data-msg-id="${safeId}" data-filename="${safeText || 'photo.jpg'}" title="Enregistrer dans Téléchargements/NOVA">
+                            ${icons.download}
+                        </button>
+                    </div>
                 </div>
             </div>
         `;
     } else if (m.type === 'file') {
         contentHtml = `
-            <div class="msg-file-card" data-filename="${escapeHtml(m.text)}" data-action="showFileAlert" style="cursor: pointer;">
-                ${icons.file}
-                <div style="overflow: hidden;">
-                    <div style="font-size: 13px; font-weight: 600; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px;">${safeText}</div>
-                    <div style="font-size: 11px; color: var(--text-muted);">${safeMeta || '2,4 Mo'}</div>
+            <div class="msg-file-card" data-msg-id="${safeId}" data-filename="${safeText || 'document'}" data-action="showFileAlert" style="cursor: pointer; display: flex; align-items: center; justify-content: space-between;">
+                <div style="display: flex; align-items: center; gap: 10px; overflow: hidden;">
+                    ${icons.file}
+                    <div style="overflow: hidden;">
+                        <div style="font-size: 13px; font-weight: 600; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px;">${safeText}</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">${safeMeta || 'Fichier'}</div>
+                    </div>
                 </div>
+                <button class="icon-btn" style="width: 26px; height: 26px; color: var(--accent-purple-light); padding: 0;" data-action="saveAttachment" data-msg-id="${safeId}" data-filename="${safeText || 'document'}" title="Enregistrer dans Téléchargements/NOVA">
+                    ${icons.download}
+                </button>
             </div>
         `;
     } else if (m.type === 'video') {
-        // Previously fell through to a plain text bubble — video had a URL but no player at
-        // all. A real, playable <video> now, with the same "not loaded yet" placeholder pattern
-        // as image/voice above while the attachment is being fetched (see ensureAttachmentLoaded).
         contentHtml = `
             <div class="msg-photo-card">
                 ${m.url ? `<video src="${escapeHtml(m.url)}" controls preload="metadata" class="msg-image-thumb" style="background:#000;"></video>` : `
                     <div class="msg-photo-preview">
-                        ${icons.image}
+                        ${icons.video}
                         <span style="font-size: 11px; font-weight: 600; color: white;">${safeText || 'Vidéo'}</span>
                         <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || ''}</span>
                     </div>
                 `}
-                <div style="padding: 6px 10px; font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center;">
-                    <span style="font-weight: 600; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px;">${safeText}</span>
-                    <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || 'Envoyé'}</span>
+                <div style="padding: 6px 10px; font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+                    <span style="font-weight: 600; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px;">${safeText || 'Vidéo'}</span>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || ''}</span>
+                        <button class="icon-btn" style="width: 24px; height: 24px; color: var(--accent-purple-light); padding: 0;" data-action="saveAttachment" data-msg-id="${safeId}" data-filename="${safeText || 'video.mp4'}" title="Enregistrer dans Téléchargements/NOVA">
+                            ${icons.download}
+                        </button>
+                    </div>
                 </div>
             </div>
         `;
     } else if (m.type === 'voice') {
-        // A real, playable recording (see stopAndSendVoiceRecording) — native <audio controls>
-        // rather than a custom-styled player, so playback is guaranteed correct rather than
-        // hand-rolled and unverified.
         contentHtml = `
             <div class="msg-voice-card" style="flex-direction: column; align-items: stretch; gap: 4px;">
-                ${m.url ? `<audio controls preload="none" src="${escapeHtml(m.url)}" style="width: 220px; height: 36px;"></audio>` : `<span style="font-size: 12px; color: var(--text-dim);">Audio indisponible</span>`}
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    ${m.url ? `<audio controls preload="none" src="${escapeHtml(m.url)}" style="flex: 1; height: 36px;"></audio>` : `<span style="font-size: 12px; color: var(--text-dim);">Audio indisponible</span>`}
+                    <button class="icon-btn" style="width: 24px; height: 24px; color: var(--text-muted); padding: 0;" data-action="saveAttachment" data-msg-id="${safeId}" data-filename="note_vocale_${safeId}.webm" title="Enregistrer la note vocale">
+                        ${icons.download}
+                    </button>
+                </div>
                 <span style="font-size: 11px; color: var(--text-muted); font-family: monospace;">${safeMeta || ''}</span>
             </div>
         `;
@@ -2602,7 +2793,6 @@ function buildMessageHtml(m) {
         contentHtml = `<div class="msg-bubble">${safeText}</div>`;
     }
 
-    const safeId = escapeHtml(m.id);
     const statusHtml = m.isOutgoing ? `
         <span id="msg-status-${safeId}" style="display: inline-flex; align-items: center;">
             ${messageStatusTickHtml(m)}

@@ -1754,3 +1754,206 @@ button:disabled,
     transform: translateY(-2px) scale(1.05);
 }
 
+/* ==========================================================================
+   MOBILE BOTTOM NAVIGATION & SAFE-AREA RESPONSIVE ADAPTATION
+   ========================================================================== */
+.mobile-bottom-nav {
+    display: none;
+    width: 100%;
+    height: calc(58px + env(safe-area-inset-bottom, 0px));
+    padding: 6px 12px calc(6px + env(safe-area-inset-bottom, 0px)) 12px;
+    background-color: var(--bg-surface);
+    border-top: 1px solid var(--border-subtle);
+    justify-content: space-around;
+    align-items: center;
+    flex-shrink: 0;
+    z-index: 40;
+    box-sizing: border-box;
+}
+
+@media (max-width: 1023px) {
+    .app-root {
+        flex-direction: column;
+        width: 100vw;
+        height: 100vh;
+        height: 100dvh;
+        overflow: hidden;
+    }
+
+    .app-stage {
+        flex: 1;
+        min-height: 0;
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+
+    .screen-container {
+        flex: 1;
+        min-height: 0;
+        width: 100%;
+        max-width: 100%;
+        height: 100%;
+        box-shadow: none;
+        overflow: hidden;
+    }
+
+    .mobile-bottom-nav.show {
+        display: flex;
+    }
+}
+
+.nav-tab {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    flex: 1;
+    padding: 6px 0;
+    border-radius: var(--radius-md);
+    transition: var(--transition-fast);
+}
+
+.nav-tab:hover, .nav-tab.active {
+    color: var(--accent-purple-light);
+}
+
+.badge-tab-unread {
+    display: none;
+    position: absolute;
+    top: 2px;
+    right: 22%;
+    background-color: var(--accent-purple);
+    color: white;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: var(--radius-full);
+    min-width: 16px;
+    height: 16px;
+    line-height: 14px;
+    text-align: center;
+    border: 2px solid var(--bg-surface);
+}
+
+/* ==========================================================================
+   12-WORD MNEMONIC GRID & BADGES (100% COPYABLE)
+   ========================================================================== */
+.mnemonic-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    background: rgba(0, 0, 0, 0.4);
+    padding: 14px;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-subtle);
+    user-select: text;
+    -webkit-user-select: text;
+}
+
+@media (max-width: 420px) {
+    .mnemonic-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.mnemonic-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--bg-surface-2);
+    border: 1px solid var(--border-subtle);
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-family: monospace;
+    color: white;
+}
+
+.mnemonic-chip-num {
+    font-size: 10px;
+    color: var(--accent-purple-light);
+    font-weight: 700;
+    min-width: 18px;
+}
+
+.mnemonic-chip-word {
+    font-weight: 600;
+    color: white;
+}
+
+/* ==========================================================================
+   FULLSCREEN IMAGE PREVIEW VIEWER & SAVE
+   ========================================================================== */
+.image-preview-modal-view {
+    background: rgba(0, 0, 0, 0.96);
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 0;
+    z-index: 3000;
+}
+
+.image-preview-header {
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: calc(14px + env(safe-area-inset-top, 0px)) 16px 14px 16px;
+    background: rgba(8, 10, 16, 0.85);
+    backdrop-filter: blur(12px);
+    z-index: 10;
+}
+
+.image-preview-content {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    padding: 12px;
+}
+
+.image-preview-content img {
+    max-width: 100%;
+    max-height: 85vh;
+    object-fit: contain;
+    border-radius: var(--radius-md);
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+}
+
+/* ==========================================================================
+   FLOATING TOAST NOTIFICATION
+   ========================================================================== */
+.toast-notification {
+    position: fixed;
+    bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    left: 50%;
+    transform: translateX(-50%) translateY(100px);
+    background: rgba(17, 20, 28, 0.95);
+    color: white;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 10px 20px;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--accent-purple);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.7);
+    z-index: 99999;
+    pointer-events: none;
+    opacity: 0;
+    transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease;
+}
+
+.toast-notification.show {
+    transform: translateX(-50%) translateY(0);
+    opacity: 1;
+}
+
+
