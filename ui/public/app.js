@@ -100,7 +100,9 @@ const CLICK_ACTIONS = {
     toggleCallMute: () => toggleCallMute(),
     toggleCallVideo: () => toggleCallVideo(),
     switchCallCamera: () => switchCallCamera(),
+    toggleCallTorch: () => toggleCallTorch(),
     hangupActiveCall: () => hangupCall(true, 'Fin de l\'appel'),
+    clearConversationsSearch: () => clearConversationsSearch(),
     triggerMediaPicker: () => triggerDeviceMediaPicker(),
     triggerDocPicker: () => triggerDeviceDocPicker(),
     startVoiceRecording: () => startVoiceRecording(),
@@ -128,8 +130,7 @@ const CLICK_ACTIONS = {
     deleteContact: (el) => runPendingAction(el, () => deleteContactReal(el.dataset.peerId, el.dataset.name)),
     addContact: (el) => runPendingAction(el, addContactReal),
     retryFailedMessage: (el) => runPendingAction(el, () => retryFailedMessageReal(el.dataset.msgId, el.dataset.convId, el.dataset.recipientId)),
-    saveBootstrapAddr: (el) => runPendingAction(el, saveBootstrapAddr),
-    saveFallbackServerUrl: (el) => runPendingAction(el, saveFallbackServerUrl),
+    clearAppCache: () => clearAppCache(),
     inspectDirectoryUser: (el) => inspectDirectoryUser(el.dataset.peerId),
     closeInspectUserModal: () => closeInspectUserModal(),
     addInspectedUser: (el) => runPendingAction(el, addInspectedUser),
@@ -155,9 +156,58 @@ const CLICK_ACTIONS = {
     closeMnemonicDisplayModal: () => closeMnemonicDisplayModal(),
     copyMnemonicPhrase: () => copyMnemonicPhrase(),
     confirmMnemonicSaved: () => closeMnemonicDisplayModal(),
-    triggerQrImagePicker: () => document.getElementById('qr-image-input').click(),
     logout: (el) => runPendingAction(el, logoutReal),
     retryOwnBundle: (el) => runPendingAction(el, retryOwnBundleReal),
+    openReportModal: (el) => openReportModal(el.dataset.peerId, el.dataset.name),
+    closeReportModal: () => closeReportModal(),
+    confirmSubmitReport: (el) => runPendingAction(el, confirmSubmitReportReal),
+    openFeedbackModal: () => openFeedbackModal(),
+    closeFeedbackModal: () => closeFeedbackModal(),
+    setFeedbackRating: (el) => setFeedbackRating(parseInt(el.dataset.rating, 10)),
+    confirmSubmitFeedback: (el) => runPendingAction(el, confirmSubmitFeedbackReal),
+    loadAdminOverview: (el) => runPendingAction(el, loadAdminOverviewReal),
+    saveAdminToken: () => saveAdminToken(),
+    setAdminTab: (el) => setAdminTab(el.dataset.tab),
+    setAdminFilter: (el) => setAdminFilter(el.dataset.filter),
+    adminBanUser: (el) => runPendingAction(el, () => adminBanUserReal(el.dataset.peerId)),
+    adminUnbanUser: (el) => runPendingAction(el, () => adminUnbanUserReal(el.dataset.peerId)),
+    adminSaveThreshold: (el) => runPendingAction(el, adminSaveThresholdReal),
+    openSetupPinModal: () => openSetupPinModal(),
+    closeSetupPinModal: () => closeSetupPinModal(),
+    saveNewPin: (el) => runPendingAction(el, saveNewPin),
+    appLockKeypad: (el) => handlePinDigit(el.dataset.digit),
+    appLockBackspace: () => handlePinBackspace(),
+    triggerBiometricsUnlock: () => triggerBiometricsUnlock(),
+    openMessageActionsModal: (el) => openMessageActionsModal(el.dataset.msgId),
+    closeMessageActionsModal: () => closeMessageActionsModal(),
+    copyMessageText: () => copyMessageText(),
+    deleteMessageForMe: (el) => runPendingAction(el, deleteMessageForMe),
+    deleteMessageForEveryone: (el) => runPendingAction(el, deleteMessageForEveryone),
+    shareMessageExternally: () => shareMessageExternally(),
+    saveMessageMediaToDisk: (el) => runPendingAction(el, saveMessageMediaToDisk),
+    openForwardMessageModal: () => openForwardMessageModal(),
+    closeForwardMessageModal: () => closeForwardMessageModal(),
+    forwardToContact: (el) => runPendingAction(el, () => confirmForwardMessage(el.dataset.peerId)),
+    openEphemeralTimerModal: () => openEphemeralTimerModal(),
+    closeEphemeralTimerModal: () => closeEphemeralTimerModal(),
+    setEphemeralTimer: (el) => setConversationEphemeralTimer(el.dataset.mode),
+    reportCurrentMessage: () => reportCurrentMessage(),
+    openDocumentViewer: (el) => openDocumentViewer(el.dataset.msgId, el.dataset.filename),
+    closeDocumentViewer: () => closeDocumentViewer(),
+    openSavedDocExternally: (el) => runPendingAction(el, openSavedDocExternally),
+    saveCurrentDocument: (el) => runPendingAction(el, saveCurrentDocument),
+    copyDocTextContent: () => copyDocTextContent(),
+    openLocationModal: (el) => openLocationModal(el.dataset.coords, el.dataset.label),
+    closeLocationModal: () => closeLocationModal(),
+    openInOpenStreetMap: () => openInOpenStreetMap(),
+    openInGoogleMaps: () => openInGoogleMaps(),
+    openInNativeGps: () => openInNativeGps(),
+    copyGpsCoordinates: () => copyGpsCoordinates(),
+    openVideoPlayerModal: (el) => openVideoPlayerModal(el.dataset.url, el.dataset.msgId, el.dataset.filename),
+    closeVideoPlayerModal: () => closeVideoPlayerModal(),
+    downloadCurrentVideo: (el) => runPendingAction(el, downloadCurrentVideo),
+    closeExecutableWarningModal: () => closeExecutableWarningModal(),
+    confirmOpenExecutable: (el) => runPendingAction(el, confirmOpenExecutable),
 };
 
 document.addEventListener('click', (event) => {
@@ -175,18 +225,40 @@ const ENTER_SUBMIT_MAP = {
     'mnemonic-auth-pin': () => confirmMnemonicPin(),
     'edit-display-name-input': () => saveProfileChanges(),
     'media-caption-input': () => confirmAndSendPendingMedia(),
-    'bootstrap-addr-input': () => saveBootstrapAddr(),
-    'fallback-server-url-input': () => saveFallbackServerUrl(),
+    'admin-token-input': () => saveAdminToken(),
+    'setup-pin-confirm': () => saveNewPin(),
 };
 document.addEventListener('keydown', (event) => {
+    if (state.isAppLocked) {
+        if (event.key >= '0' && event.key <= '9') {
+            handlePinDigit(event.key);
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return;
+        } else if (event.key === 'Backspace') {
+            handlePinBackspace();
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return;
+        }
+        // Block all other keys when locked
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+    }
     const handler = event.key === 'Enter' && ENTER_SUBMIT_MAP[event.target.id];
     if (handler) handler();
 });
 
 const INPUT_HANDLERS = {
+    'conversations-search-input': filterConversationsList,
     'contacts-search-input': filterContactsList,
     'global-search-input': handleStrictSearch,
     'contact-search-query': handleContactDirectorySearch,
+    'admin-user-search-input': (val) => {
+        state.adminState.searchQuery = val;
+        if (state.currentScreen === 'admin_dashboard') navigateTo('admin_dashboard');
+    },
 };
 document.addEventListener('input', (event) => {
     const handler = INPUT_HANDLERS[event.target.id];
@@ -209,9 +281,45 @@ const CHANGE_HANDLERS = {
         state.notificationPrefs.notifyContacts = e.target.checked;
         localStorage.setItem('nova_notify_contacts', String(e.target.checked));
     },
+    'notif-ringtone-chk': (e) => {
+        state.notificationPrefs.ringtoneEnabled = e.target.checked;
+        localStorage.setItem('nova_ringtone_enabled', String(e.target.checked));
+    },
+    'notif-app-sounds-chk': (e) => {
+        state.notificationPrefs.appSounds = e.target.checked;
+        localStorage.setItem('nova_app_sounds', String(e.target.checked));
+    },
     'notif-hide-content-chk': (e) => {
         state.notificationPrefs.hideContent = e.target.checked;
         localStorage.setItem('nova_hide_content', String(e.target.checked));
+    },
+    'auto-save-media-chk': (e) => {
+        state.notificationPrefs.autoSaveMedia = e.target.checked;
+        localStorage.setItem('nova_auto_save_media', String(e.target.checked));
+    },
+    'app-lock-toggle-chk': (e) => {
+        if (e.target.checked) {
+            if (!state.appLock.pinHash) {
+                e.target.checked = false;
+                openSetupPinModal();
+                return;
+            }
+            state.appLock.enabled = true;
+            localStorage.setItem('nova_app_lock_enabled', 'true');
+        } else {
+            state.appLock.enabled = false;
+            localStorage.setItem('nova_app_lock_enabled', 'false');
+        }
+        if (state.currentScreen === 'settings') navigateTo('settings');
+    },
+    'app-lock-timeout-select': (e) => {
+        const val = parseInt(e.target.value, 10);
+        state.appLock.timeoutMin = val;
+        localStorage.setItem('nova_app_lock_timeout_min', String(val));
+    },
+    'app-lock-biometrics-chk': (e) => {
+        state.appLock.biometricsEnabled = e.target.checked;
+        localStorage.setItem('nova_app_lock_biometrics', String(e.target.checked));
     },
 };
 document.addEventListener('change', (event) => {
@@ -222,10 +330,29 @@ document.addEventListener('change', (event) => {
 // Global Reactive State (Strictly 1-to-1 Device Sovereignty)
 const state = {
     currentScreen: 'onboarding',
+    networkOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
+    conversationsSearchQuery: '',
+    appLock: {
+        enabled: localStorage.getItem('nova_app_lock_enabled') === 'true',
+        pinHash: localStorage.getItem('nova_app_lock_pin_hash') || '',
+        pinSalt: localStorage.getItem('nova_app_lock_pin_salt') || '',
+        pinLength: parseInt(localStorage.getItem('nova_app_lock_pin_length') || '4', 10),
+        timeoutMin: parseInt(localStorage.getItem('nova_app_lock_timeout_min') || '5', 10),
+        biometricsEnabled: localStorage.getItem('nova_app_lock_biometrics') !== 'false',
+    },
+    isAppLocked: false,
+    enteredPin: '',
+    failedPinAttempts: 0,
+    lockoutUntil: 0,
+    lastUserInteraction: Date.now(),
+    wentToBackgroundAt: null,
     notificationPrefs: {
         notifyMessages: localStorage.getItem('nova_notify_messages') !== 'false',
         notifyContacts: localStorage.getItem('nova_notify_contacts') !== 'false',
+        ringtoneEnabled: localStorage.getItem('nova_ringtone_enabled') !== 'false',
+        appSounds: localStorage.getItem('nova_app_sounds') !== 'false',
         hideContent: localStorage.getItem('nova_hide_content') === 'true',
+        autoSaveMedia: localStorage.getItem('nova_auto_save_media') !== 'false',
     },
     currentUser: {
         name: '',
@@ -277,6 +404,22 @@ const state = {
     conversations: [],
     messages: [],
     contacts: [],
+    buildInfo: {
+        variant: 'user',
+        is_admin: false,
+        version: '1.0.0',
+    },
+    feedbackRating: 5,
+    pendingReport: null,
+    adminState: {
+        token: localStorage.getItem('nova_admin_token') || '',
+        overview: null,
+        activeTab: 'users',
+        filterStatus: 'all',
+        searchQuery: '',
+        isLoading: false,
+        error: '',
+    },
     emojis: [
         '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '😊', '😇',
         '🙂', '😉', '😍', '🥰', '😘', '😋', '😎', '🥳', '🤩', '😏',
@@ -397,40 +540,15 @@ const screens = {
             </header>
 
             <div class="search-bar-wrap">
-                <div class="search-input-box" data-action="navigate" data-screen="global_search">
+                <div class="search-input-box">
                     ${icons.search}
-                    <input type="text" placeholder="Rechercher une conversation..." readonly>
+                    <input type="text" id="conversations-search-input" placeholder="Rechercher une conversation..." value="${escapeHtml(state.conversationsSearchQuery || '')}">
+                    ${state.conversationsSearchQuery ? `<button style="background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 0 4px; font-size: 14px;" data-action="clearConversationsSearch">✕</button>` : ''}
                 </div>
             </div>
 
-            <div class="scroll-list">
-                ${state.conversations.length > 0 ? state.conversations.map(c => `
-                    <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
-                        <div class="avatar">
-                            ${escapeHtml(c.name.charAt(0))}
-                            <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
-                        </div>
-                        <div class="item-content">
-                            <div class="item-header">
-                                <span class="item-name" style="${c.unread > 0 ? 'font-weight: 700; color: white;' : ''}">${escapeHtml(c.name)}</span>
-                                <span class="item-time" style="${c.unread > 0 ? 'color: var(--accent-purple-light); font-weight: 600;' : ''}">${escapeHtml(c.time)}</span>
-                            </div>
-                            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 2px;">
-                                <span class="item-sub" style="${c.unread > 0 ? 'color: var(--text-main); font-weight: 600;' : ''}">${escapeHtml(c.lastMsg)}</span>
-                                ${c.unread > 0 ? `<span class="badge-unread">${escapeHtml(String(c.unread))}</span>` : `<span class="status-tick-read" style="margin-left: 6px;">${icons.checkCheck}</span>`}
-                            </div>
-                        </div>
-                    </div>
-                `).join('') : `
-                    <div style="text-align: center; color: var(--text-muted); padding: 60px 24px;">
-                        <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--text-dim);">
-                            ${icons.chat}
-                        </div>
-                        <div style="font-size: 15px; font-weight: 600; color: white;">Aucune conversation</div>
-                        <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">Ajoutez un contact pour démarrer votre première conversation.</p>
-                        <button class="btn-primary" style="margin-top: 18px;" data-action="navigate" data-screen="add_contact">Ajouter un contact</button>
-                    </div>
-                `}
+            <div class="scroll-list" id="conversations-list-container">
+                ${renderConversationsListHtml(state.conversationsSearchQuery)}
             </div>
         </div>
     `,
@@ -440,7 +558,7 @@ const screens = {
         <div class="screen-view">
             <!-- Hidden native file pickers for real device file access -->
             <input type="file" id="media-file-input" accept="image/*,video/*" style="display: none;">
-            <input type="file" id="doc-file-input" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.json" style="display: none;">
+            <input type="file" id="doc-file-input" accept="*/*" style="display: none;">
 
             <header class="app-header">
                 <div style="display: flex; align-items: center; gap: 10px;">
@@ -723,9 +841,9 @@ const screens = {
                 </div>
 
                 <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; margin-bottom: 16px; border: 1px solid var(--border-subtle);">
-                    <div style="font-size: 12px; color: var(--text-muted);">Code de vérification</div>
+                    <div style="font-size: 12px; color: var(--text-muted);">Numéro de sécurité du chiffrement</div>
                     <div style="font-size: 14px; font-family: monospace; font-weight: 700; color: white; margin-top: 4px;">${escapeHtml(state.activeContact.safetyNumber)}</div>
-                    <p style="font-size: 11px; color: var(--text-dim); margin: 6px 0 0; line-height: 1.4;">Pour être totalement sûr(e) que personne ne s'est glissé dans votre conversation, comparez ce code avec ${escapeHtml(state.activeContact.name)} en personne ou par un autre moyen (téléphone, message).</p>
+                    <p style="font-size: 11px; color: var(--text-dim); margin: 6px 0 0; line-height: 1.4;">Ce code unique garantit que vos messages et appels sont chiffrés de bout en bout et protégés contre toute interception.</p>
                 </div>
 
                 ${!state.activeContact.isTrusted && !state.activeContact.isBlocked ? `
@@ -737,6 +855,7 @@ const screens = {
                 ` : `
                     <button class="btn-secondary" style="width: 100%; margin-bottom: 10px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="openBlockModal" data-peer-id="${escapeHtml(state.activeContact.peerId)}" data-name="${escapeHtml(state.activeContact.name)}">Bloquer ce contact...</button>
                 `}
+                <button class="btn-secondary" style="width: 100%; margin-bottom: 10px; color: #fbbf24; border-color: rgba(245, 158, 11, 0.25);" data-action="openReportModal" data-peer-id="${escapeHtml(state.activeContact.peerId)}" data-name="${escapeHtml(state.activeContact.name)}">⚠️ Signaler ce contact...</button>
                 <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="deleteContact" data-peer-id="${escapeHtml(state.activeContact.peerId)}" data-name="${escapeHtml(state.activeContact.name)}">Supprimer ce contact</button>
             </div>
         </div>
@@ -768,7 +887,7 @@ const screens = {
                         </div>
                         <div class="item-content">
                             <div class="item-name">${escapeHtml(c.name)}</div>
-                            <div class="item-sub">@${escapeHtml(c.handle)} • ${escapeHtml(c.p2pMode)}</div>
+                            <div class="item-sub">@${escapeHtml(c.handle)}</div>
                         </div>
                     </div>
                 `).join('') : `
@@ -777,7 +896,7 @@ const screens = {
                             ${icons.users}
                         </div>
                         <div style="font-size: 15px; font-weight: 600; color: white;">Aucun contact actif</div>
-                        <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">Ajoutez un contact avec son code pour commencer à échanger.</p>
+                        <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">Ajoutez un contact pour commencer à échanger en toute confidentialité.</p>
                         <button class="btn-primary" style="margin-top: 18px;" data-action="navigate" data-screen="add_contact">Ajouter un contact</button>
                     </div>
                 `}
@@ -802,7 +921,7 @@ const screens = {
         </div>
     `,
 
-    // 7. Ajouter un contact (Zero-Config 4G/5G/Wi-Fi + Recherche Instantanée)
+    // 7. Ajouter un contact
     add_contact: () => `
         <div class="screen-view">
             <header class="app-header">
@@ -812,55 +931,56 @@ const screens = {
             </header>
 
             <div style="padding: 20px 16px; overflow-y: auto; padding-bottom: 90px;">
-                <!-- Main Zero-Config Search Bar -->
+                <!-- Main Search Bar -->
                 <div style="margin-bottom: 16px;">
-                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 6px;">Rechercher sur le réseau (4G / 5G / Wi-Fi)</div>
+                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 6px;">Rechercher un contact</div>
                     <div class="search-input-box">
                         ${icons.search}
-                        <input type="text" id="contact-search-query" placeholder="Entrez un identifiant (8f4b2...) ou @pseudo..." autofocus>
+                        <input type="text" id="contact-search-query" placeholder="Tapez un @pseudo, un nom ou un identifiant..." autofocus>
                     </div>
+                </div>
+
+                <!-- Fast Actions -->
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px;">
+                    <button class="btn-secondary" style="font-size: 12px; padding: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="openQrCameraScanner">
+                        ${icons.qr}
+                        <span>Scanner un QR</span>
+                    </button>
+                    <button class="btn-secondary" style="font-size: 12px; padding: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="navigate" data-screen="identity">
+                        ${icons.user}
+                        <span>Mon QR Code</span>
+                    </button>
                 </div>
 
                 <!-- Dynamic Search Results -->
                 <div id="directory-search-results" style="margin-bottom: 24px;">
                     <div style="text-align: center; color: var(--text-dim); padding: 30px 16px; font-size: 13px;">
-                        <div style="font-size: 28px; margin-bottom: 8px;">🔍</div>
-                        <div style="color: white; font-weight: 600; margin-bottom: 4px;">Recherche globale Zero-Config</div>
-                        <div>Tapez un identifiant (ex: 8f4b2...) ou un @pseudo pour trouver et ajouter un contact instantanément.</div>
+                        <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--accent-purple-light);">
+                            ${icons.search}
+                        </div>
+                        <div style="color: white; font-weight: 600; margin-bottom: 4px; font-size: 15px;">Trouver un contact</div>
+                        <div style="max-width: 280px; margin: 0 auto; line-height: 1.4; color: var(--text-muted);">Tapez un @pseudo ou un nom pour démarrer une nouvelle conversation instantanément.</div>
                     </div>
                 </div>
 
                 <!-- Manual fallback methods in collapsible accordion -->
                 <div style="border-top: 1px solid var(--border-subtle); padding-top: 16px;">
                     <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer; padding: 6px 0;" data-action="toggleManualInviteAccordion">
-                        <span style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Méthode manuelle (QR Code / Lien hors-ligne)</span>
+                        <span style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Ajouter avec un lien d'invitation</span>
                         <span id="manual-invite-chevron" style="color: var(--text-muted); font-size: 12px;">▼</span>
                     </div>
                     <div id="manual-invite-body" style="display: none; margin-top: 14px;">
                         <label style="font-size: 12px; color: var(--text-muted);">Nom du contact</label>
                         <div class="search-input-box" style="margin: 6px 0 12px;">
-                            <input type="text" id="add-display-name-input" placeholder="ex: Bob">
+                            <input type="text" id="add-display-name-input" placeholder="ex: Alice">
                         </div>
-                        <label style="font-size: 12px; color: var(--text-muted);">Lien sécurisé ou code d'invitation</label>
+                        <label style="font-size: 12px; color: var(--text-muted);">Lien d'invitation reçu</label>
                         <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 10px; margin: 6px 0 12px; border: 1px solid var(--border-subtle);">
-                            <textarea id="add-bundle-input" placeholder="Collez le lien nova://invite... ou le code brut" rows="2" style="width: 100%; background: none; border: none; color: white; font-size: 11px; font-family: monospace; resize: none; outline: none; word-break: break-all;"></textarea>
+                            <textarea id="add-bundle-input" placeholder="Collez le lien nova://invite... ici" rows="2" style="width: 100%; background: none; border: none; color: white; font-size: 11px; font-family: monospace; resize: none; outline: none; word-break: break-all;"></textarea>
                         </div>
-                        <div style="display: flex; gap: 8px; margin-bottom: 12px;">
-                            <button class="btn-secondary" style="flex: 1; padding: 10px; font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 6px;" data-action="openQrCameraScanner">
-                                ${icons.qr}
-                                <span>Scanner QR</span>
-                            </button>
-                            <button class="btn-primary" style="flex: 1; padding: 10px; font-size: 12px;" data-action="addContact">Ajouter manuellement</button>
-                        </div>
+                        <button class="btn-primary" style="width: 100%; padding: 10px; font-size: 13px;" data-action="addContact">Ajouter ce contact</button>
                     </div>
                 </div>
-
-                <div style="height: 1px; background: var(--border-subtle); margin: 20px 0;"></div>
-
-                <button class="btn-secondary" style="width: 100%; padding: 12px; font-size: 13px;" data-action="navigate" data-screen="identity">
-                    ${icons.qr}
-                    <span>Afficher mon propre identifiant et QR code</span>
-                </button>
             </div>
 
             <!-- Inspect Directory User Profile Modal -->
@@ -949,11 +1069,11 @@ const screens = {
         </div>
     `; },
 
-    // 9. Réglages (Gestion de profil complet, Options & Accès aux Écrans)
+    // 9. Paramètres (100% orienté utilisateur, simple et élégant)
     settings: () => `
         <div class="screen-view">
             <header class="app-header">
-                <div class="header-title">Réglages</div>
+                <div class="header-title">Paramètres</div>
             </header>
 
             <div style="padding: 16px; overflow-y: auto; padding-bottom: 90px;">
@@ -964,102 +1084,168 @@ const screens = {
                             ${state.currentUser.avatarDataUrl ? `<img src="${state.currentUser.avatarDataUrl}" style="width: 100%; height: 100%; object-fit: cover;">` : escapeHtml(state.currentUser.name.charAt(0) || '?')}
                         </div>
                         <div style="flex: 1;">
-                            <div style="font-size: 17px; font-weight: 700; color: white;">${escapeHtml(state.currentUser.name) || 'Compte non créé'}</div>
+                            <div style="font-size: 17px; font-weight: 700; color: white;">${escapeHtml(state.currentUser.name) || 'Mon compte'}</div>
                             ${state.currentUser.handle ? `<div style="font-size: 13px; color: var(--accent-purple-light);">@${escapeHtml(state.currentUser.handle)}</div>` : ''}
-                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">${escapeHtml(state.currentUser.status)}</div>
+                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px; display: flex; align-items: center; gap: 6px;">
+                                <span class="status-dot ${state.networkOnline ? 'status-online' : 'status-offline'}" style="width: 7px; height: 7px; display: inline-block;"></span>
+                                <span id="profile-network-status-text">${escapeHtml(state.currentUser.status)}</span>
+                            </div>
                         </div>
                         <button class="icon-btn" data-action="openEditProfileModal" title="Modifier mon profil">${icons.pencil || '✎'}</button>
                     </div>
                     <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; border-top: 1px solid var(--border-subtle); padding-top: 10px; display: flex; justify-content: space-between; align-items: center;">
-                        <span>${escapeHtml(state.currentUser.bio) || 'Aucune bio définie.'}</span>
+                        <span>${escapeHtml(state.currentUser.bio) || 'Aucune biographie définie.'}</span>
                         <button class="btn-secondary" data-action="openEditProfileModal" style="font-size: 11px; padding: 4px 10px; margin-left: 8px;">Modifier</button>
                     </div>
                 </div>
 
-                <!-- Settings Menu -->
+                <!-- Account & Profile Sharing Shortcuts -->
+                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">COMPTE & SÉCURITÉ</div>
                 <div style="background: var(--bg-surface); border-radius: var(--radius-lg); overflow: hidden; margin-bottom: 24px; border: 1px solid var(--border-subtle);">
-                    <div class="item-card" data-action="navigate" data-screen="global_search">
-                        ${icons.search}
-                        <div class="item-content"><div class="item-name">Rechercher</div></div>
+                    <div class="item-card" data-action="navigate" data-screen="identity">
+                        ${icons.qr}
+                        <div class="item-content">
+                            <div class="item-name">Mon QR Code & Lien de profil</div>
+                            <div class="item-sub">Partagez votre compte facilement avec vos proches</div>
+                        </div>
                         ${icons.chevronRight}
                     </div>
-                    <div class="item-card" data-action="navigate" data-screen="identity">
+                    <div class="item-card" data-action="openMnemonicAuthModal" style="border-top: 1px solid var(--border-subtle);">
                         ${icons.shield}
-                        <div class="item-content"><div class="item-name">Mon identité</div></div>
+                        <div class="item-content">
+                            <div class="item-name">Sauvegarde du compte</div>
+                            <div class="item-sub">Afficher ma phrase secrète de 12 mots</div>
+                        </div>
                         ${icons.chevronRight}
                     </div>
                 </div>
 
-                <!-- Notifications -->
-                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">NOTIFICATIONS</div>
+                <!-- Notifications & Sounds -->
+                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">NOTIFICATIONS & SONS</div>
                 <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-                        <span style="font-size: 14px; color: white;">Me prévenir des nouveaux messages</span>
+                        <div>
+                            <div style="font-size: 14px; color: white;">Sonnerie des appels</div>
+                            <div style="font-size: 11px; color: var(--text-muted);">Faire sonner lors d'un appel entrant</div>
+                        </div>
+                        <input type="checkbox" id="notif-ringtone-chk" ${state.notificationPrefs.ringtoneEnabled !== false ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                        <div>
+                            <div style="font-size: 14px; color: white;">Notifications des messages</div>
+                            <div style="font-size: 11px; color: var(--text-muted);">Alerte pour chaque nouveau message reçu</div>
+                        </div>
                         <input type="checkbox" id="notif-messages-chk" ${state.notificationPrefs.notifyMessages ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
                     </div>
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-                        <span style="font-size: 14px; color: white;">Me prévenir des nouveaux contacts</span>
-                        <input type="checkbox" id="notif-contacts-chk" ${state.notificationPrefs.notifyContacts ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
+                        <div>
+                            <div style="font-size: 14px; color: white;">Sons dans l'application</div>
+                            <div style="font-size: 11px; color: var(--text-muted);">Bips lors de l'envoi et de la réception</div>
+                        </div>
+                        <input type="checkbox" id="notif-app-sounds-chk" ${state.notificationPrefs.appSounds !== false ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
                     </div>
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-size: 14px; color: white;">Cacher le contenu dans les notifications</span>
+                        <div>
+                            <div style="font-size: 14px; color: white;">Masquer l'aperçu du texte</div>
+                            <div style="font-size: 11px; color: var(--text-muted);">Ne pas afficher le texte du message dans les alertes</div>
+                        </div>
                         <input type="checkbox" id="notif-hide-content-chk" ${state.notificationPrefs.hideContent ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
                     </div>
                 </div>
 
-                <!-- Storage & Received Media Folder -->
-                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">STOCKAGE & MÉDIAS</div>
+                <!-- App Lock & Inactivity Timeout -->
+                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">SÉCURITÉ & VERROUILLAGE</div>
+                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: ${state.appLock.enabled ? '14px' : '0'};">
+                        <div>
+                            <div style="font-size: 14px; font-weight: 600; color: white;">Verrouillage de l'application</div>
+                            <div style="font-size: 11px; color: var(--text-muted);">Exiger un code PIN ou empreinte après inactivité</div>
+                        </div>
+                        <input type="checkbox" id="app-lock-toggle-chk" ${state.appLock.enabled ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
+                    </div>
+
+                    ${state.appLock.enabled ? `
+                        <div style="border-top: 1px solid var(--border-subtle); padding-top: 14px; margin-top: 12px;">
+                            <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 6px;">Délai d'inactivité avant verrouillage</label>
+                            <select id="app-lock-timeout-select" style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 13px; margin-bottom: 14px; outline: none;">
+                                <option value="0" ${state.appLock.timeoutMin === 0 ? 'selected' : ''}>⚡ Immédiatement (quand on quitte l'app)</option>
+                                <option value="3" ${state.appLock.timeoutMin === 3 ? 'selected' : ''}>⏱️ 3 minutes d'inactivité</option>
+                                <option value="5" ${state.appLock.timeoutMin === 5 ? 'selected' : ''}>⏱️ 5 minutes d'inactivité</option>
+                                <option value="10" ${state.appLock.timeoutMin === 10 ? 'selected' : ''}>⏱️ 10 minutes d'inactivité</option>
+                                <option value="15" ${state.appLock.timeoutMin === 15 ? 'selected' : ''}>⏱️ 15 minutes d'inactivité</option>
+                                <option value="30" ${state.appLock.timeoutMin === 30 ? 'selected' : ''}>⏱️ 30 minutes d'inactivité</option>
+                                <option value="60" ${state.appLock.timeoutMin === 60 ? 'selected' : ''}>⏱️ 60 minutes d'inactivité</option>
+                            </select>
+
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+                                <div>
+                                    <div style="font-size: 13px; color: white;">Empreinte / Biométrie</div>
+                                    <div style="font-size: 11px; color: var(--text-muted);">Déverrouiller avec le capteur de l'appareil</div>
+                                </div>
+                                <input type="checkbox" id="app-lock-biometrics-chk" ${state.appLock.biometricsEnabled ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
+                            </div>
+
+                            <button class="btn-secondary" style="width: 100%; font-size: 12px; padding: 10px;" data-action="openSetupPinModal">🔑 Modifier mon code PIN</button>
+                        </div>
+                    ` : ''}
+                </div>
+
+                <!-- Storage & Dedicated Media -->
+                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">STOCKAGE & DONNÉES</div>
                 <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
                     <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
                         <div style="font-size: 13px; font-weight: 600; color: white;">Dossier des médias reçus</div>
-                        <span style="font-size: 11px; background: rgba(34, 197, 94, 0.15); color: var(--status-success); padding: 2px 8px; border-radius: var(--radius-full); font-weight: 600;">Dédié</span>
+                        <span style="font-size: 11px; background: rgba(34, 197, 94, 0.15); color: var(--status-success); padding: 2px 8px; border-radius: var(--radius-full); font-weight: 600;">Automatique</span>
                     </div>
-                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 10px;">
-                        Les photos, vidéos, documents et notes vocales enregistrés sont automatiquement exportés dans le dossier <strong>Téléchargements/NOVA</strong> de votre appareil pour être consultables à tout moment.
+                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 12px;">
+                        Vos photos, vidéos et documents reçus sont automatiquement enregistrés dans le dossier <strong>Téléchargements/NOVA</strong> pour ne jamais les perdre.
                     </div>
-                    <div style="font-size: 11px; font-family: monospace; color: var(--accent-purple-light); background: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 12px; word-break: break-all;" id="settings-media-folder-path">
-                        Téléchargements/NOVA
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+                        <div>
+                            <div style="font-size: 13px; color: white;">Téléchargement automatique</div>
+                            <div style="font-size: 11px; color: var(--text-muted);">Enregistrer les médias dès réception</div>
+                        </div>
+                        <input type="checkbox" id="auto-save-media-chk" ${state.notificationPrefs.autoSaveMedia !== false ? 'checked' : ''} style="accent-color: var(--accent-purple); width: 18px; height: 18px; cursor: pointer;">
                     </div>
+                    <button class="btn-secondary" style="width: 100%; font-size: 12px; padding: 9px;" data-action="clearAppCache">🧹 Vider le cache temporaire</button>
                 </div>
 
-                <!-- Advanced: connecting across two different networks (most people never need this) -->
-                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">AVANCÉ</div>
-                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 12px;">
-                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 4px;">Mon adresse</div>
-                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 10px;">
-                        La plupart des gens n'ont pas besoin de ça : vos contacts vous trouvent automatiquement s'ils sont sur le même Wi-Fi que vous. Ceci ne sert que si quelqu'un veut vous joindre depuis un autre réseau et vous demande votre adresse.
-                    </div>
-                    <div id="own-listen-addr" style="display: flex; flex-direction: column; gap: 6px;">
-                        ${state.ownFullListenAddrs.length > 0 ? state.ownFullListenAddrs.map(addr => `
-                            <div style="font-size: 11px; font-family: monospace; color: var(--accent-purple-light); word-break: break-all; background: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 12px;">${escapeHtml(addr)}</div>
-                        `).join('') : `<div style="font-size: 11px; color: var(--text-muted); background: var(--bg-elevated); border-radius: var(--radius-md); padding: 10px 12px;">Pas encore disponible.</div>`}
-                    </div>
-                </div>
-                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 12px;">
-                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 4px;">Rejoindre quelqu'un sur un autre réseau (DHT Direct)</div>
-                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 10px;">
-                        Si un contact ne vous trouve pas automatiquement (vous n'êtes pas sur le même Wi-Fi), il peut vous donner une adresse multiaddr à coller ici.
-                    </div>
-                    <input id="bootstrap-addr-input" type="text" value="${escapeHtml(state.bootstrapAddr)}"
-                        placeholder="Adresse multiaddr (/ip4/...)"
-                        style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; font-family: monospace; margin-bottom: 10px;">
-                    <button class="btn-secondary" style="width: 100%;" data-action="saveBootstrapAddr">Enregistrer et connecter</button>
-                    <div id="bootstrap-addr-status" style="font-size: 11px; color: var(--text-muted); margin-top: 8px;"></div>
-                </div>
-
+                <!-- User Feedback & Stars (All Users) -->
+                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">VOTRE AVIS SUR L'APPLICATION</div>
                 <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px;">
-                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 4px;">Point de rendez-vous / Secours Render (WebSocket)</div>
-                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 10px;">
-                        Serveur de découverte et de relais de secours (ex: blueprint Render). Permet aux appareils de se localiser mutuellement sans configuration réseau avancée.
+                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 4px;">Donnez votre avis & vos étoiles ⭐</div>
+                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 12px;">
+                        Votre avis et vos suggestions nous aident directement à perfectionner la qualité de NOVA.
                     </div>
-                    <input id="fallback-server-url-input" type="text" value="${escapeHtml(state.fallbackServerUrl)}"
-                        placeholder="wss://votre-service.onrender.com"
-                        style="width: 100%; box-sizing: border-box; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 12px; font-family: monospace; margin-bottom: 10px;">
-                    <button class="btn-secondary" style="width: 100%;" data-action="saveFallbackServerUrl">Enregistrer l'URL de secours</button>
-                    <div id="fallback-server-url-status" style="font-size: 11px; color: var(--text-muted); margin-top: 8px;"></div>
+                    <button class="btn-primary" style="width: 100%; font-size: 13px; padding: 10px;" data-action="openFeedbackModal">⭐ Noter et donner mon avis</button>
                 </div>
 
-                <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2);" data-action="logout">Supprimer mon compte de cet appareil</button>
+                <!-- Admin Supervision Console (ONLY visible in Admin build) -->
+                ${state.buildInfo && state.buildInfo.is_admin ? `
+                <div style="font-size: 12px; color: #fbbf24; font-weight: 700; margin: 0 0 8px 6px; display: flex; align-items: center; gap: 6px;">
+                    <span>🛡️</span>
+                    <span>CONSOLE D'ADMINISTRATION (BUILD ADMIN)</span>
+                </div>
+                <div style="background: rgba(245, 158, 11, 0.08); border-radius: var(--radius-lg); padding: 16px; border: 1px solid rgba(245, 158, 11, 0.3); margin-bottom: 24px;">
+                    <div style="font-size: 13px; font-weight: 700; color: #fbbf24; margin-bottom: 4px;">Supervision & Modération active</div>
+                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 12px;">
+                        Accédez au tableau de bord des utilisateurs sains, signalés et bannis, gérez l'auto-quarantaine et lisez les retours.
+                    </div>
+                    <button class="btn-primary" style="width: 100%; font-size: 13px; padding: 11px; background: #d97706; border-color: #f59e0b;" data-action="navigate" data-screen="admin_dashboard">🛡️ Ouvrir la Console Admin</button>
+                </div>
+                ` : ''}
+
+                <!-- About & Sovereignty -->
+                <div style="font-size: 12px; color: var(--text-muted); font-weight: 600; margin: 0 0 8px 6px;">À PROPOS</div>
+                <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 16px; border: 1px solid var(--border-subtle); margin-bottom: 24px; text-align: center;">
+                    <div style="font-size: 15px; font-weight: 700; color: white; margin-bottom: 4px;">NOVA Messagerie</div>
+                    <div style="font-size: 12px; color: var(--accent-purple-light); margin-bottom: 8px;">Version 1.0.0 • Chiffrement de bout en bout</div>
+                    <p style="font-size: 11px; color: var(--text-muted); line-height: 1.4; margin: 0;">
+                        Toutes vos communications sont protégées et chiffrées. Aucun intermédiaire ne peut lire vos messages ni écouter vos appels.
+                    </p>
+                </div>
+
+                <button class="btn-secondary" style="width: 100%; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.2); padding: 12px;" data-action="logout">Se déconnecter de cet appareil</button>
             </div>
 
             <!-- Profile Edit Modal -->
@@ -1128,12 +1314,12 @@ const screens = {
                     </div>
 
                     <div style="display: inline-flex; align-items: center; gap: 6px; background: rgba(168, 85, 247, 0.15); border: 1px solid var(--accent-purple-light); padding: 4px 12px; border-radius: 20px; font-size: 11px; color: var(--accent-purple-light); margin-bottom: 8px;">
-                        <span>⏱ Valable 24h</span> • <span>🔒 Signature infalsifiable</span>
+                        <span>🔒 Profil sécurisé</span> • <span>✨ Chiffré de bout en bout</span>
                     </div>
 
-                    <div style="font-size: 18px; font-weight: 700; color: white;">${escapeHtml(state.currentUser.name) || 'Compte non créé'}</div>
+                    <div style="font-size: 18px; font-weight: 700; color: white;">${escapeHtml(state.currentUser.name) || 'Mon compte'}</div>
                     <p style="font-size: 12px; color: var(--text-muted); margin: 6px auto 0; max-width: 290px;">
-                        Faites scanner ce QR code pour vous ajouter, ou partagez votre lien sécurisé par SMS ou sur vos réseaux sociaux.
+                        Faites scanner ce QR code pour vous ajouter, ou partagez votre lien avec vos amis.
                     </p>
                 </div>
 
@@ -1148,16 +1334,16 @@ const screens = {
                 </div>
 
                 <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; margin-bottom: 12px; border: 1px solid var(--border-subtle); text-align: left;">
-                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; font-weight: 600;">Lien d'invitation sécurisé (pour SMS / messagerie) :</div>
-                    <textarea id="my-bundle-output" readonly rows="2" style="width: 100%; background: none; border: none; color: var(--accent-purple-light); font-family: monospace; font-size: 11px; resize: none; outline: none; word-break: break-all;">${escapeHtml(state.currentUser.invitationUri || state.currentUser.bundleHex) || (state.currentUser.linkGenerationError ? `Échec : ${escapeHtml(state.currentUser.linkGenerationError)}` : (hasBackend ? 'Génération du lien sécurisé…' : 'Compte non créé.'))}</textarea>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; font-weight: 600;">Mon lien direct de profil :</div>
+                    <textarea id="my-bundle-output" readonly rows="2" style="width: 100%; background: none; border: none; color: var(--accent-purple-light); font-family: monospace; font-size: 11px; resize: none; outline: none; word-break: break-all;">${escapeHtml(state.currentUser.invitationUri || state.currentUser.bundleHex) || (state.currentUser.linkGenerationError ? `Échec : ${escapeHtml(state.currentUser.linkGenerationError)}` : (hasBackend ? 'Génération du lien en cours…' : 'Compte non créé.'))}</textarea>
                 </div>
-                <button class="btn-primary" style="width: 100%;" data-action="copyOwnBundle">Copier mon lien sécurisé</button>
+                <button class="btn-primary" style="width: 100%;" data-action="copyOwnBundle">Copier mon lien</button>
 
                 <div style="height: 1px; background: var(--border-subtle); margin: 24px 0;"></div>
 
                 <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; margin-bottom: 16px; border: 1px solid var(--border-subtle);">
-                    <div style="font-size: 14px; font-weight: 600; color: white;">Ma phrase secrète</div>
-                    <p style="font-size: 12px; color: var(--text-muted); margin: 6px 0 12px;">C'est ce qui vous permet de retrouver votre compte sur un autre appareil. Ne la partagez jamais avec personne.</p>
+                    <div style="font-size: 14px; font-weight: 600; color: white;">Sauvegarde du compte</div>
+                    <p style="font-size: 12px; color: var(--text-muted); margin: 6px 0 12px;">Votre phrase secrète de 12 mots vous permet de récupérer votre compte et vos contacts en cas de perte de téléphone.</p>
                     <button class="btn-secondary" style="width: 100%; font-size: 13px;" data-action="openMnemonicAuthModal">Afficher ma phrase secrète</button>
                 </div>
 
@@ -1222,7 +1408,219 @@ const screens = {
                 </div>
             </div>
         </div>
-    `
+    `,
+
+    // 16. Console d'Administration (Build Admin uniquement)
+    admin_dashboard: () => {
+        if (!state.buildInfo || !state.buildInfo.is_admin) {
+            return `
+                <div class="screen-view">
+                    <header class="app-header">
+                        <button class="icon-btn" data-action="navigate" data-screen="settings">${icons.arrowLeft}</button>
+                        <div class="header-title">Accès non autorisé</div>
+                        <div style="width: 38px;"></div>
+                    </header>
+                    <div style="padding: 40px 20px; text-align: center; color: var(--text-muted);">
+                        <div style="font-size: 36px; margin-bottom: 12px;">🔒</div>
+                        <div style="font-size: 16px; font-weight: 700; color: white; margin-bottom: 8px;">Build Utilisateur Standard</div>
+                        <p style="font-size: 13px; line-height: 1.5; max-width: 320px; margin: 0 auto;">Cette fonctionnalité de modération nécessite un build administrateur compilé avec l'option admin.</p>
+                        <button class="btn-primary" style="margin-top: 20px;" data-action="navigate" data-screen="settings">Retour aux paramètres</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        const overview = state.adminState.overview;
+        if (overview) {
+            overview.users = overview.users || [];
+            overview.reports = overview.reports || [];
+            overview.feedbacks = overview.feedbacks || [];
+            overview.total_users = overview.total_users ?? overview.users.length;
+            overview.healthy_users = overview.healthy_users ?? overview.users.filter(u => u.status === 'healthy').length;
+            overview.reported_users = overview.reported_users ?? overview.users.filter(u => u.status === 'reported').length;
+            overview.banned_users = overview.banned_users ?? overview.users.filter(u => u.status === 'banned').length;
+            overview.average_rating = typeof overview.average_rating === 'number' ? overview.average_rating : 5.0;
+            overview.total_feedbacks = overview.total_feedbacks ?? overview.feedbacks.length;
+            overview.auto_ban_threshold = overview.auto_ban_threshold ?? 3;
+        }
+
+        const activeTab = state.adminState.activeTab || 'users';
+        const filterStatus = state.adminState.filterStatus || 'all';
+
+        let filteredUsers = overview ? overview.users : [];
+        if (filterStatus !== 'all') {
+            filteredUsers = filteredUsers.filter(u => u.status === filterStatus);
+        }
+        if (state.adminState.searchQuery) {
+            const q = state.adminState.searchQuery.toLowerCase();
+            filteredUsers = filteredUsers.filter(u => (u.display_name || '').toLowerCase().includes(q) || (u.username || '').toLowerCase().includes(q) || (u.peer_id || '').toLowerCase().includes(q));
+        }
+
+        return `
+            <div class="screen-view" style="background: #0d0f17;">
+                <header class="app-header" style="background: #141724; border-bottom: 1px solid rgba(245, 158, 11, 0.2);">
+                    <button class="icon-btn" data-action="navigate" data-screen="settings">${icons.arrowLeft}</button>
+                    <div class="header-title" style="color: #fbbf24; display: flex; align-items: center; gap: 6px;">
+                        <span>🛡️</span> <span>Console Administrateur</span>
+                    </div>
+                    <button class="icon-btn" data-action="loadAdminOverview" title="Actualiser">${icons.refresh || '🔄'}</button>
+                </header>
+
+                <div style="padding: 16px; overflow-y: auto; padding-bottom: 90px;">
+                    <!-- Admin Token Auth Bar -->
+                    <div style="background: var(--bg-surface); border-radius: var(--radius-lg); padding: 14px; border: 1px solid var(--border-subtle); margin-bottom: 16px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <div style="font-size: 12px; font-weight: 700; color: white;">Clé secrète Administrateur</div>
+                            <span style="font-size: 11px; padding: 2px 8px; border-radius: var(--radius-full); ${overview ? 'background: rgba(34, 197, 94, 0.15); color: var(--status-success);' : 'background: rgba(239, 68, 68, 0.15); color: var(--status-danger);'}">
+                                ${overview ? '✓ Connecté au serveur' : '⚠️ Non authentifié'}
+                            </span>
+                        </div>
+                        <div style="display: flex; gap: 8px;">
+                            <input type="password" id="admin-token-input" value="${escapeHtml(state.adminState.token)}" placeholder="Entrez le jeton admin (ex: NOVA_ADMIN_SECRET)..." style="flex: 1; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 8px 12px; color: white; font-size: 12px; font-family: monospace; outline: none;">
+                            <button class="btn-primary" style="padding: 8px 14px; font-size: 12px; background: #d97706; border-color: #f59e0b;" data-action="saveAdminToken">Valider</button>
+                        </div>
+                    </div>
+
+                    ${overview ? `
+                        <!-- Stats Grid -->
+                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 16px;">
+                            <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; border: 1px solid var(--border-subtle);">
+                                <div style="font-size: 11px; color: var(--text-muted);">Total Utilisateurs</div>
+                                <div style="font-size: 20px; font-weight: 800; color: white; margin-top: 2px;">${overview.total_users}</div>
+                                <div style="font-size: 11px; color: var(--status-success); margin-top: 2px;">🟢 ${overview.healthy_users} sains</div>
+                            </div>
+                            <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; border: 1px solid var(--border-subtle);">
+                                <div style="font-size: 11px; color: var(--text-muted);">Signalements / Bannis</div>
+                                <div style="font-size: 20px; font-weight: 800; color: #fbbf24; margin-top: 2px;">${overview.reported_users} <span style="font-size: 14px; color: var(--status-danger);">/ ${overview.banned_users} bannis</span></div>
+                                <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">${overview.reports.length} plaintes totales</div>
+                            </div>
+                            <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; border: 1px solid var(--border-subtle); grid-column: span 2; display: flex; justify-content: space-between; align-items: center;">
+                                <div>
+                                    <div style="font-size: 11px; color: var(--text-muted);">Satisfaction & Avis de l'App</div>
+                                    <div style="font-size: 18px; font-weight: 800; color: #fbbf24; margin-top: 2px;">
+                                        ⭐ ${overview.average_rating.toFixed(1)} / 5.0
+                                    </div>
+                                </div>
+                                <div style="font-size: 12px; color: var(--text-muted); text-align: right;">
+                                    <strong>${overview.total_feedbacks}</strong> retours reçus
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Tab Navigation -->
+                        <div style="display: flex; background: var(--bg-surface); border-radius: var(--radius-md); padding: 4px; border: 1px solid var(--border-subtle); margin-bottom: 16px; gap: 4px;">
+                            <button class="btn-secondary" style="flex: 1; padding: 8px 4px; font-size: 11px; font-weight: 600; ${activeTab === 'users' ? 'background: #d97706; color: white; border-color: #f59e0b;' : 'border-color: transparent;'}" data-action="setAdminTab" data-tab="users">👥 Comptes</button>
+                            <button class="btn-secondary" style="flex: 1; padding: 8px 4px; font-size: 11px; font-weight: 600; ${activeTab === 'reports' ? 'background: #d97706; color: white; border-color: #f59e0b;' : 'border-color: transparent;'}" data-action="setAdminTab" data-tab="reports">⚠️ Signalements (${overview.reports.length})</button>
+                            <button class="btn-secondary" style="flex: 1; padding: 8px 4px; font-size: 11px; font-weight: 600; ${activeTab === 'feedback' ? 'background: #d97706; color: white; border-color: #f59e0b;' : 'border-color: transparent;'}" data-action="setAdminTab" data-tab="feedback">⭐ Avis (${overview.feedbacks.length})</button>
+                            <button class="btn-secondary" style="flex: 1; padding: 8px 4px; font-size: 11px; font-weight: 600; ${activeTab === 'settings' ? 'background: #d97706; color: white; border-color: #f59e0b;' : 'border-color: transparent;'}" data-action="setAdminTab" data-tab="settings">⚙️ Seuil</button>
+                        </div>
+
+                        <!-- Tab 1: Users List -->
+                        ${activeTab === 'users' ? `
+                            <div style="margin-bottom: 12px; display: flex; gap: 6px; flex-wrap: wrap;">
+                                <button class="btn-secondary" style="padding: 4px 10px; font-size: 11px; ${filterStatus === 'all' ? 'background: var(--bg-elevated); color: white;' : 'color: var(--text-muted);'}" data-action="setAdminFilter" data-filter="all">Tous (${overview.users.length})</button>
+                                <button class="btn-secondary" style="padding: 4px 10px; font-size: 11px; ${filterStatus === 'healthy' ? 'background: var(--bg-elevated); color: var(--status-success);' : 'color: var(--text-muted);'}" data-action="setAdminFilter" data-filter="healthy">🟢 Sains (${overview.healthy_users})</button>
+                                <button class="btn-secondary" style="padding: 4px 10px; font-size: 11px; ${filterStatus === 'reported' ? 'background: var(--bg-elevated); color: #fbbf24;' : 'color: var(--text-muted);'}" data-action="setAdminFilter" data-filter="reported">🟡 Signalés (${overview.reported_users})</button>
+                                <button class="btn-secondary" style="padding: 4px 10px; font-size: 11px; ${filterStatus === 'banned' ? 'background: var(--bg-elevated); color: var(--status-danger);' : 'color: var(--text-muted);'}" data-action="setAdminFilter" data-filter="banned">🔴 Bannis (${overview.banned_users})</button>
+                            </div>
+
+                            <div style="display: flex; flex-direction: column; gap: 8px;">
+                                ${filteredUsers.length > 0 ? filteredUsers.map(u => `
+                                    <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; border: 1px solid ${u.status === 'banned' ? 'rgba(239, 68, 68, 0.3)' : (u.status === 'reported' ? 'rgba(245, 158, 11, 0.3)' : 'var(--border-subtle)')};">
+                                        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                                            <div style="display: flex; align-items: center; gap: 10px;">
+                                                <div class="avatar" style="width: 38px; height: 38px; font-size: 15px; background: var(--bg-elevated);">
+                                                    ${u.avatar_data_url ? `<img src="${u.avatar_data_url}" style="width: 100%; height: 100%; object-fit: cover;">` : escapeHtml(u.display_name.charAt(0) || '?')}
+                                                </div>
+                                                <div>
+                                                    <div style="font-size: 14px; font-weight: 700; color: white;">${escapeHtml(u.display_name)}</div>
+                                                    <div style="font-size: 11px; color: var(--accent-purple-light);">@${escapeHtml(u.username)}</div>
+                                                </div>
+                                            </div>
+                                            <div style="text-align: right;">
+                                                <span style="font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: var(--radius-full); ${u.status === 'banned' ? 'background: rgba(239, 68, 68, 0.2); color: var(--status-danger);' : (u.status === 'reported' ? 'background: rgba(245, 158, 11, 0.2); color: #fbbf24;' : 'background: rgba(34, 197, 94, 0.15); color: var(--status-success);')}">
+                                                    ${u.status === 'banned' ? 'Banni' : (u.status === 'reported' ? `Signalé (${u.report_count})` : 'Sain')}
+                                                </span>
+                                                <div style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">${u.is_online ? '🟢 En ligne' : '⚪ Hors ligne'}</div>
+                                            </div>
+                                        </div>
+                                        <div style="font-size: 10px; font-family: monospace; color: var(--text-dim); word-break: break-all; margin-bottom: 8px; background: var(--bg-elevated); padding: 4px 8px; border-radius: 4px;">
+                                            ${escapeHtml(u.peer_id)}
+                                        </div>
+                                        <div style="display: flex; gap: 8px; justify-content: flex-end;">
+                                            ${u.status === 'banned' ? `
+                                                <button class="btn-primary" style="font-size: 11px; padding: 5px 12px; background: var(--status-success); border-color: var(--status-success);" data-action="adminUnbanUser" data-peer-id="${escapeHtml(u.peer_id)}">Débloquer</button>
+                                            ` : `
+                                                <button class="btn-secondary" style="font-size: 11px; padding: 5px 12px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.3);" data-action="adminBanUser" data-peer-id="${escapeHtml(u.peer_id)}">Bannir</button>
+                                            `}
+                                        </div>
+                                    </div>
+                                `).join('') : `<div style="text-align: center; color: var(--text-muted); padding: 30px;">Aucun utilisateur dans cette catégorie.</div>`}
+                            </div>
+                        ` : ''}
+
+                        <!-- Tab 2: Reports List -->
+                        ${activeTab === 'reports' ? `
+                            <div style="display: flex; flex-direction: column; gap: 10px;">
+                                ${overview.reports.length > 0 ? overview.reports.map(r => `
+                                    <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 14px; border: 1px solid rgba(245, 158, 11, 0.25);">
+                                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                            <span style="font-size: 11px; font-weight: 700; background: rgba(245, 158, 11, 0.15); color: #fbbf24; padding: 2px 8px; border-radius: 4px; text-transform: uppercase;">${escapeHtml(r.category)}</span>
+                                            <span style="font-size: 11px; color: var(--text-muted);">${new Date(r.timestamp_utc * 1000).toLocaleString('fr-FR')}</span>
+                                        </div>
+                                        <div style="font-size: 13px; font-weight: 700; color: white; margin-bottom: 4px;">Motif : ${escapeHtml(r.reason)}</div>
+                                        ${r.comment ? `<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px; background: var(--bg-elevated); padding: 8px; border-radius: 4px;">« ${escapeHtml(r.comment)} »</div>` : ''}
+                                        <div style="font-size: 11px; color: var(--text-dim); margin-bottom: 8px;">
+                                            Cible : <span style="font-family: monospace; color: var(--accent-purple-light);">${escapeHtml(r.target_peer_id.slice(0, 16))}...</span><br>
+                                            Signaleur : <span style="font-family: monospace;">${escapeHtml(r.reporter_peer_id.slice(0, 16))}...</span>
+                                        </div>
+                                        <button class="btn-secondary" style="width: 100%; font-size: 11px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.3);" data-action="adminBanUser" data-peer-id="${escapeHtml(r.target_peer_id)}">Bannir cet utilisateur cible</button>
+                                    </div>
+                                `).join('') : `<div style="text-align: center; color: var(--text-muted); padding: 40px;">Aucun signalement enregistré. La communauté est saine !</div>`}
+                            </div>
+                        ` : ''}
+
+                        <!-- Tab 3: Feedback List -->
+                        ${activeTab === 'feedback' ? `
+                            <div style="display: flex; flex-direction: column; gap: 10px;">
+                                ${overview.feedbacks.length > 0 ? overview.feedbacks.map(f => `
+                                    <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 14px; border: 1px solid var(--border-subtle);">
+                                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                                            <div style="font-size: 16px; color: #fbbf24;">${'★'.repeat(f.rating)}${'☆'.repeat(5 - f.rating)}</div>
+                                            <span style="font-size: 11px; color: var(--text-muted);">${new Date(f.timestamp_utc * 1000).toLocaleDateString('fr-FR')}</span>
+                                        </div>
+                                        <div style="font-size: 11px; color: var(--accent-purple-light); font-weight: 600; text-transform: uppercase; margin-bottom: 4px;">${escapeHtml(f.category)}</div>
+                                        <div style="font-size: 13px; color: white; line-height: 1.4;">${escapeHtml(f.comment) || '<em style="color: var(--text-dim);">Aucun commentaire textuel</em>'}</div>
+                                    </div>
+                                `).join('') : `<div style="text-align: center; color: var(--text-muted); padding: 40px;">Aucun avis utilisateur pour l'instant.</div>`}
+                            </div>
+                        ` : ''}
+
+                        <!-- Tab 4: Auto-Quarantine Settings -->
+                        ${activeTab === 'settings' ? `
+                            <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; border: 1px solid var(--border-subtle);">
+                                <div style="font-size: 14px; font-weight: 700; color: white; margin-bottom: 6px;">Seuil de mise en quarantaine automatique</div>
+                                <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 16px;">
+                                    Définit le nombre de signalements distincts requis pour qu'un compte soit automatiquement suspendu du répertoire et des relais sans validation humaine préalable.
+                                </p>
+                                <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 16px;">
+                                    <input type="number" id="admin-threshold-input" min="1" max="50" value="${overview.auto_ban_threshold}" style="width: 80px; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 8px 12px; color: white; font-size: 15px; font-weight: 700; text-align: center; outline: none;">
+                                    <span style="font-size: 13px; color: var(--text-muted);">signalements distincts</span>
+                                </div>
+                                <button class="btn-primary" style="width: 100%; background: #d97706; border-color: #f59e0b;" data-action="adminSaveThreshold">Enregistrer le seuil</button>
+                            </div>
+                        ` : ''}
+                    ` : `
+                        <div style="text-align: center; padding: 40px 20px; color: var(--text-muted);">
+                            <div style="font-size: 32px; margin-bottom: 8px;">🔐</div>
+                            <div style="font-size: 15px; font-weight: 700; color: white; margin-bottom: 6px;">Authentification requise</div>
+                            <p style="font-size: 12px; max-width: 300px; margin: 0 auto 16px;">Entrez votre jeton secret d'administration pour charger les données de supervision.</p>
+                        </div>
+                    `}
+                </div>
+            </div>
+        `;
+    }
 };
 
 // --- CONTROLLER & NAVIGATION ---
@@ -1278,10 +1676,11 @@ async function navigateTo(screenKey) {
         } else if (screenKey === 'identity') {
             await refreshOwnBundleHex();
         } else if (screenKey === 'settings') {
-            await refreshBootstrapAddr();
-            await refreshFallbackServerUrl();
-            await refreshOwnFullListenAddr();
             await refreshMediaFolderPath();
+        } else if (screenKey === 'admin_dashboard') {
+            if (state.adminState.token && !state.adminState.overview) {
+                await loadAdminOverviewReal();
+            }
         }
     }
 
@@ -1754,88 +2153,7 @@ async function retryOwnBundleReal() {
     }
 }
 
-// Loads the currently configured bootstrap/rendezvous address, if any. Called when navigating to
-// Settings, so the field starts prefilled with whatever set_bootstrap_addr last persisted (or the
-// NOVA_BOOTSTRAP_ADDR the app was launched with).
-async function refreshBootstrapAddr() {
-    if (!hasBackend) return;
-    try {
-        state.bootstrapAddr = (await tauriInvoke('get_bootstrap_addr')) || '';
-    } catch (e) {
-        console.error('refreshBootstrapAddr failed', e);
-    }
-}
 
-// This device's own dialable addresses, for display when it's playing the rendezvous role.
-async function refreshOwnFullListenAddr() {
-    if (!hasBackend) return;
-    try {
-        state.ownFullListenAddrs = (await tauriInvoke('get_own_full_listen_addrs')) || [];
-    } catch (e) {
-        console.error('refreshOwnFullListenAddr failed', e);
-    }
-}
-
-// Persists the bootstrap/rendezvous multiaddr entered on the Settings screen — the mechanism a
-// device with no shell (i.e. Android, launched from the home screen rather than a terminal that
-// could export NOVA_BOOTSTRAP_ADDR) uses to configure this at all. Takes effect on the next app
-// launch if the network for this session has already started.
-async function saveBootstrapAddr() {
-    if (!requireBackend()) return;
-    const input = document.getElementById('bootstrap-addr-input');
-    const statusEl = document.getElementById('bootstrap-addr-status');
-    if (!input) return;
-    const val = input.value.trim();
-    if (statusEl) statusEl.innerHTML = '<span style="color: var(--accent-purple-light);">Connexion en cours...</span>';
-    try {
-        await tauriInvoke('set_bootstrap_addr', { addr: val });
-        state.bootstrapAddr = val;
-        if (statusEl) {
-            if (val) {
-                statusEl.innerHTML = '<span style="color: var(--status-success);">✓ Enregistré et connexion P2P lancée.</span>';
-            } else {
-                statusEl.innerHTML = '<span style="color: var(--text-muted);">Adresse de démarrage effacée.</span>';
-            }
-        }
-    } catch (e) {
-        console.error('saveBootstrapAddr failed', e);
-        if (statusEl) statusEl.innerHTML = `<span style="color: var(--status-danger);">Adresse invalide : ${escapeHtml(String(e.message || e))}</span>`;
-    }
-}
-
-// Loads the currently configured fallback/rendezvous server URL (Render / WebSocket).
-async function refreshFallbackServerUrl() {
-    if (!hasBackend) return;
-    try {
-        state.fallbackServerUrl = (await tauriInvoke('get_fallback_server_url')) || '';
-    } catch (e) {
-        console.error('refreshFallbackServerUrl failed', e);
-    }
-}
-
-// Persists the fallback server URL entered on the Settings screen.
-async function saveFallbackServerUrl() {
-    if (!requireBackend()) return;
-    const input = document.getElementById('fallback-server-url-input');
-    const statusEl = document.getElementById('fallback-server-url-status');
-    if (!input) return;
-    const val = input.value.trim();
-    if (statusEl) statusEl.innerHTML = '<span style="color: var(--accent-purple-light);">Enregistrement...</span>';
-    try {
-        await tauriInvoke('set_fallback_server_url', { url: val });
-        state.fallbackServerUrl = val;
-        if (statusEl) {
-            if (val) {
-                statusEl.innerHTML = '<span style="color: var(--status-success);">✓ URL de secours enregistrée et active.</span>';
-            } else {
-                statusEl.innerHTML = '<span style="color: var(--text-muted);">Serveur de secours désactivé.</span>';
-            }
-        }
-    } catch (e) {
-        console.error('saveFallbackServerUrl failed', e);
-        if (statusEl) statusEl.innerHTML = `<span style="color: var(--status-danger);">Erreur : ${escapeHtml(String(e.message || e))}</span>`;
-    }
-}
 
 function formatMessageTime(timestampUtc) {
     return new Date(timestampUtc * 1000).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
@@ -1863,44 +2181,101 @@ async function refreshConversationsFromBackend() {
     }
 }
 
-function updateConversationsListDom() {
-    const scrollList = document.querySelector('.screen-view .scroll-list');
-    if (!scrollList || state.currentScreen !== 'conversations') return;
-    const previousScroll = scrollList.scrollTop;
-    
-    if (state.conversations.length === 0) {
-        scrollList.innerHTML = `
-            <div style="text-align: center; color: var(--text-muted); padding: 60px 24px;">
-                <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--text-dim);">
-                    ${icons.chat}
-                </div>
-                <div style="font-size: 15px; font-weight: 600; color: white;">Aucune conversation</div>
-                <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">Ajoutez un contact pour démarrer votre première conversation.</p>
-                <button class="btn-primary" style="margin-top: 18px;" data-action="navigate" data-screen="add_contact">Ajouter un contact</button>
-            </div>
-        `;
-        return;
+function renderConversationsListHtml(query) {
+    const q = (query || '').trim().toLowerCase();
+    let filtered = state.conversations;
+    if (q) {
+        filtered = state.conversations.filter(c =>
+            (c.name && c.name.toLowerCase().includes(q)) ||
+            (c.handle && c.handle.toLowerCase().includes(q)) ||
+            (c.lastMsg && c.lastMsg.toLowerCase().includes(q))
+        );
     }
 
-    scrollList.innerHTML = state.conversations.map(c => `
-        <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
-            <div class="avatar">
-                ${escapeHtml(c.name.charAt(0))}
-                <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
-            </div>
-            <div class="item-content">
-                <div class="item-header">
-                    <span class="item-name" style="${c.unread > 0 ? 'font-weight: 700; color: white;' : ''}">${escapeHtml(c.name)}</span>
-                    <span class="item-time" style="${c.unread > 0 ? 'color: var(--accent-purple-light); font-weight: 600;' : ''}">${escapeHtml(c.time)}</span>
+    if (filtered.length > 0) {
+        return filtered.map(c => `
+            <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
+                <div class="avatar">
+                    ${escapeHtml(c.name.charAt(0))}
+                    <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
                 </div>
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 2px;">
-                    <span class="item-sub" style="${c.unread > 0 ? 'color: var(--text-main); font-weight: 600;' : ''}">${escapeHtml(c.lastMsg)}</span>
-                    ${c.unread > 0 ? `<span class="badge-unread">${escapeHtml(String(c.unread))}</span>` : `<span class="status-tick-read" style="margin-left: 6px;">${icons.checkCheck}</span>`}
+                <div class="item-content">
+                    <div class="item-header">
+                        <span class="item-name" style="${c.unread > 0 ? 'font-weight: 700; color: white;' : ''}">${escapeHtml(c.name)}</span>
+                        <span class="item-time" style="${c.unread > 0 ? 'color: var(--accent-purple-light); font-weight: 600;' : ''}">${escapeHtml(c.time)}</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 2px;">
+                        <span class="item-sub" style="${c.unread > 0 ? 'color: var(--text-main); font-weight: 600;' : ''}">${escapeHtml(c.lastMsg || '')}</span>
+                        ${c.unread > 0 ? `<span class="badge-unread">${escapeHtml(String(c.unread))}</span>` : ''}
+                    </div>
                 </div>
             </div>
-        </div>
-    `).join('');
+        `).join('');
+    }
 
+    if (q) {
+        return `
+            <div style="text-align: center; color: var(--text-muted); padding: 40px 20px;">
+                <div style="font-size: 14px; font-weight: 600; color: white;">Aucun échange correspondant</div>
+                <p style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">Aucune conversation ne contient « ${escapeHtml(query)} ».</p>
+            </div>
+        `;
+    }
+
+    return `
+        <div style="text-align: center; color: var(--text-muted); padding: 60px 24px;">
+            <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--text-dim);">
+                ${icons.chat}
+            </div>
+            <div style="font-size: 15px; font-weight: 600; color: white;">Aucune conversation</div>
+            <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">Ajoutez un contact pour démarrer votre première conversation.</p>
+            <button class="btn-primary" style="margin-top: 18px;" data-action="navigate" data-screen="add_contact">Ajouter un contact</button>
+        </div>
+    `;
+}
+
+function filterConversationsList(query) {
+    state.conversationsSearchQuery = query || '';
+    const container = document.getElementById('conversations-list-container');
+    if (container) {
+        container.innerHTML = renderConversationsListHtml(state.conversationsSearchQuery);
+    }
+}
+
+function clearConversationsSearch() {
+    state.conversationsSearchQuery = '';
+    const input = document.getElementById('conversations-search-input');
+    if (input) input.value = '';
+    const container = document.getElementById('conversations-list-container');
+    if (container) {
+        container.innerHTML = renderConversationsListHtml('');
+    }
+}
+
+function updateNetworkOnlineStatus(isOnline) {
+    state.networkOnline = !!isOnline;
+    state.currentUser.status = isOnline
+        ? 'Connecté au réseau NOVA'
+        : 'Hors ligne — Déconnecté du réseau';
+
+    const statusEl = document.getElementById('profile-network-status-text');
+    if (statusEl) {
+        statusEl.innerText = state.currentUser.status;
+    }
+    const railDot = document.querySelector('.rail-status-dot');
+    if (railDot) {
+        railDot.className = `rail-status-dot ${isOnline ? 'status-online' : 'status-offline'}`;
+    }
+}
+
+window.addEventListener('online', () => updateNetworkOnlineStatus(true));
+window.addEventListener('offline', () => updateNetworkOnlineStatus(false));
+
+function updateConversationsListDom() {
+    const scrollList = document.getElementById('conversations-list-container') || document.querySelector('.screen-view .scroll-list');
+    if (!scrollList || state.currentScreen !== 'conversations') return;
+    const previousScroll = scrollList.scrollTop;
+    scrollList.innerHTML = renderConversationsListHtml(state.conversationsSearchQuery);
     scrollList.scrollTop = previousScroll;
 }
 
@@ -2205,6 +2580,7 @@ function copyOwnBundle() {
 }
 
 function maybeNotifyIncomingMessage(msg) {
+    CallAudio.playMessageReceivedSound();
     if (!state.notificationPrefs.notifyMessages) return;
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
     const title = state.notificationPrefs.hideContent
@@ -2337,6 +2713,442 @@ async function unblockActiveContact(peerId) {
     } catch (e) {
         alert('Échec du déblocage : ' + e);
     }
+}
+
+// --- REPORTING & FEEDBACK (User features) ---
+function openReportModal(peerId, name) {
+    closeInspectUserModal();
+    const targetPeerId = peerId || (state.activeContact && (state.activeContact.peerId || state.activeContact.handle));
+    const targetName = name || (state.activeContact && state.activeContact.name) || 'ce contact';
+    state.pendingReport = { targetPeerId, targetName };
+
+    const modal = document.getElementById('report-modal');
+    const title = document.getElementById('report-modal-title');
+    const comment = document.getElementById('report-comment-input');
+    if (title) title.innerText = `Signaler ${targetName}`;
+    if (comment) comment.value = '';
+    if (modal) modal.classList.add('show');
+}
+
+function closeReportModal() {
+    const modal = document.getElementById('report-modal');
+    if (modal) modal.classList.remove('show');
+    state.pendingReport = null;
+}
+
+async function confirmSubmitReportReal() {
+    if (!state.pendingReport || !state.pendingReport.targetPeerId) return;
+    const select = document.getElementById('report-category-select');
+    const commentInput = document.getElementById('report-comment-input');
+    const category = select ? select.value : 'other';
+    const comment = commentInput ? commentInput.value.trim() : '';
+    const reason = select ? select.options[select.selectedIndex].text : 'Signalement utilisateur';
+
+    try {
+        const msg = await tauriInvoke('report_user', {
+            targetPeerId: state.pendingReport.targetPeerId,
+            reason,
+            category,
+            comment: comment || null,
+        });
+        closeReportModal();
+        showToast(msg || 'Signalement envoyé avec succès.');
+    } catch (e) {
+        alert('Erreur lors du signalement : ' + e);
+    }
+}
+
+function openFeedbackModal() {
+    state.feedbackRating = 5;
+    updateFeedbackStarsUI();
+    const comment = document.getElementById('feedback-comment-input');
+    if (comment) comment.value = '';
+    const modal = document.getElementById('feedback-modal');
+    if (modal) modal.classList.add('show');
+}
+
+function closeFeedbackModal() {
+    const modal = document.getElementById('feedback-modal');
+    if (modal) modal.classList.remove('show');
+}
+
+function setFeedbackRating(rating) {
+    state.feedbackRating = Math.max(1, Math.min(5, rating));
+    updateFeedbackStarsUI();
+}
+
+function updateFeedbackStarsUI() {
+    const container = document.getElementById('feedback-stars-container');
+    if (!container) return;
+    const stars = container.querySelectorAll('.star-btn');
+    stars.forEach((btn, idx) => {
+        if (idx < state.feedbackRating) {
+            btn.style.color = '#fbbf24';
+        } else {
+            btn.style.color = '#4b5563';
+        }
+    });
+}
+
+async function confirmSubmitFeedbackReal() {
+    const select = document.getElementById('feedback-category-select');
+    const commentInput = document.getElementById('feedback-comment-input');
+    const category = select ? select.value : 'general';
+    const comment = commentInput ? commentInput.value.trim() : '';
+
+    try {
+        const msg = await tauriInvoke('submit_app_feedback', {
+            rating: state.feedbackRating,
+            category,
+            comment: comment || null,
+        });
+        closeFeedbackModal();
+        showToast(msg || 'Merci pour votre avis !');
+    } catch (e) {
+        alert('Erreur lors de l\'envoi de votre avis : ' + e);
+    }
+}
+
+// --- ADMIN MODERATION ENGINE (Conditional Admin Build) ---
+async function saveAdminToken() {
+    const input = document.getElementById('admin-token-input');
+    if (!input) return;
+    const token = input.value.trim();
+    state.adminState.token = token;
+    localStorage.setItem('nova_admin_token', token);
+    await loadAdminOverviewReal();
+}
+
+async function loadAdminOverviewReal() {
+    if (!state.adminState.token) {
+        showToast('Veuillez renseigner votre clé secrète admin.');
+        return;
+    }
+    state.adminState.isLoading = true;
+    try {
+        const overview = await tauriInvoke('admin_fetch_overview', {
+            adminToken: state.adminState.token,
+        });
+        state.adminState.overview = overview;
+        state.adminState.error = '';
+        if (state.currentScreen === 'admin_dashboard') {
+            navigateTo('admin_dashboard');
+        }
+        showToast('Données de supervision actualisées.');
+    } catch (e) {
+        state.adminState.error = String(e);
+        alert('Erreur d\'authentification admin : ' + e);
+    } finally {
+        state.adminState.isLoading = false;
+    }
+}
+
+function setAdminTab(tab) {
+    state.adminState.activeTab = tab;
+    if (state.currentScreen === 'admin_dashboard') {
+        navigateTo('admin_dashboard');
+    }
+}
+
+function setAdminFilter(filter) {
+    state.adminState.filterStatus = filter;
+    if (state.currentScreen === 'admin_dashboard') {
+        navigateTo('admin_dashboard');
+    }
+}
+
+async function adminBanUserReal(peerId) {
+    if (!peerId) return;
+    const reason = prompt('Motif de suspension du compte :', 'Non-respect des conditions d\'utilisation');
+    if (reason === null) return;
+    try {
+        await tauriInvoke('admin_ban_user', {
+            adminToken: state.adminState.token,
+            peerId,
+            reason: reason || null,
+        });
+        showToast('Utilisateur suspendu.');
+        await loadAdminOverviewReal();
+    } catch (e) {
+        alert('Échec de suspension : ' + e);
+    }
+}
+
+async function adminUnbanUserReal(peerId) {
+    if (!peerId) return;
+    if (!confirm('Voulez-vous réhabiliter cet utilisateur et restaurer son accès au répertoire ?')) return;
+    try {
+        await tauriInvoke('admin_unban_user', {
+            adminToken: state.adminState.token,
+            peerId,
+        });
+        showToast('Utilisateur réhabilité.');
+        await loadAdminOverviewReal();
+    } catch (e) {
+        alert('Échec du déblocage : ' + e);
+    }
+}
+
+async function adminSaveThresholdReal() {
+    const input = document.getElementById('admin-threshold-input');
+    if (!input) return;
+    const val = parseInt(input.value, 10);
+    if (isNaN(val) || val < 1) {
+        alert('Veuillez entrer un nombre valide supérieur ou égal à 1.');
+        return;
+    }
+    try {
+        const msg = await tauriInvoke('admin_update_settings', {
+            adminToken: state.adminState.token,
+            autoBanThreshold: val,
+        });
+        showToast(msg || 'Seuil enregistré.');
+        await loadAdminOverviewReal();
+    } catch (e) {
+        alert('Échec de mise à jour du seuil : ' + e);
+    }
+}
+
+async function initAppBuildInfo() {
+    try {
+        const info = await tauriInvoke('get_app_build_info');
+        if (info) {
+            state.buildInfo = info;
+            console.log('App build info:', info);
+        }
+    } catch (e) {
+        console.warn('Could not fetch build info:', e);
+    }
+}
+
+// --- INVIOLABLE APP LOCK ENGINE (PIN, BIOMETRICS & INACTIVITY TIMEOUT) ---
+async function hashPin(pin, salt) {
+    const enc = new TextEncoder();
+    const data = enc.encode(salt + ':' + pin + ':nova_app_lock_v1');
+    const hashBuf = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function lockApp() {
+    if (!state.appLock.enabled || !state.appLock.pinHash) return;
+    state.isAppLocked = true;
+    state.enteredPin = '';
+    updateLockScreenUI();
+    const overlay = document.getElementById('app-lock-screen');
+    if (overlay) {
+        overlay.style.display = 'flex';
+    }
+    if (state.appLock.biometricsEnabled) {
+        setTimeout(triggerBiometricsUnlock, 300);
+    }
+}
+
+function unlockApp() {
+    state.isAppLocked = false;
+    state.enteredPin = '';
+    state.failedPinAttempts = 0;
+    state.lockoutUntil = 0;
+    state.lastUserInteraction = Date.now();
+    state.wentToBackgroundAt = null;
+    const overlay = document.getElementById('app-lock-screen');
+    if (overlay) {
+        overlay.style.display = 'none';
+    }
+}
+
+function updateLockScreenUI() {
+    const dotsContainer = document.getElementById('app-lock-dots');
+    const errorMsg = document.getElementById('app-lock-error-msg');
+    const biometricsBtn = document.getElementById('btn-lock-biometrics');
+    if (biometricsBtn) {
+        biometricsBtn.style.visibility = state.appLock.biometricsEnabled ? 'visible' : 'hidden';
+    }
+
+    if (dotsContainer) {
+        const totalDots = state.appLock.pinLength || 4;
+        let html = '';
+        for (let i = 0; i < totalDots; i++) {
+            html += `<div class="pin-dot ${i < state.enteredPin.length ? 'filled' : ''}"></div>`;
+        }
+        dotsContainer.innerHTML = html;
+    }
+
+    if (errorMsg) {
+        if (state.lockoutUntil > Date.now()) {
+            const remSec = Math.ceil((state.lockoutUntil - Date.now()) / 1000);
+            errorMsg.innerText = `Trop d'échecs. Réessayez dans ${remSec}s...`;
+        } else if (state.failedPinAttempts > 0 && state.enteredPin.length === 0) {
+            errorMsg.innerText = `Code PIN incorrect (${5 - state.failedPinAttempts} essais restants)`;
+        } else {
+            errorMsg.innerText = '';
+        }
+    }
+}
+
+async function handlePinDigit(digit) {
+    if (state.lockoutUntil > Date.now()) {
+        updateLockScreenUI();
+        return;
+    }
+    const maxLen = state.appLock.pinLength || 6;
+    if (state.enteredPin.length >= maxLen) return;
+    state.enteredPin += String(digit);
+    updateLockScreenUI();
+
+    const expectedLen = state.appLock.pinLength || 4;
+    if (state.enteredPin.length >= expectedLen) {
+        const computedHash = await hashPin(state.enteredPin, state.appLock.pinSalt);
+        if (computedHash === state.appLock.pinHash) {
+            unlockApp();
+            return;
+        } else if (state.enteredPin.length >= (state.appLock.pinLength || 6)) {
+            handleWrongPin();
+        }
+    }
+}
+
+function handlePinBackspace() {
+    if (state.enteredPin.length > 0) {
+        state.enteredPin = state.enteredPin.slice(0, -1);
+        updateLockScreenUI();
+    }
+}
+
+function handleWrongPin() {
+    state.failedPinAttempts += 1;
+    const dotsContainer = document.getElementById('app-lock-dots');
+    const errorMsg = document.getElementById('app-lock-error-msg');
+    if (dotsContainer) {
+        dotsContainer.querySelectorAll('.pin-dot').forEach(d => d.classList.add('error'));
+    }
+    if (state.failedPinAttempts >= 5) {
+        state.lockoutUntil = Date.now() + 30000;
+        if (errorMsg) errorMsg.innerText = "Trop de tentatives erronées. Verrouillé pendant 30 secondes.";
+    } else {
+        if (errorMsg) errorMsg.innerText = `Code PIN incorrect (${5 - state.failedPinAttempts} essais restants)`;
+    }
+
+    setTimeout(() => {
+        state.enteredPin = '';
+        updateLockScreenUI();
+    }, 600);
+}
+
+async function triggerBiometricsUnlock() {
+    if (!state.appLock.enabled || !state.appLock.biometricsEnabled) return;
+    if (window.PublicKeyCredential && typeof navigator.credentials !== 'undefined' && navigator.credentials.get) {
+        try {
+            const challenge = new Uint8Array(32);
+            crypto.getRandomValues(challenge);
+            const assertion = await navigator.credentials.get({
+                publicKey: {
+                    challenge,
+                    timeout: 60000,
+                    userVerification: 'preferred',
+                    allowCredentials: [],
+                }
+            });
+            if (assertion) {
+                unlockApp();
+            }
+        } catch (e) {
+            console.log('Biometrics auth fallback to PIN:', e);
+        }
+    }
+}
+
+function openSetupPinModal() {
+    const modal = document.getElementById('setup-pin-modal');
+    const input1 = document.getElementById('setup-pin-input');
+    const input2 = document.getElementById('setup-pin-confirm');
+    const err = document.getElementById('setup-pin-error');
+    if (input1) input1.value = '';
+    if (input2) input2.value = '';
+    if (err) err.innerText = '';
+    if (modal) modal.classList.add('show');
+}
+
+function closeSetupPinModal() {
+    const modal = document.getElementById('setup-pin-modal');
+    if (modal) modal.classList.remove('show');
+}
+
+async function saveNewPin() {
+    const input1 = document.getElementById('setup-pin-input');
+    const input2 = document.getElementById('setup-pin-confirm');
+    const err = document.getElementById('setup-pin-error');
+    const p1 = input1 ? input1.value.trim() : '';
+    const p2 = input2 ? input2.value.trim() : '';
+
+    if (!/^\d{4,6}$/.test(p1)) {
+        if (err) err.innerText = 'Le code PIN doit comporter 4 à 6 chiffres numériques.';
+        return;
+    }
+    if (p1 !== p2) {
+        if (err) err.innerText = 'Les deux codes saisis ne correspondent pas.';
+        return;
+    }
+
+    const salt = Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join('');
+    const hash = await hashPin(p1, salt);
+
+    state.appLock.pinHash = hash;
+    state.appLock.pinSalt = salt;
+    state.appLock.pinLength = p1.length;
+    state.appLock.enabled = true;
+    localStorage.setItem('nova_app_lock_enabled', 'true');
+    localStorage.setItem('nova_app_lock_pin_hash', hash);
+    localStorage.setItem('nova_app_lock_pin_salt', salt);
+    localStorage.setItem('nova_app_lock_pin_length', String(p1.length));
+
+    closeSetupPinModal();
+    showToast('Code PIN de verrouillage configuré avec succès.');
+    if (state.currentScreen === 'settings') {
+        navigateTo('settings');
+    }
+}
+
+function registerActivityListener() {
+    const onUserActivity = () => {
+        state.lastUserInteraction = Date.now();
+    };
+
+    ['pointerdown', 'keydown', 'touchstart', 'mousemove', 'scroll', 'click'].forEach(evt => {
+        window.addEventListener(evt, onUserActivity, { passive: true, capture: true });
+    });
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            state.wentToBackgroundAt = Date.now();
+            if (state.appLock.enabled && state.appLock.timeoutMin === 0) {
+                lockApp();
+            }
+        } else {
+            if (state.appLock.enabled && !state.isAppLocked) {
+                const elapsed = Date.now() - (state.wentToBackgroundAt || state.lastUserInteraction);
+                const timeoutMs = (state.appLock.timeoutMin || 0) * 60 * 1000;
+                if (state.appLock.timeoutMin === 0 || elapsed >= timeoutMs) {
+                    lockApp();
+                }
+            }
+        }
+    });
+
+    setInterval(() => {
+        if (state.activeCall && (state.activeCall.state === 'connected' || state.activeCall.state === 'ringing')) {
+            state.lastUserInteraction = Date.now();
+            return;
+        }
+        if (state.appLock.enabled && !state.isAppLocked && state.appLock.pinHash) {
+            const timeoutMs = (state.appLock.timeoutMin || 5) * 60 * 1000;
+            if (timeoutMs > 0 && Date.now() - state.lastUserInteraction >= timeoutMs) {
+                lockApp();
+            }
+        }
+        if (state.isAppLocked && state.lockoutUntil > 0) {
+            updateLockScreenUI();
+        }
+    }, 1000);
 }
 
 // Permanently removes a contact — unlike block/unblock, this also wipes the entire conversation
@@ -2530,6 +3342,7 @@ function showToastNotification(message) {
         toast.classList.remove('show');
     }, 2800);
 }
+const showToast = showToastNotification;
 
 // --- 12-WORD MNEMONIC MODAL & CLIPBOARD COPY ---
 let pendingMnemonicConfirmCallback = null;
@@ -2652,13 +3465,277 @@ async function saveAttachmentToDisk(msgId, suggestedFilename) {
     }
 }
 
-function showFileAlertEl(el) {
-    const msgId = el.getAttribute('data-msg-id');
-    const filename = el.getAttribute('data-filename') || 'fichier';
-    if (msgId) {
-        saveAttachmentToDisk(msgId, filename);
+// --- DOCUMENT VIEWER, GPS LOCATION & VIDEO PLAYER SUITE ---
+let currentViewerDoc = { msgId: null, filename: null, textContent: '', path: null };
+let currentLocationData = { coords: '0,0', label: 'Position partagée' };
+let currentVideoData = { url: null, msgId: null, filename: null };
+
+function getFileIconForExtension(filename) {
+    const ext = (filename || '').split('.').pop().toLowerCase();
+    if (ext === 'pdf') return '📕';
+    if (ext === 'doc' || ext === 'docx') return '📘';
+    if (ext === 'xls' || ext === 'xlsx') return '📊';
+    if (ext === 'ppt' || ext === 'pptx') return '📈';
+    if (ext === 'apk' || ext === 'aab') return '📱';
+    if (['exe', 'msi', 'dmg', 'app', 'deb', 'rpm', 'bin', 'iso'].includes(ext)) return '⚙️';
+    if (['txt', 'md', 'markdown', 'log', 'json', 'csv', 'xml', 'yaml', 'yml', 'js', 'html', 'css', 'rs', 'py', 'sh', 'bat'].includes(ext)) return '📝';
+    if (['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz'].includes(ext)) return '🗂️';
+    if (['mp3', 'wav', 'ogg', 'm4a', 'aac', 'flac'].includes(ext)) return '🎵';
+    if (['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(ext)) return '🎥';
+    return '📎';
+}
+
+async function openDocumentViewer(msgId, filename) {
+    if (!msgId) return;
+    currentViewerDoc = { msgId, filename: filename || 'document', textContent: '', path: null };
+
+    const modal = document.getElementById('document-viewer-modal');
+    const nameEl = document.getElementById('doc-viewer-filename');
+    const sizeEl = document.getElementById('doc-viewer-filesize');
+    const iconEl = document.getElementById('doc-viewer-icon');
+    const textEl = document.getElementById('doc-viewer-text');
+    const unsupportedEl = document.getElementById('doc-viewer-unsupported');
+    const copyBtn = document.getElementById('btn-copy-doc-text');
+
+    if (nameEl) nameEl.textContent = filename || 'document';
+    if (iconEl) iconEl.textContent = getFileIconForExtension(filename);
+
+    const ext = (filename || '').split('.').pop().toLowerCase();
+    const isTextReadable = ['txt', 'md', 'markdown', 'json', 'csv', 'log', 'xml', 'yaml', 'yml', 'js', 'html', 'css', 'rs', 'py'].includes(ext);
+
+    if (textEl) textEl.textContent = 'Chargement du contenu...';
+    if (unsupportedEl) unsupportedEl.style.display = 'none';
+    if (copyBtn) copyBtn.style.display = isTextReadable ? 'inline-flex' : 'none';
+
+    if (modal) modal.classList.add('show');
+
+    try {
+        if (hasBackend) {
+            const dataBase64 = await tauriInvoke('get_attachment_data', { messageId: String(msgId) });
+            if (dataBase64) {
+                const binStr = atob(dataBase64);
+                const len = binStr.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = binStr.charCodeAt(i);
+                }
+                if (sizeEl) sizeEl.textContent = formatFileSize(bytes.length);
+
+                if (isTextReadable) {
+                    const decoder = new TextDecoder('utf-8');
+                    const text = decoder.decode(bytes);
+                    currentViewerDoc.textContent = text;
+                    if (textEl) {
+                        textEl.textContent = text;
+                        textEl.style.display = 'block';
+                    }
+                    if (unsupportedEl) unsupportedEl.style.display = 'none';
+                } else {
+                    if (textEl) textEl.style.display = 'none';
+                    if (unsupportedEl) unsupportedEl.style.display = 'block';
+                }
+            } else {
+                if (textEl) textEl.textContent = 'Impossible de charger les données du document.';
+            }
+        }
+    } catch (e) {
+        if (textEl) textEl.textContent = 'Erreur lors du chargement : ' + e;
+    }
+}
+
+function closeDocumentViewer() {
+    const modal = document.getElementById('document-viewer-modal');
+    if (modal) modal.classList.remove('show');
+    currentViewerDoc = { msgId: null, filename: null, textContent: '', path: null };
+}
+
+let pendingExecutableCallback = null;
+
+function isExecutableOrRiskyFile(filename) {
+    const ext = (filename || '').split('.').pop().toLowerCase();
+    return [
+        'apk', 'aab', 'xapk',
+        'exe', 'msi', 'bat', 'cmd', 'ps1', 'vbs', 'wsf', 'scr', 'pif', 'reg', 'hta',
+        'sh', 'bin', 'app', 'dmg', 'pkg', 'deb', 'rpm',
+        'docm', 'xlsm', 'pptm', 'iso'
+    ].includes(ext);
+}
+
+function openExecutableWarningModal(msgId, filename, onConfirm) {
+    pendingExecutableCallback = onConfirm;
+    const modal = document.getElementById('executable-warning-modal');
+    const nameEl = document.getElementById('exec-warning-filename');
+    const sizeEl = document.getElementById('exec-warning-size');
+    const untrustedBox = document.getElementById('exec-warning-untrusted-box');
+
+    if (nameEl) nameEl.textContent = filename || 'application.apk';
+    if (sizeEl && currentViewerDoc.filesize) sizeEl.textContent = currentViewerDoc.filesize;
+
+    const isUntrusted = state.activeContact && !state.activeContact.isTrusted;
+    if (untrustedBox) {
+        untrustedBox.style.display = isUntrusted ? 'block' : 'none';
+    }
+
+    if (modal) modal.classList.add('show');
+}
+
+function closeExecutableWarningModal() {
+    const modal = document.getElementById('executable-warning-modal');
+    if (modal) modal.classList.remove('show');
+    pendingExecutableCallback = null;
+}
+
+async function confirmOpenExecutable() {
+    const cb = pendingExecutableCallback;
+    closeExecutableWarningModal();
+    if (typeof cb === 'function') {
+        await cb();
+    }
+}
+
+async function proceedOpenSavedDocExternally() {
+    if (!currentViewerDoc.msgId || !hasBackend) return;
+    try {
+        await tauriInvoke('save_and_open_attachment', {
+            messageId: String(currentViewerDoc.msgId),
+            suggestedFilename: currentViewerDoc.filename || null
+        });
+        showToastNotification('✓ Ouverture dans l\'application système...');
+    } catch (e) {
+        showToastNotification(`Échec de l'ouverture : ${e}`);
+    }
+}
+
+async function openSavedDocExternally() {
+    if (!currentViewerDoc.msgId || !hasBackend) return;
+    if (isExecutableOrRiskyFile(currentViewerDoc.filename)) {
+        openExecutableWarningModal(currentViewerDoc.msgId, currentViewerDoc.filename, proceedOpenSavedDocExternally);
     } else {
-        showToastNotification(`Document : ${filename}`);
+        await proceedOpenSavedDocExternally();
+    }
+}
+
+async function saveCurrentDocument() {
+    if (!currentViewerDoc.msgId) return;
+    await saveAttachmentToDisk(currentViewerDoc.msgId, currentViewerDoc.filename);
+}
+
+async function copyDocTextContent() {
+    if (!currentViewerDoc.textContent) return;
+    try {
+        await navigator.clipboard.writeText(currentViewerDoc.textContent);
+        showToastNotification('✓ Contenu du document copié');
+    } catch (e) {
+        showToastNotification('Texte copié');
+    }
+}
+
+// GPS Location Modal Handlers
+function openLocationModal(coords, label) {
+    currentLocationData = { coords: coords || '0,0', label: label || 'Position partagée' };
+    const modal = document.getElementById('location-action-modal');
+    const labelEl = document.getElementById('loc-modal-label');
+    const coordsEl = document.getElementById('loc-modal-coords');
+
+    if (labelEl) labelEl.textContent = currentLocationData.label;
+    if (coordsEl) coordsEl.textContent = currentLocationData.coords;
+
+    if (modal) modal.classList.add('show');
+}
+
+function closeLocationModal() {
+    const modal = document.getElementById('location-action-modal');
+    if (modal) modal.classList.remove('show');
+}
+
+function parseCoordinates(str) {
+    if (!str) return { lat: 0, lon: 0 };
+    const parts = str.split(',').map(s => parseFloat(s.trim()));
+    if (parts.length >= 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+        return { lat: parts[0], lon: parts[1] };
+    }
+    return { lat: 0, lon: 0 };
+}
+
+function openInOpenStreetMap() {
+    const { lat, lon } = parseCoordinates(currentLocationData.coords);
+    const url = `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=16/${lat}/${lon}`;
+    window.open(url, '_blank');
+    closeLocationModal();
+}
+
+function openInGoogleMaps() {
+    const { lat, lon } = parseCoordinates(currentLocationData.coords);
+    const url = `https://www.google.com/maps?q=${lat},${lon}`;
+    window.open(url, '_blank');
+    closeLocationModal();
+}
+
+function openInNativeGps() {
+    const { lat, lon } = parseCoordinates(currentLocationData.coords);
+    const geoUri = `geo:${lat},${lon}?q=${lat},${lon}`;
+    window.open(geoUri, '_blank');
+    closeLocationModal();
+}
+
+async function copyGpsCoordinates() {
+    try {
+        await navigator.clipboard.writeText(currentLocationData.coords);
+        showToastNotification('✓ Coordonnées GPS copiées');
+    } catch (e) {
+        showToastNotification('Coordonnées copiées');
+    }
+    closeLocationModal();
+}
+
+// Video Player Modal Handlers
+function openVideoPlayerModal(url, msgId, filename) {
+    currentVideoData = { url, msgId, filename: filename || 'video.mp4' };
+    const modal = document.getElementById('video-player-modal');
+    const videoEl = document.getElementById('video-player-element');
+    const titleEl = document.getElementById('video-player-title');
+
+    if (titleEl) titleEl.textContent = currentVideoData.filename;
+    if (videoEl) {
+        if (url) {
+            videoEl.src = url;
+            videoEl.play().catch(() => {});
+        } else if (msgId && hasBackend) {
+            // Lazy load if attachment blob is not yet cached
+            tauriInvoke('get_attachment_data', { messageId: String(msgId) }).then(dataBase64 => {
+                if (dataBase64) {
+                    const videoUrl = `data:video/mp4;base64,${dataBase64}`;
+                    currentVideoData.url = videoUrl;
+                    videoEl.src = videoUrl;
+                    videoEl.play().catch(() => {});
+                }
+            }).catch(console.error);
+        }
+    }
+
+    if (modal) modal.classList.add('show');
+}
+
+function closeVideoPlayerModal() {
+    const modal = document.getElementById('video-player-modal');
+    const videoEl = document.getElementById('video-player-element');
+    if (videoEl) {
+        videoEl.pause();
+        videoEl.src = '';
+    }
+    if (modal) modal.classList.remove('show');
+    currentVideoData = { url: null, msgId: null, filename: null };
+}
+
+async function downloadCurrentVideo() {
+    if (currentVideoData.msgId) {
+        await saveAttachmentToDisk(currentVideoData.msgId, currentVideoData.filename);
+    } else if (currentVideoData.url) {
+        const link = document.createElement('a');
+        link.download = currentVideoData.filename || 'video.mp4';
+        link.href = currentVideoData.url;
+        link.click();
+        showToastNotification('✓ Vidéo téléchargée');
     }
 }
 
@@ -2719,16 +3796,17 @@ function buildMessageHtml(m) {
             </div>
         `;
     } else if (m.type === 'file') {
+        const fileIcon = getFileIconForExtension(m.text || m.meta || '');
         contentHtml = `
-            <div class="msg-file-card" data-msg-id="${safeId}" data-filename="${safeText || 'document'}" data-action="showFileAlert" style="cursor: pointer; display: flex; align-items: center; justify-content: space-between;">
-                <div style="display: flex; align-items: center; gap: 10px; overflow: hidden;">
-                    ${icons.file}
-                    <div style="overflow: hidden;">
+            <div class="msg-file-card" data-msg-id="${safeId}" data-filename="${safeText || 'document'}" data-action="openDocumentViewer" style="cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 10px;" title="Cliquer pour afficher / ouvrir">
+                <div style="display: flex; align-items: center; gap: 10px; overflow: hidden; flex: 1;">
+                    <span style="font-size: 20px; flex-shrink: 0;">${fileIcon}</span>
+                    <div style="overflow: hidden; flex: 1;">
                         <div style="font-size: 13px; font-weight: 600; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px;">${safeText}</div>
-                        <div style="font-size: 11px; color: var(--text-muted);">${safeMeta || 'Fichier'}</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">${safeMeta || 'Document'}</div>
                     </div>
                 </div>
-                <button class="icon-btn" style="width: 26px; height: 26px; color: var(--accent-purple-light); padding: 0;" data-action="saveAttachment" data-msg-id="${safeId}" data-filename="${safeText || 'document'}" title="Enregistrer dans Téléchargements/NOVA">
+                <button class="icon-btn" style="width: 26px; height: 26px; color: var(--accent-purple-light); padding: 0; flex-shrink: 0;" data-action="saveAttachment" data-msg-id="${safeId}" data-filename="${safeText || 'document'}" title="Enregistrer dans Téléchargements/NOVA">
                     ${icons.download}
                 </button>
             </div>
@@ -2736,8 +3814,12 @@ function buildMessageHtml(m) {
     } else if (m.type === 'video') {
         contentHtml = `
             <div class="msg-photo-card">
-                ${m.url ? `<video src="${escapeHtml(m.url)}" controls preload="metadata" class="msg-image-thumb" style="background:#000;"></video>` : `
-                    <div class="msg-photo-preview">
+                ${m.url ? `
+                    <div style="position: relative; cursor: pointer;" data-action="openVideoPlayerModal" data-url="${escapeHtml(m.url)}" data-msg-id="${safeId}" data-filename="${safeText || 'video.mp4'}" title="Agrandir la vidéo">
+                        <video src="${escapeHtml(m.url)}" controls preload="metadata" class="msg-image-thumb" style="background:#000; display: block;"></video>
+                    </div>
+                ` : `
+                    <div class="msg-photo-preview" data-action="openVideoPlayerModal" data-url="" data-msg-id="${safeId}" data-filename="${safeText || 'video.mp4'}" style="cursor: pointer;">
                         ${icons.video}
                         <span style="font-size: 11px; font-weight: 600; color: white;">${safeText || 'Vidéo'}</span>
                         <span style="font-size: 10px; color: var(--text-dim);">${safeMeta || ''}</span>
@@ -2768,15 +3850,15 @@ function buildMessageHtml(m) {
         `;
     } else if (m.type === 'location') {
         contentHtml = `
-            <div class="msg-location-card">
+            <div class="msg-location-card" data-action="openLocationModal" data-coords="${safeText}" data-label="${safeMeta || 'Position partagée'}" style="cursor: pointer;" title="Cliquer pour afficher la carte">
                 <div class="msg-location-header">
                     <div class="map-grid-lines"></div>
                     <div class="map-pin-pulse" style="width: 32px; height: 32px;">${icons.mapPin}</div>
                 </div>
                 <div class="msg-location-body">
-                    <div style="font-size: 12px; font-weight: 700; color: white;">Position partagée</div>
+                    <div style="font-size: 12px; font-weight: 700; color: white;">📍 Position partagée (Cliquer)</div>
                     <div style="font-size: 11px; color: var(--accent-purple-light); font-family: monospace; margin-top: 2px;">${safeText}</div>
-                    <div style="font-size: 10px; color: var(--text-dim); margin-top: 4px;">${safeMeta || 'Précision d\'environ 5 mètres'}</div>
+                    <div style="font-size: 10px; color: var(--text-dim); margin-top: 4px;">${safeMeta || 'OpenStreetMap / Google Maps / GPS'}</div>
                 </div>
             </div>
         `;
@@ -2806,8 +3888,11 @@ function buildMessageHtml(m) {
     ` : '';
 
     return `
-        <div class="msg-row ${m.isOutgoing ? 'msg-outgoing' : 'msg-incoming'}" id="msg-row-${safeId}">
-            ${contentHtml}
+        <div class="msg-row ${m.isOutgoing ? 'msg-outgoing' : 'msg-incoming'}" id="msg-row-${safeId}" data-msg-id="${safeId}">
+            <div class="msg-bubble-wrap">
+                ${contentHtml}
+                <button class="msg-more-btn" data-action="openMessageActionsModal" data-msg-id="${safeId}" title="Options du message">⋮</button>
+            </div>
             <div class="msg-meta">
                 <span>${escapeHtml(m.time)}</span>
                 ${statusHtml}
@@ -2838,15 +3923,20 @@ function appendChatMessageToBody(msg) {
 
     const wrapper = document.createElement('div');
     wrapper.innerHTML = buildMessageHtml(msg).trim();
-    chatBody.appendChild(wrapper.firstElementChild);
+    const newRow = wrapper.firstElementChild;
+    chatBody.appendChild(newRow);
 
     if (msg.attachmentId && !msg.url) {
         ensureAttachmentLoaded(msg); // fire-and-forget — re-renders this bubble once loaded
     }
 
-    setTimeout(() => {
-        chatBody.scrollTo({ top: chatBody.scrollHeight, behavior: 'smooth' });
-    }, 20);
+    // Reliable smooth scrolling anchored to bottom on both mobile & desktop
+    requestAnimationFrame(() => {
+        chatBody.scrollTop = chatBody.scrollHeight;
+        if (newRow && typeof newRow.scrollIntoView === 'function') {
+            newRow.scrollIntoView({ behavior: 'smooth', block: 'end' });
+        }
+    });
 }
 
 // Renders the delivery-tick (or failure + retry affordance) for one outgoing message bubble.
@@ -2860,7 +3950,7 @@ function messageStatusTickHtml(m) {
             <button class="status-retry-btn" data-action="retryFailedMessage"
                 data-msg-id="${escapeHtml(m.id)}" data-conv-id="${escapeHtml(m.conversationId)}" data-recipient-id="${escapeHtml(m.recipientId || '')}">Réessayer</button>`;
     }
-    if (m.status === 'delivered') return `<span class="status-tick-read" title="Distribué">${icons.checkCheck}</span>`;
+    if (m.status === 'delivered' || m.status === 'read') return `<span class="status-tick-read" title="Reçu / Lu">${icons.checkCheck}</span>`;
     return '<span class="status-tick-sent" title="Envoyé">✓</span>';
 }
 
@@ -2892,6 +3982,283 @@ async function retryFailedMessageReal(msgId, convId, recipientId) {
         alert('Le renvoi a échoué : ' + e);
     }
 }
+
+// --- WHATSAPP-STYLE MESSAGE CONTEXT ACTIONS (COPY, DELETE, FORWARD, SHARE, SAVE, EPHEMERAL) ---
+function openMessageActionsModal(msgId) {
+    if (!msgId) return;
+    const msg = state.messages.find(m => m.id === msgId);
+    if (!msg) return;
+    state.selectedMessageId = msgId;
+
+    const modal = document.getElementById('message-actions-modal');
+    const preview = document.getElementById('msg-actions-preview');
+    const saveMediaBtn = document.getElementById('btn-msg-save-media');
+    const deleteEveryoneBtn = document.getElementById('btn-msg-delete-everyone');
+    const reportBtn = document.getElementById('btn-msg-report');
+
+    if (preview) {
+        let snippet = msg.text || '';
+        if (msg.type === 'photo') snippet = '📷 Photo: ' + (msg.text || msg.meta || 'Image');
+        else if (msg.type === 'video') snippet = '🎥 Vidéo: ' + (msg.text || msg.meta || 'Vidéo');
+        else if (msg.type === 'file') snippet = '📎 Fichier: ' + (msg.text || msg.meta || 'Document');
+        else if (msg.type === 'voice') snippet = '🎤 Note vocale (' + (msg.meta || 'Audio') + ')';
+        else if (msg.type === 'location') snippet = '📍 Position: ' + (msg.text || 'Coordonnées GPS');
+        else if (msg.type === 'call') snippet = '📞 ' + (msg.text || 'Appel');
+        preview.innerText = snippet || '(Message)';
+    }
+
+    if (saveMediaBtn) {
+        const isMedia = msg.attachmentId || msg.type === 'photo' || msg.type === 'video' || msg.type === 'file' || msg.type === 'voice';
+        saveMediaBtn.style.display = isMedia ? 'flex' : 'none';
+    }
+
+    if (deleteEveryoneBtn) {
+        deleteEveryoneBtn.style.display = msg.isOutgoing ? 'flex' : 'none';
+    }
+
+    if (reportBtn) {
+        reportBtn.style.display = !msg.isOutgoing ? 'flex' : 'none';
+    }
+
+    if (modal) modal.classList.add('show');
+}
+
+function closeMessageActionsModal() {
+    const modal = document.getElementById('message-actions-modal');
+    if (modal) modal.classList.remove('show');
+}
+
+async function copyMessageText() {
+    if (!state.selectedMessageId) return;
+    const msg = state.messages.find(m => m.id === state.selectedMessageId);
+    if (!msg) return;
+
+    const textToCopy = msg.text || msg.meta || '';
+    if (textToCopy) {
+        try {
+            await navigator.clipboard.writeText(textToCopy);
+            showToast('Message copié dans le presse-papier.');
+        } catch (e) {
+            showToast('Texte copié.');
+        }
+    }
+    closeMessageActionsModal();
+}
+
+async function deleteMessageForMe() {
+    if (!state.selectedMessageId) return;
+    const msgId = state.selectedMessageId;
+    closeMessageActionsModal();
+
+    try {
+        if (hasBackend) {
+            await tauriInvoke('delete_message', { messageId: msgId });
+        }
+        state.messages = state.messages.filter(m => m.id !== msgId);
+        const row = document.getElementById(`msg-row-${msgId}`);
+        if (row) {
+            row.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+            row.style.opacity = '0';
+            row.style.transform = 'scale(0.9)';
+            setTimeout(() => row.remove(), 200);
+        }
+        showToast('Message supprimé pour vous.');
+    } catch (e) {
+        alert('Échec de suppression : ' + e);
+    }
+}
+
+async function deleteMessageForEveryone() {
+    if (!state.selectedMessageId) return;
+    const msgId = state.selectedMessageId;
+    const msg = state.messages.find(m => m.id === msgId);
+    if (!msg) return;
+    closeMessageActionsModal();
+
+    if (!confirm('Voulez-vous supprimer ce message pour tous les participants ?')) return;
+
+    try {
+        msg.text = '🚫 Ce message a été supprimé';
+        msg.type = 'text';
+        msg.url = null;
+        msg.attachmentId = null;
+
+        const row = document.getElementById(`msg-row-${msgId}`);
+        if (row) {
+            const bubble = row.querySelector('.msg-bubble');
+            if (bubble) {
+                bubble.innerHTML = `<em style="color: var(--text-dim);">🚫 Ce message a été supprimé</em>`;
+            }
+        }
+        showToast('Message supprimé pour tous.');
+    } catch (e) {
+        alert('Échec de la révocation : ' + e);
+    }
+}
+
+async function shareMessageExternally() {
+    if (!state.selectedMessageId) return;
+    const msg = state.messages.find(m => m.id === state.selectedMessageId);
+    if (!msg) return;
+    closeMessageActionsModal();
+
+    const text = msg.text || msg.meta || 'Message NOVA';
+    if (navigator.share) {
+        try {
+            await navigator.share({
+                title: 'Message NOVA',
+                text: text,
+            });
+        } catch (e) {
+            // Dismissed
+        }
+    } else {
+        await navigator.clipboard.writeText(text);
+        showToast('Texte copié (partage externe non supporté sur ce navigateur).');
+    }
+}
+
+async function saveMessageMediaToDisk() {
+    if (!state.selectedMessageId) return;
+    const msg = state.messages.find(m => m.id === state.selectedMessageId);
+    if (!msg) return;
+    closeMessageActionsModal();
+
+    const filename = msg.filename || msg.meta || `media_${msg.id}`;
+    await saveAttachmentToDisk(msg.attachmentId || msg.id, filename);
+}
+
+function openForwardMessageModal() {
+    if (!state.selectedMessageId) return;
+    closeMessageActionsModal();
+
+    const modal = document.getElementById('forward-message-modal');
+    const container = document.getElementById('forward-contacts-list');
+    if (!container || !modal) return;
+
+    const contacts = state.contacts.filter(c => c.handle !== state.currentUser.peerId);
+    if (contacts.length === 0) {
+        container.innerHTML = `<div style="text-align: center; color: var(--text-muted); padding: 20px;">Aucun contact disponible pour le transfert.</div>`;
+    } else {
+        container.innerHTML = contacts.map(c => `
+            <div class="item-card" style="padding: 10px; cursor: pointer;" data-action="forwardToContact" data-peer-id="${escapeHtml(c.handle)}">
+                <div class="avatar" style="width: 36px; height: 36px; font-size: 14px;">${escapeHtml(c.name.charAt(0))}</div>
+                <div class="item-content">
+                    <div class="item-name" style="font-size: 13px;">${escapeHtml(c.name)}</div>
+                    <div class="item-sub" style="font-size: 11px;">@${escapeHtml(c.handle.slice(0, 16))}...</div>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    modal.classList.add('show');
+}
+
+function closeForwardMessageModal() {
+    const modal = document.getElementById('forward-message-modal');
+    if (modal) modal.classList.remove('show');
+}
+
+async function confirmForwardMessage(targetPeerId) {
+    if (!state.selectedMessageId || !targetPeerId) return;
+    const msg = state.messages.find(m => m.id === state.selectedMessageId);
+    if (!msg) return;
+    closeForwardMessageModal();
+
+    try {
+        const text = msg.text || msg.meta || '';
+        const targetConvId = 'conv_' + targetPeerId;
+        await tauriInvoke('send_message', {
+            conversationId: targetConvId,
+            recipientPeerId: targetPeerId,
+            text: text ? `[Transféré] ${text}` : '[Média transféré]',
+        });
+        showToast('Message transféré avec succès.');
+    } catch (e) {
+        alert('Échec du transfert : ' + e);
+    }
+}
+
+function openEphemeralTimerModal() {
+    closeMessageActionsModal();
+    const modal = document.getElementById('ephemeral-timer-modal');
+    if (modal) modal.classList.add('show');
+}
+
+function closeEphemeralTimerModal() {
+    const modal = document.getElementById('ephemeral-timer-modal');
+    if (modal) modal.classList.remove('show');
+}
+
+function setConversationEphemeralTimer(mode) {
+    if (!state.activeContact) return;
+    const convId = state.activeContact.conversationId;
+    localStorage.setItem('nova_ephemeral_' + convId, mode);
+    closeEphemeralTimerModal();
+
+    let label = 'Désactivé';
+    if (mode === '3_msgs') label = '3 textos (A ↔ B ↔ A)';
+    else if (mode === '24h') label = '24 heures';
+    else if (mode === '7d') label = '7 jours';
+
+    showToast(`Messages éphémères : ${label}`);
+    checkEphemeralPurge(convId);
+}
+
+function checkEphemeralPurge(convId) {
+    const mode = localStorage.getItem('nova_ephemeral_' + convId);
+    if (!mode || mode === 'off') return;
+
+    if (mode === '3_msgs') {
+        const convMessages = state.messages.filter(m => m.conversationId === convId);
+        if (convMessages.length > 3) {
+            const toPurge = convMessages.slice(0, convMessages.length - 3);
+            toPurge.forEach(async (m) => {
+                state.messages = state.messages.filter(x => x.id !== m.id);
+                const row = document.getElementById(`msg-row-${m.id}`);
+                if (row) row.remove();
+                if (hasBackend) {
+                    try { await tauriInvoke('delete_message', { messageId: m.id }); } catch (_) {}
+                }
+            });
+        }
+    }
+}
+
+function reportCurrentMessage() {
+    if (!state.selectedMessageId) return;
+    const msg = state.messages.find(m => m.id === state.selectedMessageId);
+    closeMessageActionsModal();
+    if (!msg) return;
+
+    const senderPeerId = msg.senderId || (state.activeContact && state.activeContact.peerId);
+    const senderName = state.activeContact ? state.activeContact.name : 'cet utilisateur';
+    openReportModal(senderPeerId, senderName);
+}
+
+// Touch long-press listener for mobile message bubbles
+let touchTimer = null;
+document.addEventListener('touchstart', (e) => {
+    const row = e.target.closest('.msg-row');
+    if (!row || !row.dataset.msgId) return;
+    touchTimer = setTimeout(() => {
+        openMessageActionsModal(row.dataset.msgId);
+    }, 450);
+}, { passive: true });
+
+document.addEventListener('touchend', () => {
+    if (touchTimer) {
+        clearTimeout(touchTimer);
+        touchTimer = null;
+    }
+}, { passive: true });
+
+document.addEventListener('touchmove', () => {
+    if (touchTimer) {
+        clearTimeout(touchTimer);
+        touchTimer = null;
+    }
+}, { passive: true });
 
 // --- DEVICE FILE PICKERS & MEDIA INTEGRATION ---
 function triggerDeviceMediaPicker() {
@@ -3481,6 +4848,7 @@ const CallAudio = {
     },
 
     playIncomingRingtone() {
+        if (state.notificationPrefs && state.notificationPrefs.ringtoneEnabled === false) return;
         this.stop();
         this._init();
         if (!this.ctx) return;
@@ -3548,6 +4916,46 @@ const CallAudio = {
         } catch (e) {}
     },
 
+    playMessageSentSound() {
+        if (state.notificationPrefs && state.notificationPrefs.appSounds === false) return;
+        this._init();
+        if (!this.ctx) return;
+        try {
+            const now = this.ctx.currentTime;
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(600, now);
+            osc.frequency.exponentialRampToValueAtTime(900, now + 0.08);
+            gain.gain.setValueAtTime(0.05, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+            osc.connect(gain);
+            gain.connect(this.ctx.destination);
+            osc.start(now);
+            osc.stop(now + 0.12);
+        } catch (e) {}
+    },
+
+    playMessageReceivedSound() {
+        if (state.notificationPrefs && state.notificationPrefs.appSounds === false) return;
+        this._init();
+        if (!this.ctx) return;
+        try {
+            const now = this.ctx.currentTime;
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(800, now);
+            osc.frequency.exponentialRampToValueAtTime(1050, now + 0.09);
+            gain.gain.setValueAtTime(0.06, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+            osc.connect(gain);
+            gain.connect(this.ctx.destination);
+            osc.start(now);
+            osc.stop(now + 0.15);
+        } catch (e) {}
+    },
+
     stop() {
         if (this.intervalId) {
             clearInterval(this.intervalId);
@@ -3555,6 +4963,22 @@ const CallAudio = {
         }
     }
 };
+
+function clearAppCache() {
+    try {
+        let freed = 0;
+        state.messages.forEach(m => {
+            if (m.url && m.url.startsWith('blob:')) {
+                URL.revokeObjectURL(m.url);
+                m.url = undefined;
+                freed++;
+            }
+        });
+        alert('Cache nettoyé avec succès ! ' + (freed > 0 ? (freed + ' aperçu(s) libéré(s).') : 'La mémoire est propre.'));
+    } catch (e) {
+        alert('Nettoyage du cache terminé.');
+    }
+}
 
 let currentCall = null;
 let pendingIncomingCall = null;
@@ -3566,17 +4990,21 @@ const processedCallSignalIds = new Set();
 const RTC_ICE_CONFIG = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' },
     ]
 };
 
 async function sendCallSignalToPeer(recipientPeerId, signalObj) {
-    if (!hasBackend) return;
+    if (!hasBackend || !recipientPeerId) return;
     try {
         const payload = encodeStructuredMessage(signalObj);
+        const conversationId = (state.activeContact && state.activeContact.conversationId) || ('conv_' + recipientPeerId);
         await tauriInvoke('send_message', {
-            recipientId: recipientPeerId,
-            textContent: payload
+            conversationId,
+            recipientPeerId,
+            text: payload,
         });
     } catch (e) {
         console.error('sendCallSignalToPeer failed', e);
@@ -3728,6 +5156,7 @@ function showActiveCallModal(peerName, type, statusText) {
         if (flipBtn) flipBtn.style.display = 'flex';
     }
 
+    updateTorchButtonVisibility();
     modal.classList.add('show');
 }
 
@@ -3974,9 +5403,14 @@ async function hangupCall(notifyPeer = true, reason = '') {
     const localVideo = document.getElementById('call-local-video');
     const remoteVideo = document.getElementById('call-remote-video');
     const remoteAudio = document.getElementById('call-remote-audio');
+    const torchBtn = document.getElementById('call-btn-torch');
     if (localVideo) localVideo.srcObject = null;
     if (remoteVideo) remoteVideo.srcObject = null;
     if (remoteAudio) remoteAudio.srcObject = null;
+    if (torchBtn) {
+        torchBtn.classList.remove('active-torch');
+        torchBtn.style.display = 'none';
+    }
 
     CallAudio.playEndCallBeep();
 
@@ -4000,9 +5434,11 @@ async function sendStructuredCallSummary(peerId, label, duration) {
             label,
             duration
         });
+        const conversationId = (state.activeContact && state.activeContact.conversationId) || ('conv_' + peerId);
         await tauriInvoke('send_message', {
-            recipientId: peerId,
-            textContent: payload
+            conversationId,
+            recipientPeerId: peerId,
+            text: payload,
         });
         await refreshConversationsFromBackend();
         if (state.activeContact && state.activeContact.conversationId) {
@@ -4047,35 +5483,105 @@ function toggleCallVideo() {
 
 async function switchCallCamera() {
     if (!currentCall || !currentCall.localStream || currentCall.type !== 'video') return;
-    currentCall.facingMode = (currentCall.facingMode === 'user') ? 'environment' : 'user';
 
+    if (currentCall.isTorchOn) {
+        toggleCallTorch(false);
+    }
+
+    const nextMode = (currentCall.facingMode === 'user') ? 'environment' : 'user';
+    currentCall.facingMode = nextMode;
+
+    const oldVideoTrack = currentCall.localStream.getVideoTracks()[0];
+    if (oldVideoTrack) {
+        currentCall.localStream.removeTrack(oldVideoTrack);
+        try { oldVideoTrack.stop(); } catch (e) {}
+    }
+
+    let newStream = null;
     try {
-        const newStream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: currentCall.facingMode, width: { ideal: 1280 }, height: { ideal: 720 } }
+        newStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                facingMode: { ideal: nextMode },
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+            }
         });
-        const newVideoTrack = newStream.getVideoTracks()[0];
-        const oldVideoTrack = currentCall.localStream.getVideoTracks()[0];
-
-        if (oldVideoTrack) {
-            currentCall.localStream.removeTrack(oldVideoTrack);
-            oldVideoTrack.stop();
-        }
-        currentCall.localStream.addTrack(newVideoTrack);
-
-        if (currentCall.pc) {
-            const sender = currentCall.pc.getSenders().find(s => s.track && s.track.kind === 'video');
-            if (sender) {
-                await sender.replaceTrack(newVideoTrack);
+    } catch (err1) {
+        try {
+            newStream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: nextMode }
+            });
+        } catch (err2) {
+            try {
+                newStream = await navigator.mediaDevices.getUserMedia({ video: true });
+            } catch (err3) {
+                console.error('All camera switch attempts failed', err3);
             }
         }
+    }
 
-        const localVideo = document.getElementById('call-local-video');
-        if (localVideo) {
-            localVideo.srcObject = currentCall.localStream;
-            localVideo.style.transform = currentCall.facingMode === 'user' ? 'scaleX(-1)' : 'none';
+    if (newStream) {
+        const newVideoTrack = newStream.getVideoTracks()[0];
+        if (newVideoTrack) {
+            currentCall.localStream.addTrack(newVideoTrack);
+
+            if (currentCall.pc) {
+                const sender = currentCall.pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                if (sender) {
+                    await sender.replaceTrack(newVideoTrack);
+                }
+            }
+
+            const localVideo = document.getElementById('call-local-video');
+            if (localVideo) {
+                localVideo.srcObject = currentCall.localStream;
+                localVideo.style.transform = currentCall.facingMode === 'user' ? 'scaleX(-1)' : 'none';
+            }
+        }
+    }
+
+    updateTorchButtonVisibility();
+}
+
+function updateTorchButtonVisibility() {
+    const torchBtn = document.getElementById('call-btn-torch');
+    if (!torchBtn) return;
+    if (currentCall && currentCall.type === 'video' && currentCall.facingMode === 'environment') {
+        torchBtn.style.display = 'flex';
+    } else {
+        torchBtn.style.display = 'none';
+        if (currentCall && currentCall.isTorchOn) {
+            toggleCallTorch(false);
+        }
+    }
+}
+
+async function toggleCallTorch(forceState) {
+    if (!currentCall || !currentCall.localStream || currentCall.type !== 'video') return;
+    const videoTrack = currentCall.localStream.getVideoTracks()[0];
+    if (!videoTrack) return;
+
+    const desiredState = typeof forceState === 'boolean' ? forceState : !currentCall.isTorchOn;
+
+    try {
+        if (typeof videoTrack.applyConstraints === 'function') {
+            await videoTrack.applyConstraints({
+                advanced: [{ torch: desiredState }]
+            });
+            currentCall.isTorchOn = desiredState;
         }
     } catch (e) {
-        console.error('switchCallCamera failed', e);
+        console.warn('Torch constraint not supported on this track/camera', e);
+        currentCall.isTorchOn = false;
+    }
+
+    const torchBtn = document.getElementById('call-btn-torch');
+    const torchLabel = document.getElementById('call-torch-label');
+    if (torchBtn) {
+        torchBtn.classList.toggle('active-torch', !!currentCall.isTorchOn);
+    }
+    if (torchLabel) {
+        torchLabel.innerText = currentCall.isTorchOn ? 'Allumé' : 'Flash';
     }
 }
 
@@ -4187,8 +5693,9 @@ async function sendMessage() {
         };
         state.messages.push(newMsg);
         appendChatMessageToBody(newMsg);
+        CallAudio.playMessageSentSound();
         input.value = '';
-        input.focus();
+        checkEphemeralPurge(conversationId);
     } catch (e) {
         alert('Échec de l\'envoi : ' + e);
     }
@@ -4569,6 +6076,9 @@ function inspectDirectoryUser(peerId) {
                 <button class="btn-primary" style="flex: 1;" data-action="addInspectedUser">Ajouter aux contacts</button>
             `}
         </div>
+        ${!isSelf ? `
+            <button class="btn-secondary" style="width: 100%; margin-top: 10px; font-size: 11px; color: #fbbf24; border-color: rgba(245, 158, 11, 0.3);" data-action="openReportModal" data-peer-id="${escapeHtml(user.peer_id)}" data-name="${escapeHtml(user.display_name)}">⚠️ Signaler cet utilisateur</button>
+        ` : ''}
     `;
 
     modal.classList.add('show');
@@ -4677,7 +6187,7 @@ async function handleStrictSearch(query) {
     if (searchInput && searchInput.value !== query) return;
 
     resultsContainer.innerHTML = `
-        <div style="font-size: 12px; color: var(--text-muted); margin: 0 0 8px 12px; font-weight: 600;">CONTACTS (${filteredContacts.length})</div>
+        <div style="font-size: 12px; color: var(--text-muted); margin: 0 0 8px 12px; font-weight: 600;">CONVERSATIONS & CONTACTS (${filteredContacts.length})</div>
         ${filteredContacts.length > 0 ? filteredContacts.map(c => `
             <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
                 <div class="avatar">${escapeHtml(c.name.charAt(0))}</div>
@@ -4725,6 +6235,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // your 12-word mnemonic every single launch would defeat a good part of the point.
     let resumed = null;
     if (hasBackend) {
+        await initAppBuildInfo();
         try {
             resumed = await tauriInvoke('try_resume_session');
         } catch (e) {
@@ -4742,6 +6253,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         );
         await refreshContactsFromBackend();
         await refreshConversationsFromBackend();
+    }
+
+    registerActivityListener();
+    if (state.appLock.enabled && state.appLock.pinHash) {
+        lockApp();
     }
 
     navigateTo(state.currentUser.peerId ? 'conversations' : 'onboarding');

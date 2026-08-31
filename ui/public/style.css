@@ -74,11 +74,17 @@ body {
 /* App Root Container */
 .app-root {
     width: 100vw;
+    width: 100dvw;
     height: 100vh;
     height: 100dvh;
+    max-height: 100dvh;
     display: flex;
     background-color: var(--bg-main);
-    position: relative;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
     overflow: hidden;
 }
 
@@ -397,7 +403,100 @@ body {
 .msg-row {
     display: flex;
     flex-direction: column;
-    max-width: 82%;
+    max-width: 84%;
+    position: relative;
+    user-select: text;
+    -webkit-user-select: text;
+}
+
+.msg-bubble-wrap {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    position: relative;
+    width: 100%;
+}
+
+.msg-incoming .msg-bubble-wrap {
+    flex-direction: row;
+}
+
+.msg-outgoing .msg-bubble-wrap {
+    flex-direction: row-reverse;
+}
+
+.msg-more-btn {
+    opacity: 0;
+    transition: opacity 0.15s ease, background 0.15s ease;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 16px;
+    cursor: pointer;
+    padding: 2px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
+}
+
+.msg-row:hover .msg-more-btn,
+.msg-more-btn:focus,
+.msg-more-btn:active {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.08);
+}
+
+@media (max-width: 768px) {
+    .msg-more-btn {
+        opacity: 0.55;
+    }
+}
+
+.msg-action-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 14px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    color: white;
+    cursor: pointer;
+    text-align: left;
+    transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+    font-size: 13px;
+    user-select: none;
+}
+
+.msg-action-item:hover,
+.msg-action-item:active {
+    background: var(--bg-elevated);
+    border-color: var(--accent-purple-light);
+    transform: scale(0.99);
+}
+
+.msg-action-icon {
+    font-size: 18px;
+    width: 24px;
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.msg-action-label {
+    flex: 1;
+    min-width: 0;
+}
+
+.msg-action-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 1px;
 }
 
 .msg-incoming {
@@ -446,6 +545,7 @@ body {
     word-break: break-word;
     position: relative;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    flex: 1;
 }
 
 .msg-incoming .msg-bubble {
@@ -1736,6 +1836,16 @@ button:disabled,
     color: #ef4444;
 }
 
+.call-dock-btn.active-torch {
+    background: rgba(234, 179, 8, 0.25);
+    border-color: rgba(234, 179, 8, 0.6);
+    color: #eab308;
+}
+
+.call-dock-btn.active-torch span {
+    color: #eab308;
+}
+
 .call-dock-btn.btn-hangup {
     background: linear-gradient(135deg, #ef4444, #dc2626);
     border-color: transparent;
@@ -1955,5 +2065,105 @@ button:disabled,
     transform: translateX(-50%) translateY(0);
     opacity: 1;
 }
+
+/* Star Rating Buttons */
+.star-btn {
+    transition: transform 0.15s ease, color 0.15s ease;
+    user-select: none;
+}
+.star-btn:hover {
+    transform: scale(1.25);
+}
+
+/* ==========================================================================
+   INVIOLABLE APP LOCK OVERLAY & KEYPAD
+   ========================================================================== */
+.app-lock-screen-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: #080A10;
+    z-index: 999999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    user-select: none;
+}
+
+.app-lock-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    width: 100%;
+    max-width: 320px;
+}
+
+.pin-dots-container {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+}
+
+.pin-dot {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 2px solid var(--accent-purple-light);
+    background: transparent;
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.pin-dot.filled {
+    background: var(--accent-purple-light);
+    box-shadow: 0 0 10px rgba(139, 92, 246, 0.6);
+    transform: scale(1.15);
+}
+
+.pin-dot.error {
+    border-color: var(--status-danger);
+    background: var(--status-danger);
+    box-shadow: 0 0 12px rgba(239, 68, 68, 0.7);
+}
+
+.pin-key-btn {
+    width: 68px;
+    height: 68px;
+    border-radius: 50%;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    color: white;
+    font-size: 24px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background-color 0.15s ease, transform 0.1s ease, border-color 0.15s ease;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    margin: 0 auto;
+}
+
+.pin-key-btn:active {
+    background: var(--accent-purple);
+    border-color: var(--accent-purple-light);
+    transform: scale(0.92);
+}
+
+.pin-key-action {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--accent-purple-light);
+}
+
+.pin-key-action:active {
+    background: rgba(139, 92, 246, 0.2);
+    border-color: rgba(139, 92, 246, 0.4);
+}
+
 
 

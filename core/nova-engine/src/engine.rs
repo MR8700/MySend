@@ -1382,6 +1382,11 @@ impl NovaEngine {
         Ok(self.storage.get_attachment_blob(message_id)?)
     }
 
+    /// Deletes a single message and its attachment from local storage.
+    pub fn delete_message(&self, message_id: &str) -> Result<(), EngineError> {
+        Ok(self.storage.delete_message(message_id)?)
+    }
+
     /// Retrieve peer connection info for connection diagnostics screen. Reflects the attached
     /// `P2PNode`'s real connection state once `attach_network` has been called; falls back to
     /// this engine's own (empty, until then) supervisor otherwise.

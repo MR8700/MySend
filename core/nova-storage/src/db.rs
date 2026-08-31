@@ -886,6 +886,16 @@ impl StorageEngine {
         Ok(list)
     }
 
+    /// Deletes a single message and any associated attachment from local encrypted storage.
+    pub fn delete_message(&self, message_id: &str) -> Result<(), StorageError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM message_attachments WHERE message_id = ?1", params![message_id])?;
+        tx.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     #[allow(clippy::type_complexity)]
     fn row_to_raw_message(
         row: &rusqlite::Row,

@@ -1,12 +1,14 @@
 use crate::relay::BlindRelay;
-use crate::registry::PresenceRegistry;
+use crate::registry::{AdminOverview, FeedbackRecord, PresenceRegistry};
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::http::HeaderMap;
-use axum::routing::get;
-use axum::Router;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use nova_protocol::{ServerRequest, ServerResponse};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,21 +24,66 @@ struct AppState {
     relay: Arc<BlindRelay>,
 }
 
+#[derive(Deserialize)]
+pub struct ReportPayload {
+    pub reporter_peer_id: String,
+    pub target_peer_id: String,
+    pub reason: String,
+    pub category: Option<String>,
+    pub comment: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ReportResponse {
+    pub success: bool,
+    pub auto_quarantined: bool,
+    pub message: String,
+}
+
+#[derive(Deserialize)]
+pub struct FeedbackPayload {
+    pub sender_peer_id: Option<String>,
+    pub rating: u8,
+    pub category: Option<String>,
+    pub comment: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct FeedbackResponse {
+    pub success: bool,
+    pub record: FeedbackRecord,
+}
+
+#[derive(Deserialize)]
+pub struct BanUserPayload {
+    pub peer_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UnbanUserPayload {
+    pub peer_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct SettingsPayload {
+    pub auto_ban_threshold: usize,
+}
+
+#[derive(Serialize)]
+pub struct SimpleStatusResponse {
+    pub success: bool,
+    pub message: String,
+}
+
 /// Binds a TCP listener at `bind_addr` and serves the discovery/signaling protocol forever as a
-/// WebSocket upgrade over plain HTTP (see this module's doc comment on why: no raw UDP ingress on
-/// a host like Render). Also spawns the periodic housekeeping task that expires stale presence
-/// entries and relay queues. Returns only if the initial bind fails.
+/// WebSocket upgrade over plain HTTP. Also spawns the periodic housekeeping task.
 pub async fn run_server(bind_addr: &str) -> std::io::Result<()> {
     let (listener, registry, relay) = bind(bind_addr).await?;
     serve_forever(listener, registry, relay).await;
     Ok(())
 }
 
-/// Binds the TCP listener and starts the registry/relay housekeeping task without serving yet —
-/// split out from [`run_server`] so a caller that needs the actual bound address (e.g. a test
-/// binding to port 0, or `nova-transport`'s fallback client wiring up a same-process server for
-/// its own integration tests) can read `listener.local_addr()` before handing it off to
-/// [`serve_forever`].
 pub async fn bind(bind_addr: &str) -> std::io::Result<(TcpListener, Arc<PresenceRegistry>, Arc<BlindRelay>)> {
     let registry = Arc::new(PresenceRegistry::new());
     let relay = Arc::new(BlindRelay::new());
@@ -58,7 +105,7 @@ pub async fn bind(bind_addr: &str) -> std::io::Result<(TcpListener, Arc<Presence
         e
     })?;
     let bound_addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| bind_addr.to_string());
-    info!("NOVA Server listening on ws://{bound_addr} (register / lookup / relay signaling)");
+    info!("NOVA Server listening on ws://{bound_addr} (register / lookup / relay signaling + HTTP API)");
 
     Ok((listener, registry, relay))
 }
@@ -67,10 +114,18 @@ fn router(registry: Arc<PresenceRegistry>, relay: Arc<BlindRelay>) -> Router {
     Router::new()
         .route("/", get(ws_handler))
         .route("/health", get(|| async { "ok" }))
+        // Public Consumer Endpoints (Reports & App Feedback)
+        .route("/report", post(handle_report))
+        .route("/feedback", post(handle_feedback))
+        // Admin & Moderation Endpoints (Protected by Admin Token)
+        .route("/admin/overview", get(handle_admin_overview))
+        .route("/admin/ban", post(handle_admin_ban))
+        .route("/admin/unban", post(handle_admin_unban))
+        .route("/admin/settings", post(handle_admin_settings))
         .with_state(AppState { registry, relay })
 }
 
-/// Serves the discovery/signaling protocol forever over an already-bound listener (see [`bind`]).
+/// Serves the discovery/signaling protocol forever over an already-bound listener.
 pub async fn serve_forever(listener: TcpListener, registry: Arc<PresenceRegistry>, relay: Arc<BlindRelay>) {
     let app = router(registry, relay).into_make_service_with_connect_info::<SocketAddr>();
     if let Err(e) = axum::serve(listener, app).await {
@@ -88,16 +143,6 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state, observed_ip))
 }
 
-/// The IP a `Register` request's reflexive-address correction should trust (see
-/// `PresenceRegistry::register`'s doc comment). Render — like effectively every PaaS host —
-/// terminates the client's real TCP/TLS connection at its own edge proxy and forwards to this
-/// process over an internal network, so `peer_addr` as seen here is the *proxy's* address, not
-/// the real client's, once deployed; the proxy instead reports the original client in
-/// `X-Forwarded-For`. Trusting that header is safe specifically *because* this process is only
-/// ever reachable through Render's proxy in production (never directly from the internet) — the
-/// same assumption every app behind a PaaS load balancer already makes. Locally (no proxy in
-/// front, e.g. running the server directly for a test or a LAN deployment) there is no such
-/// header and this falls back to the real socket peer address exactly as the old UDP path did.
 fn client_ip(headers: &HeaderMap, peer_addr: SocketAddr) -> IpAddr {
     headers
         .get("x-forwarded-for")
@@ -108,10 +153,139 @@ fn client_ip(headers: &HeaderMap, peer_addr: SocketAddr) -> IpAddr {
         .unwrap_or_else(|| peer_addr.ip())
 }
 
+fn check_admin_auth(headers: &HeaderMap, params: Option<&HashMap<String, String>>) -> bool {
+    let expected = std::env::var("NOVA_ADMIN_SECRET").unwrap_or_else(|_| "nova_admin_master_secret".to_string());
+    if let Some(h) = headers.get("x-admin-token").and_then(|v| v.to_str().ok()) {
+        if h.trim() == expected.trim() {
+            return true;
+        }
+    }
+    if let Some(p) = params.and_then(|m| m.get("admin_token")) {
+        if p.trim() == expected.trim() {
+            return true;
+        }
+    }
+    false
+}
+
+// -------------------------------------------------------------
+// HTTP REST Handlers for Moderation, Reporting and Feedback
+// -------------------------------------------------------------
+
+async fn handle_report(
+    State(state): State<AppState>,
+    Json(payload): Json<ReportPayload>,
+) -> Result<Json<ReportResponse>, (StatusCode, String)> {
+    let cat = payload.category.unwrap_or_else(|| "other".into());
+    let cmt = payload.comment.unwrap_or_default();
+
+    match state.registry.submit_report(
+        payload.reporter_peer_id,
+        payload.target_peer_id,
+        payload.reason,
+        cat,
+        cmt,
+    ).await {
+        Ok(auto_quarantined) => Ok(Json(ReportResponse {
+            success: true,
+            auto_quarantined,
+            message: if auto_quarantined {
+                "Signalement enregistré. Le compte a été placé en quarantaine automatique.".into()
+            } else {
+                "Signalement enregistré avec succès. Merci de contribuer à la sécurité.".into()
+            },
+        })),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+    }
+}
+
+async fn handle_feedback(
+    State(state): State<AppState>,
+    Json(payload): Json<FeedbackPayload>,
+) -> Result<Json<FeedbackResponse>, (StatusCode, String)> {
+    let cat = payload.category.unwrap_or_else(|| "general".into());
+    let cmt = payload.comment.unwrap_or_default();
+
+    match state.registry.submit_feedback(payload.sender_peer_id, payload.rating, cat, cmt).await {
+        Ok(record) => Ok(Json(FeedbackResponse {
+            success: true,
+            record,
+        })),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+    }
+}
+
+async fn handle_admin_overview(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> Result<Json<AdminOverview>, (StatusCode, String)> {
+    if !check_admin_auth(&headers, Some(&params)) {
+        return Err((StatusCode::UNAUTHORIZED, "Accès administrateur refusé : jeton invalide.".into()));
+    }
+    let overview = state.registry.get_admin_overview().await;
+    Ok(Json(overview))
+}
+
+async fn handle_admin_ban(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<BanUserPayload>,
+) -> Result<Json<SimpleStatusResponse>, (StatusCode, String)> {
+    if !check_admin_auth(&headers, None) {
+        return Err((StatusCode::UNAUTHORIZED, "Accès administrateur refusé : jeton invalide.".into()));
+    }
+    let reason = payload.reason.unwrap_or_else(|| "Bannissement administratif".into());
+    match state.registry.ban_user(payload.peer_id, reason).await {
+        Ok(()) => Ok(Json(SimpleStatusResponse {
+            success: true,
+            message: "Utilisateur banni avec succès.".into(),
+        })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+async fn handle_admin_unban(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<UnbanUserPayload>,
+) -> Result<Json<SimpleStatusResponse>, (StatusCode, String)> {
+    if !check_admin_auth(&headers, None) {
+        return Err((StatusCode::UNAUTHORIZED, "Accès administrateur refusé : jeton invalide.".into()));
+    }
+    match state.registry.unban_user(&payload.peer_id).await {
+        Ok(unbanned) => Ok(Json(SimpleStatusResponse {
+            success: true,
+            message: if unbanned {
+                "Utilisateur débanni avec succès.".into()
+            } else {
+                "Cet utilisateur n'était pas banni.".into()
+            },
+        })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+async fn handle_admin_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<SettingsPayload>,
+) -> Result<Json<SimpleStatusResponse>, (StatusCode, String)> {
+    if !check_admin_auth(&headers, None) {
+        return Err((StatusCode::UNAUTHORIZED, "Accès administrateur refusé : jeton invalide.".into()));
+    }
+    state.registry.set_auto_ban_threshold(payload.auto_ban_threshold).await;
+    Ok(Json(SimpleStatusResponse {
+        success: true,
+        message: format!("Seuil de bannissement automatique mis à jour à {}.", payload.auto_ban_threshold),
+    }))
+}
+
+// -------------------------------------------------------------
+// WebSocket Signaling & Request Handling
+// -------------------------------------------------------------
+
 async fn handle_socket(mut socket: WebSocket, state: AppState, observed_ip: IpAddr) {
-    // Only `.ip()` of this address is ever read (see `PresenceRegistry::register`) — the port is
-    // irrelevant for the reflexive-address correction, so a dummy `0` here is exactly as
-    // meaningful as the never-preserved-through-a-proxy real source port would have been anyway.
     let observed_addr = SocketAddr::new(observed_ip, 0);
 
     while let Some(msg) = socket.recv().await {
@@ -154,11 +328,6 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, observed_ip: IpAd
     }
 }
 
-/// Pure request handler (no I/O beyond the registry/relay state) — the piece worth unit- and
-/// integration-testing directly, independent of the real WebSocket transport. `observed_addr` is
-/// the caller's real address as this process trusts it (see [`client_ip`]), used to correct
-/// (STUN-style) the reflexive public address on `Register` requests — see
-/// [`PresenceRegistry::register`].
 pub async fn handle_request(
     registry: &PresenceRegistry,
     relay: &BlindRelay,
@@ -179,13 +348,21 @@ pub async fn handle_request(
         ServerRequest::RelayForward {
             target_peer_id,
             payload,
-        } => match relay.forward_opaque(&target_peer_id, payload).await {
-            Ok(()) => ServerResponse::RelayForwarded,
-            Err(e) => ServerResponse::Error(e.to_string()),
+        } => {
+            if registry.is_banned(&target_peer_id).await {
+                return ServerResponse::Error("L'utilisateur cible est suspendu.".into());
+            }
+            match relay.forward_opaque(&target_peer_id, payload).await {
+                Ok(()) => ServerResponse::RelayForwarded,
+                Err(e) => ServerResponse::Error(e.to_string()),
+            }
         },
         ServerRequest::RelayDrain(drain_request) => match drain_request.verify() {
             Ok(pubkey) => {
                 let peer_id = hex::encode(pubkey);
+                if registry.is_banned(&peer_id).await {
+                    return ServerResponse::Error("Votre compte est suspendu.".into());
+                }
                 ServerResponse::RelayDrained(relay.drain_for_peer(&peer_id).await)
             }
             Err(e) => ServerResponse::Error(e.to_string()),

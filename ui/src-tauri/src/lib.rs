@@ -197,6 +197,10 @@ async fn start_network_once(state: &State<'_, AppState>, mnemonic_str: &str, use
     }
 
     state.engine.attach_network(node).await;
+    let publish_engine = state.engine.clone();
+    tokio::spawn(async move {
+        let _ = publish_engine.publish_directory_profile().await;
+    });
 
     *started = true;
     true
@@ -297,7 +301,7 @@ fn get_user_profile(state: State<'_, AppState>) -> Result<Option<nova_storage::U
 }
 
 #[tauri::command]
-fn update_user_profile(
+async fn update_user_profile(
     state: State<'_, AppState>,
     display_name: String,
     bio: String,
@@ -308,7 +312,9 @@ fn update_user_profile(
         bio,
         avatar_data_url,
     };
-    state.engine.save_user_profile(&profile).map_err(engine_err)
+    state.engine.save_user_profile(&profile).map_err(engine_err)?;
+    let _ = state.engine.publish_directory_profile().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -350,6 +356,11 @@ async fn retry_failed_message(
 #[tauri::command]
 fn get_messages(state: State<'_, AppState>, conversation_id: String) -> Result<Vec<MessageRecord>, String> {
     state.engine.get_messages(&conversation_id).map_err(engine_err)
+}
+
+#[tauri::command]
+fn delete_message(state: State<'_, AppState>, message_id: String) -> Result<(), String> {
+    state.engine.delete_message(&message_id).map_err(engine_err)
 }
 
 #[tauri::command]
@@ -465,6 +476,48 @@ fn save_attachment_to_disk(
         .map_err(|e| format!("Erreur lors de l'enregistrement du fichier : {e}"))?;
 
     Ok(target_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn open_file_with_default_app(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path])
+            .spawn()
+            .map_err(|e| format!("Impossible d'ouvrir le fichier : {e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Impossible d'ouvrir le fichier : {e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Impossible d'ouvrir le fichier : {e}"))?;
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = &path;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn save_and_open_attachment(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    message_id: String,
+    suggested_filename: Option<String>,
+) -> Result<String, String> {
+    let path = save_attachment_to_disk(app, state, message_id, suggested_filename)?;
+    let _ = open_file_with_default_app(path.clone());
+    Ok(path)
 }
 
 #[tauri::command]
@@ -594,6 +647,260 @@ async fn set_fallback_server_url(state: State<'_, AppState>, url: String) -> Res
     Ok(())
 }
 
+/// Checks whether the P2P transport network is actively running on this device.
+#[tauri::command]
+async fn get_network_status(state: State<'_, AppState>) -> Result<bool, String> {
+    let started = *state.network_started.lock().await;
+    Ok(started)
+}
+
+fn get_server_http_base_url() -> String {
+    let ws_url = std::env::var("NOVA_UDP_FALLBACK_ADDR")
+        .unwrap_or_else(|_| "wss://nova-discovery.onrender.com".to_string());
+    if ws_url.starts_with("wss://") {
+        ws_url.replacen("wss://", "https://", 1)
+    } else if ws_url.starts_with("ws://") {
+        ws_url.replacen("ws://", "http://", 1)
+    } else {
+        "https://nova-discovery.onrender.com".to_string()
+    }
+}
+
+#[derive(Serialize)]
+pub struct AppBuildInfo {
+    pub variant: &'static str,
+    pub is_admin: bool,
+    pub version: &'static str,
+}
+
+#[tauri::command]
+async fn get_app_build_info() -> Result<AppBuildInfo, String> {
+    Ok(AppBuildInfo {
+        variant: if cfg!(feature = "admin") { "admin" } else { "user" },
+        is_admin: cfg!(feature = "admin"),
+        version: "1.0.0",
+    })
+}
+
+#[derive(Serialize)]
+struct ServerReportReq {
+    reporter_peer_id: String,
+    target_peer_id: String,
+    reason: String,
+    category: Option<String>,
+    comment: Option<String>,
+}
+
+#[tauri::command]
+async fn report_user(
+    state: State<'_, AppState>,
+    target_peer_id: String,
+    reason: String,
+    category: Option<String>,
+    comment: Option<String>,
+) -> Result<String, String> {
+    let own_peer_id = state
+        .engine
+        .identity
+        .lock()
+        .await
+        .as_ref()
+        .map(|id| id.public_id_hex())
+        .ok_or_else(|| "Aucun compte actif trouvé sur cet appareil.".to_string())?;
+    let base_url = get_server_http_base_url();
+    let url = format!("{base_url}/report");
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&url)
+        .json(&ServerReportReq {
+            reporter_peer_id: own_peer_id,
+            target_peer_id,
+            reason,
+            category,
+            comment,
+        })
+        .send()
+        .await
+        .map_err(|e| format!("Erreur réseau lors du signalement: {e}"))?;
+
+    if !res.status().is_success() {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(format!("Échec du signalement : {err_text}"));
+    }
+
+    let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    let msg = body.get("message").and_then(|m| m.as_str()).unwrap_or("Signalement envoyé.");
+    Ok(msg.to_string())
+}
+
+#[derive(Serialize)]
+struct ServerFeedbackReq {
+    sender_peer_id: Option<String>,
+    rating: u8,
+    category: Option<String>,
+    comment: Option<String>,
+}
+
+#[tauri::command]
+async fn submit_app_feedback(
+    state: State<'_, AppState>,
+    rating: u8,
+    category: Option<String>,
+    comment: Option<String>,
+) -> Result<String, String> {
+    let own_peer_id = state
+        .engine
+        .identity
+        .lock()
+        .await
+        .as_ref()
+        .map(|id| id.public_id_hex());
+    let base_url = get_server_http_base_url();
+    let url = format!("{base_url}/feedback");
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&url)
+        .json(&ServerFeedbackReq {
+            sender_peer_id: own_peer_id,
+            rating,
+            category,
+            comment,
+        })
+        .send()
+        .await
+        .map_err(|e| format!("Erreur réseau lors de l'envoi de l'avis: {e}"))?;
+
+    if !res.status().is_success() {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(format!("Échec de l'envoi : {err_text}"));
+    }
+
+    Ok("Merci pour votre retour ! Votre avis aide à améliorer NOVA.".to_string())
+}
+
+#[cfg(feature = "admin")]
+#[tauri::command]
+async fn admin_fetch_overview(admin_token: String) -> Result<serde_json::Value, String> {
+    let base_url = get_server_http_base_url();
+    let url = format!("{base_url}/admin/overview");
+
+    let client = reqwest::Client::new();
+    let res = client
+        .get(&url)
+        .header("x-admin-token", admin_token.trim())
+        .send()
+        .await
+        .map_err(|e| format!("Erreur de connexion au serveur admin: {e}"))?;
+
+    let status = res.status();
+    if !status.is_success() {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(format!("Erreur admin ({status}) : {err_text}"));
+    }
+
+    let overview: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    Ok(overview)
+}
+
+#[cfg(not(feature = "admin"))]
+#[tauri::command]
+async fn admin_fetch_overview(_admin_token: String) -> Result<serde_json::Value, String> {
+    Err("Cette fonctionnalité n'est pas incluse dans ce build utilisateur standard.".into())
+}
+
+#[cfg(feature = "admin")]
+#[tauri::command]
+async fn admin_ban_user(admin_token: String, peer_id: String, reason: Option<String>) -> Result<String, String> {
+    let base_url = get_server_http_base_url();
+    let url = format!("{base_url}/admin/ban");
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&url)
+        .header("x-admin-token", admin_token.trim())
+        .json(&serde_json::json!({
+            "peer_id": peer_id.trim(),
+            "reason": reason,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Erreur réseau: {e}"))?;
+
+    if !res.status().is_success() {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(format!("Échec du bannissement: {err_text}"));
+    }
+    Ok("Utilisateur suspendu avec succès.".into())
+}
+
+#[cfg(not(feature = "admin"))]
+#[tauri::command]
+async fn admin_ban_user(_admin_token: String, _peer_id: String, _reason: Option<String>) -> Result<String, String> {
+    Err("Build utilisateur standard.".into())
+}
+
+#[cfg(feature = "admin")]
+#[tauri::command]
+async fn admin_unban_user(admin_token: String, peer_id: String) -> Result<String, String> {
+    let base_url = get_server_http_base_url();
+    let url = format!("{base_url}/admin/unban");
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&url)
+        .header("x-admin-token", admin_token.trim())
+        .json(&serde_json::json!({
+            "peer_id": peer_id.trim(),
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Erreur réseau: {e}"))?;
+
+    if !res.status().is_success() {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(format!("Échec du déblocage: {err_text}"));
+    }
+    Ok("Utilisateur réhabilité avec succès.".into())
+}
+
+#[cfg(not(feature = "admin"))]
+#[tauri::command]
+async fn admin_unban_user(_admin_token: String, _peer_id: String) -> Result<String, String> {
+    Err("Build utilisateur standard.".into())
+}
+
+#[cfg(feature = "admin")]
+#[tauri::command]
+async fn admin_update_settings(admin_token: String, auto_ban_threshold: usize) -> Result<String, String> {
+    let base_url = get_server_http_base_url();
+    let url = format!("{base_url}/admin/settings");
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&url)
+        .header("x-admin-token", admin_token.trim())
+        .json(&serde_json::json!({
+            "auto_ban_threshold": auto_ban_threshold,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Erreur réseau: {e}"))?;
+
+    if !res.status().is_success() {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(format!("Échec de la mise à jour: {err_text}"));
+    }
+    Ok(format!("Seuil d'auto-quarantaine fixé à {auto_ban_threshold} signalements."))
+}
+
+#[cfg(not(feature = "admin"))]
+#[tauri::command]
+async fn admin_update_settings(_admin_token: String, _auto_ban_threshold: usize) -> Result<String, String> {
+    Err("Build utilisateur standard.".into())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt::try_init().ok();
@@ -684,10 +991,13 @@ pub fn run() {
             send_media,
             get_attachment_data,
             save_attachment_to_disk,
+            open_file_with_default_app,
+            save_and_open_attachment,
             get_media_folder_path,
             retry_failed_message,
             get_conversations,
             get_messages,
+            delete_message,
             search_messages,
             get_diagnostics,
             get_own_full_listen_addrs,
@@ -698,6 +1008,14 @@ pub fn run() {
             search_directory,
             get_user_profile,
             update_user_profile,
+            get_network_status,
+            get_app_build_info,
+            report_user,
+            submit_app_feedback,
+            admin_fetch_overview,
+            admin_ban_user,
+            admin_unban_user,
+            admin_update_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the NOVA Chat desktop app");

@@ -12,6 +12,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = []
+admin = []
+
 [dependencies]
 nova-crypto = { path = "../../core/nova-crypto" }
 nova-engine = { path = "../../core/nova-engine" }
@@ -20,10 +24,6 @@ nova-storage = { path = "../../core/nova-storage" }
 nova-transport = { path = "../../core/nova-transport" }
 libp2p.workspace = true
 tauri = { version = "2", features = [] }
-# Real, native file save (Settings/Identity screen's "Save QR" button) — a synthetic `<a download>`
-# blob-URL click (the previous approach) silently no-ops on Android's WebView (no download-manager
-# hook for a `data:`/`blob:` URI there) while still reporting success, since `.click()` itself never
-# throws. See `saveQrImage()` in ui/public/app.js.
 tauri-plugin-fs = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,3 +34,4 @@ rand = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
+reqwest = { workspace = true }

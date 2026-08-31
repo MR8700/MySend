@@ -5,7 +5,7 @@
     <!-- viewport-fit=cover and interactive-widget=resizes-content ensure proper safe-area insets
          and that the chat input bar stays pinned right above the virtual keyboard on mobile without cutoffs. -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
-    <title>NOVA Chat — Messagerie 1-to-1 P2P Souveraine</title>
+    <title>NOVA — Messagerie Sécurisée</title>
     <!-- No web font: style-src in tauri.conf.json's CSP is 'self' 'unsafe-inline' only, so a
          fonts.googleapis.com/fonts.gstatic.com stylesheet is blocked outright — it was a dead
          network request on every launch. A system font stack (see style.css --font-sans) keeps
@@ -83,7 +83,7 @@
                     <span id="incoming-call-type-label">Appel vocal entrant...</span>
                 </div>
                 <div class="incoming-call-security">
-                    🔒 Signalisation P2P souveraine chiffrée
+                    🔒 Appel chiffré de bout en bout
                 </div>
                 <div class="incoming-call-actions">
                     <button class="call-action-btn btn-reject" data-action="rejectIncomingCall" title="Refuser">
@@ -122,7 +122,7 @@
                 <div class="active-call-status" id="active-call-status">Appel en cours...</div>
                 <div class="active-call-timer" id="active-call-timer">00:00</div>
                 <div class="active-call-encryption">
-                    <span class="p2p-badge-pulse" style="width: 8px; height: 8px;"></span> Chiffrement direct P2P SRTP/DTLS
+                    <span class="p2p-badge-pulse" style="width: 8px; height: 8px;"></span> Communication chiffrée et sécurisée
                 </div>
             </div>
 
@@ -147,6 +147,10 @@
                 <button class="call-dock-btn" id="call-btn-camera-flip" data-action="switchCallCamera" title="Changer de caméra">
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0-4.42-3.58-8-8-8s-8 3.58-8 8c0 2.21.9 4.21 2.34 5.66L4 18h6v-6l-2.34 2.34C6.6 13.29 6 11.72 6 10c0-3.31 2.69-6 6-6s6 2.69 6 6c0 1.72-.6 3.29-1.66 4.34L18 16c1.24-1.55 2-3.68 2-6z"></path></svg>
                     <span>Tourner</span>
+                </button>
+                <button class="call-dock-btn" id="call-btn-torch" data-action="toggleCallTorch" title="Allumer / Éteindre le flash" style="display: none;">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" id="call-torch-icon"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+                    <span id="call-torch-label">Flash</span>
                 </button>
                 <button class="call-dock-btn btn-hangup" data-action="hangupActiveCall" title="Raccrocher">
                     <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-3.33-2.67m-2.67-3.34a19.79 19.79 0 0 1-3.07-8.63A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91"></path><line x1="23" y1="1" x2="1" y2="23"></line></svg>
@@ -198,6 +202,419 @@
             </div>
             <div class="image-preview-content">
                 <img id="image-preview-img" src="" alt="Aperçu grand format">
+            </div>
+        </div>
+
+        <!-- Report Contact Modal -->
+        <div id="report-modal" class="location-modal-overlay">
+            <div class="location-modal-card" style="max-width: 400px; padding: 22px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;">
+                    <div style="font-size: 16px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
+                        <span>⚠️</span>
+                        <span id="report-modal-title">Signaler un contact</span>
+                    </div>
+                    <button class="icon-btn" data-action="closeReportModal" style="width: 28px; height: 28px;">✕</button>
+                </div>
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px; line-height: 1.4;">
+                    Votre signalement est confidentiel et permet de protéger la communauté. Aucune discussion privée n'est transmise.
+                </p>
+                <label style="font-size: 12px; color: var(--text-muted);">Motif du signalement</label>
+                <select id="report-category-select" style="width: 100%; box-sizing: border-box; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 13px; margin: 6px 0 14px; outline: none;">
+                    <option value="spam">Spam / Messages indésirables ou répétés</option>
+                    <option value="harassment">Harcèlement, insultes ou menaces</option>
+                    <option value="scam">Arnaque, fraude ou tentative d'escroquerie</option>
+                    <option value="inappropriate">Contenu inapproprié ou illicite</option>
+                    <option value="impersonation">Usurpation d'identité</option>
+                    <option value="other">Autre motif</option>
+                </select>
+                <label style="font-size: 12px; color: var(--text-muted);">Détails complémentaires (facultatif)</label>
+                <textarea id="report-comment-input" rows="3" placeholder="Expliquez brièvement le problème..." style="width: 100%; box-sizing: border-box; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 13px; margin: 6px 0 16px; resize: none; outline: none;"></textarea>
+                <div style="display: flex; gap: 10px;">
+                    <button class="btn-secondary" style="flex: 1;" data-action="closeReportModal">Annuler</button>
+                    <button class="btn-primary" style="flex: 1; background: #d97706; border-color: #f59e0b;" data-action="confirmSubmitReport">Envoyer le signalement</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Feedback & Rating Modal -->
+        <div id="feedback-modal" class="location-modal-overlay">
+            <div class="location-modal-card" style="max-width: 400px; padding: 22px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;">
+                    <div style="font-size: 16px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
+                        <span>⭐</span>
+                        <span>Votre avis sur NOVA</span>
+                    </div>
+                    <button class="icon-btn" data-action="closeFeedbackModal" style="width: 28px; height: 28px;">✕</button>
+                </div>
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 16px; line-height: 1.4;">
+                    Attribuez une note et partagez vos impressions pour nous aider à améliorer l'application.
+                </p>
+
+                <div style="display: flex; justify-content: center; gap: 10px; margin-bottom: 18px;" id="feedback-stars-container">
+                    <button class="star-btn active-star" data-action="setFeedbackRating" data-rating="1" style="font-size: 32px; background: none; border: none; cursor: pointer; color: #fbbf24;">★</button>
+                    <button class="star-btn active-star" data-action="setFeedbackRating" data-rating="2" style="font-size: 32px; background: none; border: none; cursor: pointer; color: #fbbf24;">★</button>
+                    <button class="star-btn active-star" data-action="setFeedbackRating" data-rating="3" style="font-size: 32px; background: none; border: none; cursor: pointer; color: #fbbf24;">★</button>
+                    <button class="star-btn active-star" data-action="setFeedbackRating" data-rating="4" style="font-size: 32px; background: none; border: none; cursor: pointer; color: #fbbf24;">★</button>
+                    <button class="star-btn active-star" data-action="setFeedbackRating" data-rating="5" style="font-size: 32px; background: none; border: none; cursor: pointer; color: #fbbf24;">★</button>
+                </div>
+
+                <label style="font-size: 12px; color: var(--text-muted);">Sujet de votre retour</label>
+                <select id="feedback-category-select" style="width: 100%; box-sizing: border-box; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 13px; margin: 6px 0 14px; outline: none;">
+                    <option value="general">Expérience générale</option>
+                    <option value="call_quality">Qualité des appels (Voix/Vidéo)</option>
+                    <option value="ui">Design & Facilité d'utilisation</option>
+                    <option value="suggestion">Idée d'amélioration / Suggestion</option>
+                    <option value="bug">Signalement de problème ou bug</option>
+                </select>
+
+                <label style="font-size: 12px; color: var(--text-muted);">Votre commentaire</label>
+                <textarea id="feedback-comment-input" rows="3" placeholder="Dites-nous ce qui vous plaît ou ce qu'on peut perfectionner..." style="width: 100%; box-sizing: border-box; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; color: white; font-size: 13px; margin: 6px 0 16px; resize: none; outline: none;"></textarea>
+
+                <div style="display: flex; gap: 10px;">
+                    <button class="btn-secondary" style="flex: 1;" data-action="closeFeedbackModal">Annuler</button>
+                    <button class="btn-primary" style="flex: 1;" data-action="confirmSubmitFeedback">Envoyer mon avis</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Inviolable Fullscreen App Lock Screen -->
+        <div id="app-lock-screen" class="app-lock-screen-overlay" style="display: none;">
+            <div class="app-lock-content">
+                <div class="app-lock-logo">
+                    <img src="logo.png" alt="Logo" style="width: 76px; height: 76px; object-fit: contain; filter: drop-shadow(0 0 20px rgba(139, 92, 246, 0.5)); margin-bottom: 12px;">
+                </div>
+                <div style="font-size: 18px; font-weight: 700; color: white; margin-bottom: 4px;">NOVA Messagerie</div>
+                <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 24px;">Application verrouillée</div>
+
+                <!-- PIN Code Dots Indicator -->
+                <div class="pin-dots-container" id="app-lock-dots" style="display: flex; justify-content: center; gap: 14px; margin-bottom: 20px;">
+                    <div class="pin-dot"></div>
+                    <div class="pin-dot"></div>
+                    <div class="pin-dot"></div>
+                    <div class="pin-dot"></div>
+                </div>
+
+                <div id="app-lock-error-msg" style="font-size: 12px; color: var(--status-danger); min-height: 20px; margin-bottom: 16px; font-weight: 600; text-align: center;"></div>
+
+                <!-- Touch / Click On-Screen Keypad -->
+                <div class="pin-keypad-grid" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; max-width: 270px; margin: 0 auto 20px;">
+                    <button class="pin-key-btn" data-action="appLockKeypad" data-digit="1">1</button>
+                    <button class="pin-key-btn" data-action="appLockKeypad" data-digit="2">2</button>
+                    <button class="pin-key-btn" data-action="appLockKeypad" data-digit="3">3</button>
+                    <button class="pin-key-btn" data-action="appLockKeypad" data-digit="4">4</button>
+                    <button class="pin-key-btn" data-action="appLockKeypad" data-digit="5">5</button>
+                    <button class="pin-key-btn" data-action="appLockKeypad" data-digit="6">6</button>
+                    <button class="pin-key-btn" data-action="appLockKeypad" data-digit="7">7</button>
+                    <button class="pin-key-btn" data-action="appLockKeypad" data-digit="8">8</button>
+                    <button class="pin-key-btn" data-action="appLockKeypad" data-digit="9">9</button>
+                    <button class="pin-key-btn pin-key-action" data-action="triggerBiometricsUnlock" id="btn-lock-biometrics" title="Empreinte / Biométrie" style="font-size: 20px;">👆</button>
+                    <button class="pin-key-btn" data-action="appLockKeypad" data-digit="0">0</button>
+                    <button class="pin-key-btn pin-key-action" data-action="appLockBackspace" title="Effacer" style="font-size: 18px;">⌫</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Setup PIN Modal -->
+        <div id="setup-pin-modal" class="location-modal-overlay">
+            <div class="location-modal-card" style="max-width: 360px; padding: 22px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;">
+                    <div style="font-size: 16px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
+                        <span>🔒</span>
+                        <span id="setup-pin-modal-title">Définir un code PIN</span>
+                    </div>
+                    <button class="icon-btn" data-action="closeSetupPinModal" style="width: 28px; height: 28px;">✕</button>
+                </div>
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 16px; line-height: 1.4;">
+                    Choisissez un code PIN à 4 ou 6 chiffres pour protéger l'accès à vos conversations en cas d'inactivité.
+                </p>
+                <label style="font-size: 12px; color: var(--text-muted);">Nouveau code PIN</label>
+                <input type="password" inputmode="numeric" id="setup-pin-input" maxlength="6" placeholder="4 à 6 chiffres" style="width: 100%; box-sizing: border-box; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 12px 14px; color: white; font-size: 16px; letter-spacing: 4px; text-align: center; margin: 6px 0 14px; outline: none;">
+
+                <label style="font-size: 12px; color: var(--text-muted);">Confirmer le code PIN</label>
+                <input type="password" inputmode="numeric" id="setup-pin-confirm" maxlength="6" placeholder="Retapez votre code" style="width: 100%; box-sizing: border-box; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 12px 14px; color: white; font-size: 16px; letter-spacing: 4px; text-align: center; margin: 6px 0 16px; outline: none;">
+
+                <div id="setup-pin-error" style="font-size: 12px; color: var(--status-danger); min-height: 16px; margin-bottom: 12px; text-align: center;"></div>
+
+                <div style="display: flex; gap: 10px;">
+                    <button class="btn-secondary" style="flex: 1;" data-action="closeSetupPinModal">Annuler</button>
+                    <button class="btn-primary" style="flex: 1;" data-action="saveNewPin">Valider le code</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Message Actions Modal (WhatsApp-style Context Menu) -->
+        <div id="message-actions-modal" class="location-modal-overlay">
+            <div class="location-modal-card" style="max-width: 380px; padding: 18px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+                    <div style="font-size: 14px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
+                        <span>💬</span>
+                        <span id="msg-actions-title">Options du message</span>
+                    </div>
+                    <button class="icon-btn" data-action="closeMessageActionsModal" style="width: 28px; height: 28px;">✕</button>
+                </div>
+
+                <div id="msg-actions-preview" style="font-size: 12px; color: var(--text-muted); background: var(--bg-surface); padding: 10px 12px; border-radius: var(--radius-md); border: 1px solid var(--border-subtle); margin-bottom: 14px; max-height: 70px; overflow: hidden; text-overflow: ellipsis; white-space: pre-wrap; word-break: break-word;"></div>
+
+                <div class="msg-actions-list" style="display: flex; flex-direction: column; gap: 6px;">
+                    <button class="msg-action-item" data-action="copyMessageText">
+                        <span class="msg-action-icon">📋</span>
+                        <div class="msg-action-label">
+                            <div>Copier le texte</div>
+                            <div class="msg-action-sub">Copier dans le presse-papier</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" data-action="openForwardMessageModal">
+                        <span class="msg-action-icon">↗️</span>
+                        <div class="msg-action-label">
+                            <div>Transférer</div>
+                            <div class="msg-action-sub">Envoyer à un autre contact NOVA</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" data-action="shareMessageExternally">
+                        <span class="msg-action-icon">📤</span>
+                        <div class="msg-action-label">
+                            <div>Partager à l'extérieur</div>
+                            <div class="msg-action-sub">Partager vers d'autres applications</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" id="btn-msg-save-media" data-action="saveMessageMediaToDisk" style="display: none;">
+                        <span class="msg-action-icon">💾</span>
+                        <div class="msg-action-label">
+                            <div>Enregistrer le fichier</div>
+                            <div class="msg-action-sub">Sauvegarder la photo / vidéo sur l'appareil</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" data-action="openEphemeralTimerModal">
+                        <span class="msg-action-icon">⏳</span>
+                        <div class="msg-action-label">
+                            <div>Disparition automatique</div>
+                            <div class="msg-action-sub">Disparaît après 3 textos (A↔B↔A) ou 24h</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" data-action="deleteMessageForMe" style="color: var(--status-danger);">
+                        <span class="msg-action-icon">🗑️</span>
+                        <div class="msg-action-label">
+                            <div style="color: var(--status-danger);">Supprimer pour moi</div>
+                            <div class="msg-action-sub">Effacer de cet appareil</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" id="btn-msg-delete-everyone" data-action="deleteMessageForEveryone" style="color: var(--status-danger); display: none;">
+                        <span class="msg-action-icon">🚫</span>
+                        <div class="msg-action-label">
+                            <div style="color: var(--status-danger);">Supprimer pour tous</div>
+                            <div class="msg-action-sub">Révoquer le message des deux côtés</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" id="btn-msg-report" data-action="reportCurrentMessage" style="color: #fbbf24; display: none;">
+                        <span class="msg-action-icon">⚠️</span>
+                        <div class="msg-action-label">
+                            <div style="color: #fbbf24;">Signaler ce message</div>
+                            <div class="msg-action-sub">Signaler un abus ou contenu inapproprié</div>
+                        </div>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Forward Message Modal -->
+        <div id="forward-message-modal" class="location-modal-overlay">
+            <div class="location-modal-card" style="max-width: 380px; padding: 18px; max-height: 80vh; display: flex; flex-direction: column;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+                    <div style="font-size: 15px; font-weight: 700; color: white;">Transférer le message</div>
+                    <button class="icon-btn" data-action="closeForwardMessageModal" style="width: 28px; height: 28px;">✕</button>
+                </div>
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">Choisissez le contact à qui transférer ce message :</p>
+                <div id="forward-contacts-list" style="overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 8px; max-height: 320px; padding-right: 4px;"></div>
+            </div>
+        </div>
+
+        <!-- Ephemeral Disappearing Messages Modal -->
+        <div id="ephemeral-timer-modal" class="location-modal-overlay">
+            <div class="location-modal-card" style="max-width: 360px; padding: 20px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;">
+                    <div style="font-size: 15px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
+                        <span>⏳</span>
+                        <span>Messages éphémères</span>
+                    </div>
+                    <button class="icon-btn" data-action="closeEphemeralTimerModal" style="width: 28px; height: 28px;">✕</button>
+                </div>
+                <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 16px;">
+                    Les nouveaux messages de cette discussion disparaîtront automatiquement selon le délai choisi pour préserver votre espace et votre confidentialité.
+                </p>
+
+                <div class="msg-actions-list" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px;">
+                    <button class="msg-action-item" data-action="setEphemeralTimer" data-mode="3_msgs">
+                        <span class="msg-action-icon">💬</span>
+                        <div class="msg-action-label">
+                            <div style="font-weight: 700;">Après 3 textos (A ↔ B ↔ A)</div>
+                            <div class="msg-action-sub">S'efface après 3 échanges réciproques</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" data-action="setEphemeralTimer" data-mode="24h">
+                        <span class="msg-action-icon">⏱️</span>
+                        <div class="msg-action-label">
+                            <div style="font-weight: 700;">24 heures</div>
+                            <div class="msg-action-sub">S'efface 1 jour après l'envoi</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" data-action="setEphemeralTimer" data-mode="7d">
+                        <span class="msg-action-icon">📅</span>
+                        <div class="msg-action-label">
+                            <div style="font-weight: 700;">7 jours</div>
+                            <div class="msg-action-sub">S'efface 1 semaine après l'envoi</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" data-action="setEphemeralTimer" data-mode="off">
+                        <span class="msg-action-icon">❌</span>
+                        <div class="msg-action-label">
+                            <div style="font-weight: 700;">Désactivé</div>
+                            <div class="msg-action-sub">Conserver l'historique complet</div>
+                        </div>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- In-App Document & Text Viewer Modal -->
+        <div id="document-viewer-modal" class="location-modal-overlay">
+            <div class="location-modal-card" style="max-width: 520px; width: 92%; max-height: 85vh; display: flex; flex-direction: column; padding: 18px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; border-bottom: 1px solid var(--border-subtle); padding-bottom: 10px;">
+                    <div style="display: flex; align-items: center; gap: 10px; overflow: hidden;">
+                        <span id="doc-viewer-icon" style="font-size: 20px;">📄</span>
+                        <div style="overflow: hidden;">
+                            <div id="doc-viewer-filename" style="font-size: 14px; font-weight: 700; color: white; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">document.txt</div>
+                            <div id="doc-viewer-filesize" style="font-size: 11px; color: var(--text-muted);">Taille inconnue</div>
+                        </div>
+                    </div>
+                    <button class="icon-btn" data-action="closeDocumentViewer" style="width: 30px; height: 30px;">✕</button>
+                </div>
+
+                <!-- Text / Markdown content viewer area -->
+                <div id="doc-viewer-body" style="flex: 1; overflow-y: auto; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 14px; margin-bottom: 14px; max-height: 380px;">
+                    <pre id="doc-viewer-text" style="font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; color: #e2e8f0; white-space: pre-wrap; word-break: break-word; line-height: 1.5; margin: 0;"></pre>
+                    <div id="doc-viewer-unsupported" style="display: none; text-align: center; padding: 30px 10px; color: var(--text-muted);">
+                        <div style="font-size: 40px; margin-bottom: 12px;">📁</div>
+                        <div style="font-size: 14px; font-weight: 600; color: white; margin-bottom: 6px;">Document bureautique ou binaire</div>
+                        <div style="font-size: 12px; line-height: 1.4;">Cliquez sur « Ouvrir avec le système » ci-dessous pour afficher ce document dans votre lecteur habituel (Word, Excel, Acrobat, etc.).</div>
+                    </div>
+                </div>
+
+                <!-- Action buttons -->
+                <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                    <button class="btn-primary" style="flex: 1; min-width: 140px; font-size: 12px; padding: 10px 12px;" data-action="openSavedDocExternally">
+                        🚀 Ouvrir avec le système
+                    </button>
+                    <button class="btn-secondary" style="flex: 1; min-width: 120px; font-size: 12px;" data-action="saveCurrentDocument">
+                        💾 Enregistrer
+                    </button>
+                    <button class="btn-secondary" id="btn-copy-doc-text" style="font-size: 12px; padding: 10px 12px;" data-action="copyDocTextContent" title="Copier le texte">
+                        📋 Copier
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Interactive GPS Location & Maps Modal -->
+        <div id="location-action-modal" class="location-modal-overlay">
+            <div class="location-modal-card" style="max-width: 380px; padding: 20px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;">
+                    <div style="font-size: 15px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
+                        <span>📍</span>
+                        <span>Position géographique</span>
+                    </div>
+                    <button class="icon-btn" data-action="closeLocationModal" style="width: 28px; height: 28px;">✕</button>
+                </div>
+
+                <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 12px; margin-bottom: 16px; text-align: center;">
+                    <div id="loc-modal-label" style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 4px;">Position partagée</div>
+                    <div id="loc-modal-coords" style="font-family: monospace; font-size: 12px; color: var(--accent-purple-light);">0.0000, 0.0000</div>
+                </div>
+
+                <div class="msg-actions-list" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px;">
+                    <button class="msg-action-item" data-action="openInOpenStreetMap">
+                        <span class="msg-action-icon">🗺️</span>
+                        <div class="msg-action-label">
+                            <div style="font-weight: 700;">OpenStreetMap</div>
+                            <div class="msg-action-sub">Carte libre et respectueuse de la vie privée</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" data-action="openInGoogleMaps">
+                        <span class="msg-action-icon">🌐</span>
+                        <div class="msg-action-label">
+                            <div style="font-weight: 700;">Google Maps</div>
+                            <div class="msg-action-sub">Afficher dans le navigateur web</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" data-action="openInNativeGps">
+                        <span class="msg-action-icon">🧭</span>
+                        <div class="msg-action-label">
+                            <div style="font-weight: 700;">Application GPS du téléphone</div>
+                            <div class="msg-action-sub">Lancer Waze, Apple Maps ou Google Navigation</div>
+                        </div>
+                    </button>
+                    <button class="msg-action-item" data-action="copyGpsCoordinates">
+                        <span class="msg-action-icon">📋</span>
+                        <div class="msg-action-label">
+                            <div style="font-weight: 700;">Copier les coordonnées</div>
+                            <div class="msg-action-sub">Copier latitude, longitude</div>
+                        </div>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Fullscreen Video Player Modal -->
+        <div id="video-player-modal" class="location-modal-overlay">
+            <div class="location-modal-card" style="max-width: 600px; width: 94%; padding: 16px; display: flex; flex-direction: column; background: #000;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
+                    <div id="video-player-title" style="font-size: 13px; font-weight: 600; color: white; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px;">Vidéo</div>
+                    <div style="display: flex; gap: 6px;">
+                        <button class="icon-btn" data-action="downloadCurrentVideo" title="Enregistrer la vidéo" style="width: 32px; height: 32px; color: var(--accent-purple-light);">💾</button>
+                        <button class="icon-btn" data-action="closeVideoPlayerModal" style="width: 32px; height: 32px;">✕</button>
+                    </div>
+                </div>
+                <video id="video-player-element" controls playsinline style="width: 100%; max-height: 70vh; border-radius: var(--radius-sm); background: #000; outline: none;"></video>
+            </div>
+        </div>
+
+        <!-- Executable / Risky File Security Warning Modal -->
+        <div id="executable-warning-modal" class="location-modal-overlay">
+            <div class="location-modal-card" style="max-width: 420px; padding: 22px; border: 1px solid rgba(239, 68, 68, 0.4); box-shadow: 0 8px 32px rgba(239, 68, 68, 0.25);">
+                <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 14px;">
+                    <div style="width: 44px; height: 44px; border-radius: 50%; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0;">
+                        🛡️
+                    </div>
+                    <div>
+                        <div style="font-size: 15px; font-weight: 700; color: #ef4444;">Alerte de Sécurité Fichier</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">Application ou Programme Exécutable</div>
+                    </div>
+                </div>
+
+                <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 12px; margin-bottom: 14px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+                        <span style="font-size: 11px; color: var(--text-muted);">Fichier cible :</span>
+                        <span id="exec-warning-size" style="font-size: 11px; color: var(--text-dim);">0 KB</span>
+                    </div>
+                    <div id="exec-warning-filename" style="font-size: 13px; font-weight: 700; color: white; word-break: break-all; font-family: monospace;">application.apk</div>
+                </div>
+
+                <div id="exec-warning-untrusted-box" style="display: none; background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: var(--radius-md); padding: 10px 12px; margin-bottom: 14px; font-size: 11px; color: #fbbf24; line-height: 1.4;">
+                    ⚠️ <strong>Attention :</strong> L'expéditeur de ce fichier n'a pas encore été vérifié comme contact de confiance.
+                </div>
+
+                <p style="font-size: 12px; color: var(--text-muted); line-height: 1.5; margin-bottom: 18px;">
+                    Ce fichier est une <strong>application ou un programme exécutable</strong>. S'il contient un code malveillant, il pourrait compromettre votre appareil ou voler vos informations.<br><br>
+                    <span style="color: white; font-weight: 600;">Ne continuez que si vous connaissez personnellement l'expéditeur et que vous attendiez ce fichier.</span>
+                </p>
+
+                <div style="display: flex; gap: 10px; flex-direction: column;">
+                    <button class="btn-secondary" style="width: 100%; padding: 11px; font-weight: 600;" data-action="closeExecutableWarningModal">
+                        ✕ Annuler (Recommandé)
+                    </button>
+                    <button class="btn-primary" id="btn-confirm-open-exec" style="width: 100%; padding: 11px; background: #dc2626; border-color: #ef4444; font-weight: 600;" data-action="confirmOpenExecutable">
+                        ⚠️ Je fais confiance, ouvrir quand même
+                    </button>
+                </div>
             </div>
         </div>
 

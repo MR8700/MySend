@@ -21,6 +21,7 @@ storage.key
 *.apk
 *.aab
 *.idsig
+*.exe
 
 # Dist & caches
 ui/dist/
@@ -28,4 +29,7 @@ ui/node_modules/
 
 # Outils locaux / logs de build
 .claude/
+scratch/
+.cargo/
+ui/src-tauri/.cargo/
 check_out.txt

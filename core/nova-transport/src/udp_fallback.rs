@@ -56,7 +56,7 @@ use tokio_tungstenite::tungstenite::Message;
 /// waking up sleeping containers on free PaaS tiers (e.g. Render spin-down after 15m).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for individual message send/receive roundtrips once connected.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Matches `nova_server::service::MAX_DATAGRAM_SIZE` — signaling / profile search endpoint limit.
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
 /// Also matches `nova_server::service::MAX_DATAGRAM_SIZE`: `relay_forward` checks this up front

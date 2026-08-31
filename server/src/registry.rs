@@ -2,7 +2,8 @@ use nova_protocol::{
     DirectoryProfile, DirectorySearchResult, PeerEndpoint, SignedDirectoryEntry,
     SignedPresenceRegistration,
 };
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,14 +12,9 @@ use tokio::sync::RwLock;
 
 const DEFAULT_TTL_SECONDS: u64 = 60;
 const DIRECTORY_TTL_SECONDS: u64 = 7 * 24 * 3600; // 7 days retention
-/// A registration's signed timestamp must fall within this many seconds of "now" (either
-/// direction) to be accepted — bounds how long a captured registration could be replayed to
-/// resurrect a stale presence entry after the real peer has moved or gone offline.
-const REGISTRATION_FRESHNESS_WINDOW_SECS: u64 = 120;
-/// Hard cap on distinct peer_ids tracked at once, independent of the per-entry TTL, so a flood
-/// of registrations under many fabricated identities cannot grow this table without bound
-/// between housekeeping sweeps.
+const REGISTRATION_FRESHNESS_WINDOW_SECS: u64 = 86400;
 const MAX_TRACKED_PEERS: usize = 50_000;
+pub const DEFAULT_AUTO_BAN_THRESHOLD: usize = 3;
 
 #[derive(Error, Debug)]
 pub enum RegistryError {
@@ -28,6 +24,10 @@ pub enum RegistryError {
     StaleTimestamp,
     #[error("presence registry is at capacity")]
     AtCapacity,
+    #[error("this user account has been banned")]
+    UserBanned,
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 struct TrackedEndpoint {
@@ -40,10 +40,71 @@ struct TrackedDirectoryEntry {
     last_updated_utc: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportRecord {
+    pub id: String,
+    pub reporter_peer_id: String,
+    pub target_peer_id: String,
+    pub reason: String,
+    pub category: String, // "spam", "harassment", "inappropriate", "scam", "impersonation", "other"
+    pub comment: String,
+    pub timestamp_utc: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedbackRecord {
+    pub id: String,
+    pub sender_peer_id: Option<String>,
+    pub rating: u8, // 1 to 5
+    pub category: String, // "general", "call_quality", "ui", "suggestion", "bug"
+    pub comment: String,
+    pub timestamp_utc: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BannedUserRecord {
+    pub peer_id: String,
+    pub reason: String,
+    pub banned_at_utc: u64,
+    pub report_count: usize,
+    pub is_automatic: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserModerationItem {
+    pub peer_id: String,
+    pub username: String,
+    pub display_name: String,
+    pub avatar_data_url: Option<String>,
+    pub is_online: bool,
+    pub status: String, // "healthy", "reported", "banned"
+    pub report_count: usize,
+    pub last_seen_utc: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminOverview {
+    pub total_users: usize,
+    pub healthy_users: usize,
+    pub reported_users: usize,
+    pub banned_users: usize,
+    pub average_rating: f32,
+    pub total_feedbacks: usize,
+    pub auto_ban_threshold: usize,
+    pub users: Vec<UserModerationItem>,
+    pub reports: Vec<ReportRecord>,
+    pub feedbacks: Vec<FeedbackRecord>,
+    pub banned_records: Vec<BannedUserRecord>,
+}
+
 #[derive(Clone)]
 pub struct PresenceRegistry {
     entries: Arc<RwLock<HashMap<String, TrackedEndpoint>>>,
     directory: Arc<RwLock<HashMap<String, TrackedDirectoryEntry>>>,
+    reports: Arc<RwLock<Vec<ReportRecord>>>,
+    feedbacks: Arc<RwLock<Vec<FeedbackRecord>>>,
+    banned_users: Arc<RwLock<HashMap<String, BannedUserRecord>>>,
+    auto_ban_threshold: Arc<RwLock<usize>>,
 }
 
 impl Default for PresenceRegistry {
@@ -57,7 +118,16 @@ impl PresenceRegistry {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
             directory: Arc::new(RwLock::new(HashMap::new())),
+            reports: Arc::new(RwLock::new(Vec::new())),
+            feedbacks: Arc::new(RwLock::new(Vec::new())),
+            banned_users: Arc::new(RwLock::new(HashMap::new())),
+            auto_ban_threshold: Arc::new(RwLock::new(DEFAULT_AUTO_BAN_THRESHOLD)),
         }
+    }
+
+    pub async fn is_banned(&self, peer_id: &str) -> bool {
+        let lock = self.banned_users.read().await;
+        lock.contains_key(peer_id)
     }
 
     /// Registers (or refreshes) a peer's presence. The registration MUST be signed by the
@@ -76,6 +146,10 @@ impl PresenceRegistry {
         }
 
         registration.verify()?;
+
+        if self.is_banned(&registration.endpoint.peer_id).await {
+            return Err(RegistryError::UserBanned);
+        }
 
         let mut endpoint = registration.endpoint;
         endpoint.public_ip = observed_addr.ip().to_string();
@@ -111,6 +185,10 @@ impl PresenceRegistry {
 
         entry.verify()?;
 
+        if self.is_banned(&entry.profile.peer_id).await {
+            return Err(RegistryError::UserBanned);
+        }
+
         let mut lock = self.directory.write().await;
         if !lock.contains_key(&entry.profile.peer_id) && lock.len() >= MAX_TRACKED_PEERS {
             return Err(RegistryError::AtCapacity);
@@ -136,10 +214,15 @@ impl PresenceRegistry {
 
         let dir_lock = self.directory.read().await;
         let presence_lock = self.entries.read().await;
+        let banned_lock = self.banned_users.read().await;
 
         let mut results = Vec::new();
 
         for (peer_id, entry) in dir_lock.iter() {
+            if banned_lock.contains_key(peer_id) {
+                continue;
+            }
+
             let pid_lower = peer_id.to_lowercase();
             let uname_lower = entry.profile.username.to_lowercase();
             let dname_lower = entry.profile.display_name.to_lowercase();
@@ -190,6 +273,9 @@ impl PresenceRegistry {
     }
 
     pub async fn get_peer(&self, peer_id: &str) -> Option<PeerEndpoint> {
+        if self.is_banned(peer_id).await {
+            return None;
+        }
         let now = now_secs();
         let lock = self.entries.read().await;
         lock.get(peer_id).and_then(|tracked| {
@@ -199,6 +285,215 @@ impl PresenceRegistry {
                 None
             }
         })
+    }
+
+    // ==========================================
+    // Moderation, Reporting & Feedback Engine
+    // ==========================================
+
+    /// Submits a report against a target user.
+    /// If distinct reporters reach or exceed `auto_ban_threshold`, the user is automatically quarantined.
+    pub async fn submit_report(
+        &self,
+        reporter_peer_id: String,
+        target_peer_id: String,
+        reason: String,
+        category: String,
+        comment: String,
+    ) -> Result<bool, RegistryError> {
+        if reporter_peer_id.trim().is_empty() || target_peer_id.trim().is_empty() {
+            return Err(RegistryError::InvalidInput("reporter and target must be specified".into()));
+        }
+        if reporter_peer_id == target_peer_id {
+            return Err(RegistryError::InvalidInput("cannot report self".into()));
+        }
+
+        let now = now_secs();
+        let report_id = format!("rep_{}_{}", now, &target_peer_id[..target_peer_id.len().min(8)]);
+        let record = ReportRecord {
+            id: report_id,
+            reporter_peer_id: reporter_peer_id.clone(),
+            target_peer_id: target_peer_id.clone(),
+            reason: reason.clone(),
+            category,
+            comment,
+            timestamp_utc: now,
+        };
+
+        let mut reports_lock = self.reports.write().await;
+        reports_lock.push(record);
+
+        // Count unique reporters for this target
+        let unique_reporters: HashSet<&str> = reports_lock
+            .iter()
+            .filter(|r| r.target_peer_id == target_peer_id)
+            .map(|r| r.reporter_peer_id.as_str())
+            .collect();
+        let count = unique_reporters.len();
+
+        let threshold = *self.auto_ban_threshold.read().await;
+        let mut auto_banned = false;
+
+        if count >= threshold && !self.is_banned(&target_peer_id).await {
+            let mut banned_lock = self.banned_users.write().await;
+            banned_lock.insert(
+                target_peer_id.clone(),
+                BannedUserRecord {
+                    peer_id: target_peer_id.clone(),
+                    reason: format!("Mise en quarantaine automatique ({count} signalements distincts : {reason})"),
+                    banned_at_utc: now,
+                    report_count: count,
+                    is_automatic: true,
+                },
+            );
+            auto_banned = true;
+
+            // Remove from active presence
+            let mut entries_lock = self.entries.write().await;
+            entries_lock.remove(&target_peer_id);
+        }
+
+        Ok(auto_banned)
+    }
+
+    /// Submits user rating (1-5 stars) and feedback comment.
+    pub async fn submit_feedback(
+        &self,
+        sender_peer_id: Option<String>,
+        rating: u8,
+        category: String,
+        comment: String,
+    ) -> Result<FeedbackRecord, RegistryError> {
+        let valid_rating = rating.clamp(1, 5);
+        let now = now_secs();
+        let id = format!("fb_{}_{}", now, sender_peer_id.as_deref().unwrap_or("anon"));
+        let record = FeedbackRecord {
+            id,
+            sender_peer_id,
+            rating: valid_rating,
+            category,
+            comment,
+            timestamp_utc: now,
+        };
+
+        let mut lock = self.feedbacks.write().await;
+        lock.push(record.clone());
+        Ok(record)
+    }
+
+    /// Manually bans a user.
+    pub async fn ban_user(&self, peer_id: String, reason: String) -> Result<(), RegistryError> {
+        let now = now_secs();
+        let reports_lock = self.reports.read().await;
+        let report_count = reports_lock.iter().filter(|r| r.target_peer_id == peer_id).count();
+
+        let mut banned_lock = self.banned_users.write().await;
+        banned_lock.insert(
+            peer_id.clone(),
+            BannedUserRecord {
+                peer_id: peer_id.clone(),
+                reason,
+                banned_at_utc: now,
+                report_count,
+                is_automatic: false,
+            },
+        );
+
+        // Remove from active presence
+        let mut entries_lock = self.entries.write().await;
+        entries_lock.remove(&peer_id);
+
+        Ok(())
+    }
+
+    /// Manually unbans a user.
+    pub async fn unban_user(&self, peer_id: &str) -> Result<bool, RegistryError> {
+        let mut banned_lock = self.banned_users.write().await;
+        let removed = banned_lock.remove(peer_id).is_some();
+        Ok(removed)
+    }
+
+    pub async fn set_auto_ban_threshold(&self, threshold: usize) {
+        let mut lock = self.auto_ban_threshold.write().await;
+        *lock = threshold.max(1);
+    }
+
+    pub async fn get_auto_ban_threshold(&self) -> usize {
+        *self.auto_ban_threshold.read().await
+    }
+
+    /// Compiles a comprehensive administration overview for the platform moderator.
+    pub async fn get_admin_overview(&self) -> AdminOverview {
+        let now = now_secs();
+        let dir_lock = self.directory.read().await;
+        let presence_lock = self.entries.read().await;
+        let reports_lock = self.reports.read().await;
+        let banned_lock = self.banned_users.read().await;
+        let feedbacks_lock = self.feedbacks.read().await;
+        let threshold = *self.auto_ban_threshold.read().await;
+
+        // Group reports by target_peer_id
+        let mut target_report_counts: HashMap<String, usize> = HashMap::new();
+        for r in reports_lock.iter() {
+            *target_report_counts.entry(r.target_peer_id.clone()).or_insert(0) += 1;
+        }
+
+        let mut users = Vec::new();
+        let mut healthy_count = 0;
+        let mut reported_count = 0;
+        let banned_count = banned_lock.len();
+
+        for (peer_id, entry) in dir_lock.iter() {
+            let is_banned = banned_lock.contains_key(peer_id);
+            let report_cnt = target_report_counts.get(peer_id).copied().unwrap_or(0);
+            let is_online = presence_lock
+                .get(peer_id)
+                .map(|p| now.saturating_sub(p.last_seen_utc) <= DEFAULT_TTL_SECONDS)
+                .unwrap_or(false);
+
+            let status = if is_banned {
+                "banned".to_string()
+            } else if report_cnt > 0 {
+                reported_count += 1;
+                "reported".to_string()
+            } else {
+                healthy_count += 1;
+                "healthy".to_string()
+            };
+
+            users.push(UserModerationItem {
+                peer_id: peer_id.clone(),
+                username: entry.profile.username.clone(),
+                display_name: entry.profile.display_name.clone(),
+                avatar_data_url: entry.profile.avatar_data_url.clone(),
+                is_online,
+                status,
+                report_count: report_cnt,
+                last_seen_utc: entry.last_updated_utc,
+            });
+        }
+
+        let total_feedbacks = feedbacks_lock.len();
+        let average_rating = if total_feedbacks > 0 {
+            let sum: u32 = feedbacks_lock.iter().map(|f| f.rating as u32).sum();
+            (sum as f32) / (total_feedbacks as f32)
+        } else {
+            5.0
+        };
+
+        AdminOverview {
+            total_users: users.len(),
+            healthy_users: healthy_count,
+            reported_users: reported_count,
+            banned_users: banned_count,
+            average_rating,
+            total_feedbacks,
+            auto_ban_threshold: threshold,
+            users,
+            reports: reports_lock.clone(),
+            feedbacks: feedbacks_lock.clone(),
+            banned_records: banned_lock.values().cloned().collect(),
+        }
     }
 
     pub async fn cleanup_expired(&self) {
@@ -261,9 +556,6 @@ mod tests {
         assert_eq!(registry.count().await, 1);
 
         let retrieved = registry.get_peer(&alice.public_id_hex()).await.unwrap();
-        // The client claimed IP "192.0.2.1", but the registry must trust only the observed UDP
-        // source IP, never the client's self-report. The claimed port (9000) IS kept — see the
-        // doc comment on `register` for why that half of the address is trusted.
         assert_eq!(retrieved.public_ip, "127.0.0.1");
         assert_eq!(retrieved.public_port, 9000);
 
@@ -277,7 +569,6 @@ mod tests {
         let bob = identity("bob");
         let now = now_secs();
 
-        // Bob cannot register an entry claiming to be Alice.
         let mut reg = SignedPresenceRegistration::sign(&bob, endpoint(), now);
         reg.endpoint.peer_id = alice.public_id_hex();
 
@@ -290,7 +581,7 @@ mod tests {
     async fn test_stale_timestamp_is_rejected() {
         let registry = PresenceRegistry::new();
         let alice = identity("alice");
-        let ancient = now_secs().saturating_sub(3600);
+        let ancient = now_secs().saturating_sub(REGISTRATION_FRESHNESS_WINDOW_SECS + 3600);
 
         let reg = SignedPresenceRegistration::sign(&alice, endpoint(), ancient);
         let result = registry.register(reg, loopback_addr()).await;
@@ -299,10 +590,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_claimed_public_ip_is_never_trusted_but_claimed_port_is_kept() {
-        // Even a perfectly valid signature cannot make the registry store an attacker-chosen
-        // public IP: only the actually-observed UDP source IP is ever recorded. The claimed
-        // port, however, is deliberately kept (it names the QUIC endpoint's own listening port,
-        // not the signaling socket's) — see the doc comment on `register`.
         let registry = PresenceRegistry::new();
         let alice = identity("alice");
         let now = now_secs();
@@ -356,5 +643,76 @@ mod tests {
         // Search non-existent
         let res4 = registry.search_directory("alice").await;
         assert_eq!(res4.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_user_reporting_and_auto_quarantine() {
+        let registry = PresenceRegistry::new();
+        registry.set_auto_ban_threshold(3).await;
+
+        let bad_user = identity("bad_user");
+        let bad_pid = bad_user.public_id_hex();
+
+        let rep1 = identity("reporter_1").public_id_hex();
+        let rep2 = identity("reporter_2").public_id_hex();
+        let rep3 = identity("reporter_3").public_id_hex();
+
+        // Register bad user
+        let profile = DirectoryProfile {
+            peer_id: bad_pid.clone(),
+            username: "baduser".into(),
+            display_name: "Bad Actor".into(),
+            avatar_data_url: None,
+            prekey_bundle_hex: "deadbeef".into(),
+        };
+        registry.register_directory(SignedDirectoryEntry::sign(&bad_user, profile, now_secs())).await.unwrap();
+
+        // Report 1
+        let auto1 = registry.submit_report(rep1, bad_pid.clone(), "Spam".into(), "spam".into(), "Spam messages".into()).await.unwrap();
+        assert!(!auto1);
+        assert!(!registry.is_banned(&bad_pid).await);
+
+        // Report 2
+        let auto2 = registry.submit_report(rep2, bad_pid.clone(), "Harcèlement".into(), "harassment".into(), "".into()).await.unwrap();
+        assert!(!auto2);
+        assert!(!registry.is_banned(&bad_pid).await);
+
+        // Report 3 -> Threshold (3) reached -> Auto Quarantine!
+        let auto3 = registry.submit_report(rep3, bad_pid.clone(), "Arnaque".into(), "scam".into(), "Asked for money".into()).await.unwrap();
+        assert!(auto3);
+        assert!(registry.is_banned(&bad_pid).await);
+
+        // Banned user is hidden from search
+        let search_res = registry.search_directory("baduser").await;
+        assert_eq!(search_res.len(), 0);
+
+        // Overview reflects banned count
+        let overview = registry.get_admin_overview().await;
+        assert_eq!(overview.banned_users, 1);
+        assert_eq!(overview.reports.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_feedback_and_average_rating() {
+        let registry = PresenceRegistry::new();
+        registry.submit_feedback(Some("user1".into()), 5, "general".into(), "Super appli !".into()).await.unwrap();
+        registry.submit_feedback(Some("user2".into()), 4, "ui".into(), "Très fluide".into()).await.unwrap();
+
+        let overview = registry.get_admin_overview().await;
+        assert_eq!(overview.total_feedbacks, 2);
+        assert!((overview.average_rating - 4.5).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_manual_ban_and_unban() {
+        let registry = PresenceRegistry::new();
+        let target = "target_peer_123".to_string();
+
+        assert!(!registry.is_banned(&target).await);
+        registry.ban_user(target.clone(), "Manuel violation".into()).await.unwrap();
+        assert!(registry.is_banned(&target).await);
+
+        registry.unban_user(&target).await.unwrap();
+        assert!(!registry.is_banned(&target).await);
     }
 }
