@@ -400,7 +400,7 @@ impl P2PNode {
         // the literal string `none` to disable this path entirely (e.g. for someone who trusts
         // no third party with even reflexive-IP/relay metadata and would rather rely solely on
         // direct DHT/mDNS discovery).
-        const DEFAULT_FALLBACK_SERVER_URL: &str = "wss://nova-discovery.onrender.com";
+        const DEFAULT_FALLBACK_SERVER_URL: &str = "wss://nova-discovery-jllv.onrender.com";
         let fallback_env = std::env::var("NOVA_UDP_FALLBACK_ADDR").ok();
         let udp_fallback_client = if fallback_env.as_deref() == Some("none") {
             None
@@ -409,7 +409,7 @@ impl P2PNode {
             match url::Url::parse(&url) {
                 Ok(parsed) if parsed.scheme() == "ws" || parsed.scheme() == "wss" => Some(Arc::new(UdpFallbackClient::new(url))),
                 _ => {
-                    warn!("NOVA_UDP_FALLBACK_ADDR={url} is not a valid ws:// or wss:// URL (expected e.g. wss://nova-discovery.onrender.com, or \"none\" to disable) — fallback relay disabled");
+                    warn!("NOVA_UDP_FALLBACK_ADDR={url} is not a valid ws:// or wss:// URL (expected e.g. wss://nova-discovery-jllv.onrender.com, or \"none\" to disable) — fallback relay disabled");
                     None
                 }
             }

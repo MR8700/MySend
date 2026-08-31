@@ -70,15 +70,15 @@ const MAX_RELAY_PAYLOAD_SIZE: usize = 15 * 1024;
 /// WebSocket connection — see this module's doc comment for why.
 #[derive(Clone, Debug)]
 pub struct UdpFallbackClient {
-    /// A full `ws://` or `wss://` URL, e.g. `wss://nova-discovery.onrender.com`. Kept as the
-    /// original string (not a parsed `Url`) since `tokio_tungstenite::connect_async` accepts one
-    /// directly and this client never needs to inspect its components.
+    /// A full `ws://` or `wss://` URL, e.g. `wss://nova-discovery-jllv.onrender.com`. Kept as the
+    /// canonical string representation used everywhere else in `nova-transport` so log messages
+    /// and config inspections match.
     server_url: String,
 }
 
 impl UdpFallbackClient {
-    /// `server_url` must include an explicit `ws://` or `wss://` scheme (e.g.
-    /// `wss://nova-discovery.onrender.com` for a real deployment, or `ws://127.0.0.1:8080` for a
+    /// Creates a new, unconnected fallback client configured to talk to `server_url` (e.g.
+    /// `wss://nova-discovery-jllv.onrender.com` for a real deployment, or `ws://127.0.0.1:8080` for a
     /// local/LAN one) — there is no implicit default, since guessing wrong between plaintext and
     /// TLS silently either leaks this signaling traffic or fails to connect at all.
     pub fn new(server_url: impl Into<String>) -> Self {

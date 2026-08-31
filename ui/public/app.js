@@ -390,7 +390,7 @@ const state = {
     // set_bootstrap_addr) — populated by refreshBootstrapAddr(), edited on the Settings screen.
     // '' means none configured (mDNS/LAN-only discovery).
     bootstrapAddr: '',
-    // Fallback discovery and relay server URL (e.g. wss://nova-discovery.onrender.com)
+    // Fallback discovery and relay server URL (e.g. wss://nova-discovery-jllv.onrender.com)
     fallbackServerUrl: '',
     // Search results from public directory query
     directorySearchResults: [],

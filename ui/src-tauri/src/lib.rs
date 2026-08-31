@@ -656,13 +656,13 @@ async fn get_network_status(state: State<'_, AppState>) -> Result<bool, String> 
 
 fn get_server_http_base_url() -> String {
     let ws_url = std::env::var("NOVA_UDP_FALLBACK_ADDR")
-        .unwrap_or_else(|_| "wss://nova-discovery.onrender.com".to_string());
+        .unwrap_or_else(|_| "wss://nova-discovery-jllv.onrender.com".to_string());
     if ws_url.starts_with("wss://") {
         ws_url.replacen("wss://", "https://", 1)
     } else if ws_url.starts_with("ws://") {
         ws_url.replacen("ws://", "http://", 1)
     } else {
-        "https://nova-discovery.onrender.com".to_string()
+        "https://nova-discovery-jllv.onrender.com".to_string()
     }
 }
 
