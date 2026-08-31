@@ -647,6 +647,38 @@ async fn set_fallback_server_url(state: State<'_, AppState>, url: String) -> Res
     Ok(())
 }
 
+/// Returns all active fallback server URLs in the pool.
+#[tauri::command]
+async fn get_fallback_server_urls(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    if let Some(urls) = state.engine.get_fallback_server_urls().await {
+        if !urls.is_empty() {
+            return Ok(urls);
+        }
+    }
+    let fallback_url = get_fallback_server_url(state).await?;
+    Ok(fallback_url.into_iter().collect())
+}
+
+/// Triggers an immediate refresh of the dynamic seed node list from GitHub Raw (`network_nodes.json`).
+#[tauri::command]
+async fn refresh_remote_seed_nodes(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let cfg = nova_transport::fetch_remote_nodes_config().await;
+    let urls: Vec<String> = cfg
+        .fallback_servers
+        .into_iter()
+        .filter(|s| s.enabled)
+        .map(|s| s.url)
+        .collect();
+    if !urls.is_empty() {
+        state.engine.set_fallback_server_urls(urls.clone()).await;
+        if let Some(primary) = urls.first() {
+            let _ = std::fs::write(&state.fallback_server_url_file, primary);
+            std::env::set_var("NOVA_UDP_FALLBACK_ADDR", primary);
+        }
+    }
+    Ok(urls)
+}
+
 /// Checks whether the P2P transport network is actively running on this device.
 #[tauri::command]
 async fn get_network_status(state: State<'_, AppState>) -> Result<bool, String> {
@@ -1005,6 +1037,8 @@ pub fn run() {
             set_bootstrap_addr,
             get_fallback_server_url,
             set_fallback_server_url,
+            get_fallback_server_urls,
+            refresh_remote_seed_nodes,
             search_directory,
             get_user_profile,
             update_user_profile,

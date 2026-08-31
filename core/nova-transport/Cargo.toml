@@ -10,6 +10,7 @@ nova-crypto = { path = "../nova-crypto" }
 nova-protocol = { path = "../nova-protocol" }
 tokio.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 libp2p.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
@@ -17,6 +18,7 @@ tracing.workspace = true
 hex.workspace = true
 igd-next.workspace = true
 tokio-tungstenite.workspace = true
+reqwest = { workspace = true }
 url = "2.5"
 
 [dev-dependencies]

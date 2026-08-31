@@ -28,6 +28,7 @@
 //! like the discovery DHT above it.
 
 use crate::error::TransportError;
+use crate::seed_nodes::{fetch_remote_nodes_config, MultiFallbackPool, DEFAULT_PRIMARY_RELAY_URL};
 use crate::udp_fallback::UdpFallbackClient;
 use crate::{P2PTransportMode, TransportSupervisor};
 use futures_util::StreamExt;
@@ -101,7 +102,7 @@ type ResolvedPeer = (PeerId, Vec<Multiaddr>);
 type LookupResponder = oneshot::Sender<Result<Option<ResolvedPeer>, TransportError>>;
 type PendingLookups = HashMap<kad::QueryId, (String, LookupResponder)>;
 
-enum Command {
+pub(crate) enum Command {
     Announce(oneshot::Sender<Result<(), TransportError>>),
     Lookup {
         nova_peer_id: String,
@@ -147,8 +148,8 @@ enum Command {
         addrs: Vec<Multiaddr>,
         respond: oneshot::Sender<Result<(), TransportError>>,
     },
-    /// Dynamically updates or clears the fallback discovery/relay server client.
-    SetFallback(Option<Arc<UdpFallbackClient>>),
+    /// Dynamically updates or clears the fallback discovery/relay server pool.
+    SetFallback(MultiFallbackPool),
 }
 
 pub struct P2PNode {
@@ -159,13 +160,14 @@ pub struct P2PNode {
     incoming_rx: Mutex<mpsc::UnboundedReceiver<IncomingMessage>>,
     pub supervisor: Arc<TransportSupervisor>,
     /// Secondary delivery and discovery path for when the DHT + relay-circuit path above cannot reach a peer
-    /// at all — see `crate::udp_fallback`'s module docs.
-    udp_fallback: Arc<tokio::sync::RwLock<Option<Arc<UdpFallbackClient>>>>,
+    /// at all — backed by a multi-server dynamic pool with striping (see `crate::seed_nodes`).
+    fallback_pool: Arc<tokio::sync::RwLock<MultiFallbackPool>>,
 }
 
 /// Where an [`IncomingMessage`] arrived from — determines whether [`IncomingMessage::respond`]
 /// has anyone live to report back to.
-enum IncomingSource {
+#[derive(Debug)]
+pub(crate) enum IncomingSource {
     /// A live QUIC request/response round-trip: the sender is actually waiting on the other end
     /// of `channel` for a [`DeliveryOutcome`].
     LibP2p {
@@ -184,7 +186,7 @@ enum IncomingSource {
 /// waiting on the wire.
 pub struct IncomingMessage {
     pub bytes: Vec<u8>,
-    source: IncomingSource,
+    pub(crate) source: IncomingSource,
 }
 
 impl IncomingMessage {
@@ -396,25 +398,18 @@ impl P2PNode {
         // free-tier on Render — see `server/`) so every device works out of the box with no
         // per-device setup, exactly like a browser ships with default STUN/bootstrap servers
         // rather than requiring the user to find and paste one in. `NOVA_UDP_FALLBACK_ADDR`
-        // overrides this — set it to a self-hosted `nova-server` URL (`ws://`/`wss://`), or to
-        // the literal string `none` to disable this path entirely (e.g. for someone who trusts
-        // no third party with even reflexive-IP/relay metadata and would rather rely solely on
-        // direct DHT/mDNS discovery).
-        const DEFAULT_FALLBACK_SERVER_URL: &str = "wss://nova-discovery-jllv.onrender.com";
+        // Fallback Discovery and Multi-Server Relay Pool:
+        // Automatically fetches the dynamic server list from GitHub Raw (`network_nodes.json`)
+        // while falling back to built-in defaults or `NOVA_UDP_FALLBACK_ADDR` env override.
         let fallback_env = std::env::var("NOVA_UDP_FALLBACK_ADDR").ok();
-        let udp_fallback_client = if fallback_env.as_deref() == Some("none") {
-            None
+        let initial_pool = if fallback_env.as_deref() == Some("none") {
+            MultiFallbackPool::new(Vec::new())
+        } else if let Some(url) = fallback_env {
+            MultiFallbackPool::new(vec![url])
         } else {
-            let url = fallback_env.unwrap_or_else(|| DEFAULT_FALLBACK_SERVER_URL.to_string());
-            match url::Url::parse(&url) {
-                Ok(parsed) if parsed.scheme() == "ws" || parsed.scheme() == "wss" => Some(Arc::new(UdpFallbackClient::new(url))),
-                _ => {
-                    warn!("NOVA_UDP_FALLBACK_ADDR={url} is not a valid ws:// or wss:// URL (expected e.g. wss://nova-discovery-jllv.onrender.com, or \"none\" to disable) — fallback relay disabled");
-                    None
-                }
-            }
+            MultiFallbackPool::new(vec![DEFAULT_PRIMARY_RELAY_URL.to_string()])
         };
-        let udp_fallback = Arc::new(tokio::sync::RwLock::new(udp_fallback_client.clone()));
+        let fallback_pool = Arc::new(tokio::sync::RwLock::new(initial_pool.clone()));
 
         let node = Arc::new(Self {
             own_peer_id,
@@ -423,7 +418,20 @@ impl P2PNode {
             command_tx,
             incoming_rx: Mutex::new(incoming_rx),
             supervisor,
-            udp_fallback: udp_fallback.clone(),
+            fallback_pool: fallback_pool.clone(),
+        });
+
+        // Background Remote Seed Fetcher:
+        // Periodically/at-startup queries GitHub Raw for updated relay nodes without requiring app rebuilds.
+        let background_pool = node.fallback_pool.clone();
+        let background_cmd_tx = node.command_tx.clone();
+        tokio::spawn(async move {
+            let remote_cfg = fetch_remote_nodes_config().await;
+            if !remote_cfg.fallback_servers.is_empty() {
+                let updated_pool = MultiFallbackPool::from_config(&remote_cfg);
+                *background_pool.write().await = updated_pool.clone();
+                let _ = background_cmd_tx.send(Command::SetFallback(updated_pool));
+            }
         });
 
         // `identity` moves into the background task by value rather than being cloned: it holds
@@ -431,7 +439,7 @@ impl P2PNode {
         // task itself needs it, for signing DHT presence records — the public `P2PNode` handle
         // only ever needs the already-derived, non-secret `own_peer_id`.
         let command_tx_for_task = node.command_tx.clone();
-        tokio::spawn(run_swarm_task(swarm, identity, local_peer_id, command_rx, command_tx_for_task, incoming_tx, udp_fallback_client));
+        tokio::spawn(run_swarm_task(swarm, identity, local_peer_id, command_rx, command_tx_for_task, incoming_tx, initial_pool));
 
         Ok(node)
     }
@@ -442,45 +450,50 @@ impl P2PNode {
 
     /// Dynamically sets or clears the fallback server URL (e.g. from the UI Settings).
     pub async fn set_fallback_server_url(&self, url: Option<String>) {
-        let client = url.and_then(|u| {
-            let trimmed = u.trim().to_string();
-            if trimmed.is_empty() || trimmed == "none" {
-                return None;
+        let pool = match url {
+            Some(u) if !u.trim().is_empty() && u.trim() != "none" => {
+                MultiFallbackPool::new(vec![u.trim().to_string()])
             }
-            match url::Url::parse(&trimmed) {
-                Ok(parsed) if parsed.scheme() == "ws" || parsed.scheme() == "wss" => {
-                    Some(Arc::new(UdpFallbackClient::new(trimmed)))
-                }
-                _ => None,
-            }
-        });
-        *self.udp_fallback.write().await = client.clone();
-        let _ = self.command_tx.send(Command::SetFallback(client));
+            _ => MultiFallbackPool::new(Vec::new()),
+        };
+        *self.fallback_pool.write().await = pool.clone();
+        let _ = self.command_tx.send(Command::SetFallback(pool));
     }
 
-    /// Returns the currently active fallback server URL, if any.
+    /// Dynamically sets multiple fallback server URLs (e.g. for multi-path striping).
+    pub async fn set_fallback_server_urls(&self, urls: Vec<String>) {
+        let pool = MultiFallbackPool::new(urls);
+        *self.fallback_pool.write().await = pool.clone();
+        let _ = self.command_tx.send(Command::SetFallback(pool));
+    }
+
+    /// Returns the currently active primary fallback server URL, if any.
     pub async fn get_fallback_server_url(&self) -> Option<String> {
-        self.udp_fallback.read().await.as_ref().map(|c| c.server_url().to_string())
+        let urls = self.fallback_pool.read().await.urls();
+        urls.first().cloned()
     }
 
-    /// Publishes this device's public directory profile and PreKey bundle to the fallback server.
+    /// Returns all currently active fallback server URLs in the pool.
+    pub async fn get_fallback_server_urls(&self) -> Vec<String> {
+        self.fallback_pool.read().await.urls()
+    }
+
+    /// Publishes this device's public directory profile and PreKey bundle to the fallback servers.
     pub async fn register_directory_entry(&self, entry: nova_protocol::SignedDirectoryEntry) -> Result<(), TransportError> {
-        let fallback = self.udp_fallback.read().await.clone();
-        if let Some(client) = fallback {
-            client.register_directory_signed(entry).await
-        } else {
-            Err(TransportError::Setup("no fallback server configured".into()))
+        let pool = self.fallback_pool.read().await.clone();
+        let urls = pool.urls();
+        if urls.is_empty() {
+            return Err(TransportError::Setup("no fallback server configured".into()));
         }
+        // Register on primary client
+        let client = UdpFallbackClient::new(pool.primary_url());
+        client.register_directory_signed(entry).await
     }
 
-    /// Searches the fallback directory for matching users by query (peer_id prefix, username, display name).
+    /// Searches the fallback directory across all active servers in parallel, merging results.
     pub async fn search_directory(&self, query: &str) -> Result<Vec<nova_protocol::DirectorySearchResult>, TransportError> {
-        let fallback = self.udp_fallback.read().await.clone();
-        if let Some(client) = fallback {
-            client.search_directory(query).await
-        } else {
-            Ok(Vec::new())
-        }
+        let pool = self.fallback_pool.read().await.clone();
+        pool.search_directory_merged(query).await
     }
 
     /// This node's primary actual (OS-resolved) listen multiaddr, e.g. for out-of-band bootstrap
@@ -596,35 +609,27 @@ impl P2PNode {
             }
         }
 
-        // If DHT lookup didn't find the peer, check the fallback discovery server (e.g. Render)
-        let fallback = self.udp_fallback.read().await.clone();
-        if let Some(client) = fallback {
-            match client.lookup(nova_peer_id).await {
-                Ok(Some(endpoint)) => {
-                    if let Ok(pub_bytes) = hex::decode(nova_peer_id) {
-                        if let Ok(ed_pub) = libp2p::identity::ed25519::PublicKey::try_from_bytes(&pub_bytes) {
-                            let libp2p_peer_id = libp2p::identity::PublicKey::from(ed_pub).to_peer_id();
-                            let mut addrs = Vec::new();
-                            if let (Some(local_ip), Some(local_port)) = (&endpoint.local_ip, endpoint.local_port) {
-                                if let Ok(addr) = format!("/ip4/{local_ip}/udp/{local_port}/quic-v1").parse::<Multiaddr>() {
-                                    addrs.push(addr);
-                                }
-                            }
-                            if endpoint.public_port != 0 && !endpoint.public_ip.is_empty() && endpoint.public_ip != "0.0.0.0" {
-                                if let Ok(addr) = format!("/ip4/{}/udp/{}/quic-v1", endpoint.public_ip, endpoint.public_port).parse::<Multiaddr>() {
-                                    addrs.push(addr);
-                                }
-                            }
-                            if !addrs.is_empty() {
-                                debug!("Resolved peer {nova_peer_id} via fallback discovery server");
-                                return Ok(Some((libp2p_peer_id, addrs)));
-                            }
+        // If DHT lookup didn't find the peer, check the fallback discovery servers (fastest response wins)
+        let pool = self.fallback_pool.read().await.clone();
+        if let Ok(Some(endpoint)) = pool.lookup_fastest(nova_peer_id).await {
+            if let Ok(pub_bytes) = hex::decode(nova_peer_id) {
+                if let Ok(ed_pub) = libp2p::identity::ed25519::PublicKey::try_from_bytes(&pub_bytes) {
+                    let libp2p_peer_id = libp2p::identity::PublicKey::from(ed_pub).to_peer_id();
+                    let mut addrs = Vec::new();
+                    if let (Some(local_ip), Some(local_port)) = (&endpoint.local_ip, endpoint.local_port) {
+                        if let Ok(addr) = format!("/ip4/{local_ip}/udp/{local_port}/quic-v1").parse::<Multiaddr>() {
+                            addrs.push(addr);
                         }
                     }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    debug!("Fallback lookup for {nova_peer_id} failed: {e}");
+                    if endpoint.public_port != 0 && !endpoint.public_ip.is_empty() && endpoint.public_ip != "0.0.0.0" {
+                        if let Ok(addr) = format!("/ip4/{}/udp/{}/quic-v1", endpoint.public_ip, endpoint.public_port).parse::<Multiaddr>() {
+                            addrs.push(addr);
+                        }
+                    }
+                    if !addrs.is_empty() {
+                        debug!("Resolved peer {nova_peer_id} via fallback discovery pool");
+                        return Ok(Some((libp2p_peer_id, addrs)));
+                    }
                 }
             }
         }
@@ -808,25 +813,20 @@ impl P2PNode {
         self.incoming_rx.lock().await.recv().await
     }
 
-    /// Best-effort, fire-and-forget hand-off of each of `chunks` to the UDP fallback relay (see
-    /// `crate::udp_fallback`) for `nova_peer_id` — called from `send_chunks_to_peer`'s failure
-    /// paths so a peer unreachable through the DHT still gets a second chance. Each chunk is
-    /// relayed independently (out-of-order delivery/reassembly on the receiving end is already
-    /// handled at the Double Ratchet level — see `send_chunks_to_peer`'s docs); relaying one
-    /// chunk failing does not stop the others from being attempted. Spawned rather than awaited:
-    /// this must never add latency to a call that has already decided the primary path failed,
-    /// and a slow/unreachable fallback server must not block it either. A no-op if no fallback
-    /// server is configured.
+    /// Best-effort, fire-and-forget hand-off of `chunks` to the multi-server fallback relay pool (see
+    /// `crate::seed_nodes`) for `nova_peer_id` — called from `send_chunks_to_peer`'s failure
+    /// paths so a peer unreachable through the DHT still gets a second chance.
+    ///
+    /// Chunks are **striped in parallel** across all active relay servers to maximize throughput
+    /// and provide automatic failover.
     async fn spawn_udp_fallback_send_chunks(&self, nova_peer_id: &str, chunks: Vec<Vec<u8>>) {
-        let fallback = self.udp_fallback.read().await.clone();
-        let Some(fallback) = fallback else { return };
+        let pool = self.fallback_pool.read().await.clone();
+        if pool.is_empty() || chunks.is_empty() {
+            return;
+        }
         let nova_peer_id = nova_peer_id.to_string();
         tokio::spawn(async move {
-            for chunk in chunks {
-                if let Err(e) = fallback.relay_forward(&nova_peer_id, chunk).await {
-                    debug!("UDP fallback relay_forward to {nova_peer_id} failed: {e}");
-                }
-            }
+            pool.send_chunks_multipath(&nova_peer_id, chunks).await;
         });
     }
 }
@@ -889,7 +889,7 @@ async fn run_swarm_task(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     command_tx: mpsc::UnboundedSender<Command>,
     incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
-    mut udp_fallback: Option<Arc<UdpFallbackClient>>,
+    mut fallback_pool: MultiFallbackPool,
 ) {
     let mut pending_lookups: PendingLookups = HashMap::new();
     let mut pending_dials: HashMap<PeerId, Vec<oneshot::Sender<Result<(), TransportError>>>> = HashMap::new();
@@ -904,26 +904,17 @@ async fn run_swarm_task(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if let Err(e) = do_announce(&mut swarm, &identity, local_peer_id, &udp_fallback) {
+                if let Err(e) = do_announce(&mut swarm, &identity, local_peer_id, &fallback_pool) {
                     warn!("Presence heartbeat failed: {e}");
                 }
             }
             _ = udp_fallback_drain.tick() => {
-                // Signing is fast/synchronous (no I/O) so it happens inline here; the actual
-                // network round-trip is spawned off so a slow/unreachable fallback server can
-                // never stall this event loop (which also drives the primary DHT/QUIC path).
-                if let Some(fallback) = udp_fallback.clone() {
+                if !fallback_pool.is_empty() {
                     let drain_request = nova_protocol::SignedDrainRequest::sign(&identity, now_secs());
+                    let pool = fallback_pool.clone();
                     let incoming_tx = incoming_tx.clone();
                     tokio::spawn(async move {
-                        match fallback.drain_incoming_signed(drain_request).await {
-                            Ok(items) => {
-                                for bytes in items {
-                                    let _ = incoming_tx.send(IncomingMessage { bytes, source: IncomingSource::UdpFallback });
-                                }
-                            }
-                            Err(e) => debug!("UDP fallback drain failed: {e}"),
-                        }
+                        pool.drain_incoming_all(drain_request, incoming_tx).await;
                     });
                 }
             }
@@ -931,7 +922,7 @@ async fn run_swarm_task(
                 let Some(cmd) = maybe_cmd else { break };
                 match cmd {
                     Command::Announce(respond) => {
-                        let _ = respond.send(do_announce(&mut swarm, &identity, local_peer_id, &udp_fallback));
+                        let _ = respond.send(do_announce(&mut swarm, &identity, local_peer_id, &fallback_pool));
                     }
                     Command::Lookup { nova_peer_id, respond } => {
                         let key_bytes = match hex::decode(&nova_peer_id) {
@@ -1024,8 +1015,8 @@ async fn run_swarm_task(
                     Command::RespondIncoming { channel, outcome } => {
                         let _ = swarm.behaviour_mut().messaging.send_response(channel, outcome);
                     }
-                    Command::SetFallback(new_fallback) => {
-                        udp_fallback = new_fallback;
+                    Command::SetFallback(new_pool) => {
+                        fallback_pool = new_pool;
                     }
                 }
             }
@@ -1049,7 +1040,7 @@ fn do_announce(
     swarm: &mut Swarm<NovaBehaviour>,
     identity: &DeviceIdentity,
     local_peer_id: PeerId,
-    udp_fallback: &Option<Arc<UdpFallbackClient>>,
+    fallback_pool: &MultiFallbackPool,
 ) -> Result<(), TransportError> {
     let mut addrs: Vec<String> = swarm
         .external_addresses()
@@ -1061,8 +1052,8 @@ fn do_announce(
 
     let dht_result = publish_record(swarm, identity, local_peer_id, addrs);
 
-    // Announce to the fallback server (e.g. Render) if configured
-    if let Some(fallback) = udp_fallback.clone() {
+    // Announce to all active fallback servers in parallel
+    if !fallback_pool.is_empty() {
         let local_udp_port = swarm.listeners().find_map(|a| {
             a.iter().find_map(|p| match p {
                 Protocol::Udp(port) => Some(port),
@@ -1086,12 +1077,9 @@ fn do_announce(
         };
 
         let registration = nova_protocol::SignedPresenceRegistration::sign(identity, endpoint, now_secs());
+        let pool = fallback_pool.clone();
         tokio::spawn(async move {
-            if let Err(e) = fallback.register_presence_signed(registration).await {
-                debug!("Fallback presence registration failed: {e}");
-            } else {
-                debug!("Fallback presence registration succeeded");
-            }
+            pool.register_presence_all(registration).await;
         });
     }
 

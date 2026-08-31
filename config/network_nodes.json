@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "updated_at": "2026-08-31T18:40:00Z",
+  "description": "NOVA Dynamic Seed & Fallback Relay Nodes Configuration",
+  "fallback_servers": [
+    {
+      "url": "wss://nova-discovery-jllv.onrender.com",
+      "name": "Render Primary (Europe)",
+      "priority": 1,
+      "enabled": true
+    }
+  ],
+  "bootstrap_dht_nodes": []
+}

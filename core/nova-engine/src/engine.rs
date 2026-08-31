@@ -1431,10 +1431,26 @@ impl NovaEngine {
         }
     }
 
-    /// Retrieves the active fallback server URL, if any.
+    /// Sets multiple fallback server URLs for multi-path relay striping.
+    pub async fn set_fallback_server_urls(&self, urls: Vec<String>) {
+        if let Some(node) = self.network.lock().await.clone() {
+            node.set_fallback_server_urls(urls).await;
+        }
+    }
+
+    /// Retrieves the active primary fallback server URL, if any.
     pub async fn get_fallback_server_url(&self) -> Option<String> {
         if let Some(node) = self.network.lock().await.clone() {
             node.get_fallback_server_url().await
+        } else {
+            None
+        }
+    }
+
+    /// Retrieves all active fallback server URLs in the pool.
+    pub async fn get_fallback_server_urls(&self) -> Option<Vec<String>> {
+        if let Some(node) = self.network.lock().await.clone() {
+            Some(node.get_fallback_server_urls().await)
         } else {
             None
         }
