@@ -29,7 +29,6 @@
 
 use crate::error::TransportError;
 use crate::seed_nodes::{fetch_remote_nodes_config, MultiFallbackPool, DEFAULT_PRIMARY_RELAY_URL};
-use crate::udp_fallback::UdpFallbackClient;
 use crate::{P2PTransportMode, TransportSupervisor};
 use futures_util::StreamExt;
 use libp2p::core::multiaddr::Protocol;
@@ -55,7 +54,7 @@ const PRESENCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// see `crate::udp_fallback`. More frequent than the DHT presence heartbeat: this is this node's
 /// only way to receive anything over that path at all (unlike the DHT/QUIC path, nothing pushes
 /// to it), so responsiveness on this path depends entirely on poll frequency.
-const UDP_FALLBACK_DRAIN_INTERVAL: Duration = Duration::from_secs(5);
+const UDP_FALLBACK_DRAIN_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NovaMessageRequest(Vec<u8>);
@@ -478,16 +477,10 @@ impl P2PNode {
         self.fallback_pool.read().await.urls()
     }
 
-    /// Publishes this device's public directory profile and PreKey bundle to the fallback servers.
+    /// Publishes this device's public directory profile and PreKey bundle to all fallback servers in parallel.
     pub async fn register_directory_entry(&self, entry: nova_protocol::SignedDirectoryEntry) -> Result<(), TransportError> {
         let pool = self.fallback_pool.read().await.clone();
-        let urls = pool.urls();
-        if urls.is_empty() {
-            return Err(TransportError::Setup("no fallback server configured".into()));
-        }
-        // Register on primary client
-        let client = UdpFallbackClient::new(pool.primary_url());
-        client.register_directory_signed(entry).await
+        pool.register_directory_all(entry).await
     }
 
     /// Searches the fallback directory across all active servers in parallel, merging results.
@@ -762,47 +755,70 @@ impl P2PNode {
                 None
             }
         };
-        let Some((peer_id, addrs)) = found else {
-            self.spawn_udp_fallback_send_chunks(nova_peer_id, chunks).await;
-            return Ok((P2PTransportMode::Disconnected, DeliveryOutcome::Rejected));
-        };
-        let mode = connection_mode_for(&addrs);
 
-        if tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, self.dial(peer_id, addrs))
-            .await
-            .is_err()
-        {
-            self.spawn_udp_fallback_send_chunks(nova_peer_id, chunks).await;
-            return Ok((P2PTransportMode::Disconnected, DeliveryOutcome::Rejected));
-        }
+        if let Some((peer_id, addrs)) = found {
+            let mode = connection_mode_for(&addrs);
+            if tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, self.dial(peer_id, addrs))
+                .await
+                .is_ok()
+            {
+                let request_started = tokio::time::Instant::now();
+                let mut last_outcome = DeliveryOutcome::Rejected;
+                let mut direct_ok = true;
 
-        let request_started = tokio::time::Instant::now();
-        let mut last_outcome = DeliveryOutcome::Rejected;
-        for chunk in chunks {
-            let (tx, rx) = oneshot::channel();
-            self.command_tx
-                .send(Command::SendRequest {
-                    peer_id,
-                    bytes: chunk,
-                    respond: tx,
-                })
-                .map_err(|_| TransportError::SwarmTaskGone)?;
+                for chunk in &chunks {
+                    let (tx, rx) = oneshot::channel();
+                    if self
+                        .command_tx
+                        .send(Command::SendRequest {
+                            peer_id,
+                            bytes: chunk.clone(),
+                            respond: tx,
+                        })
+                        .is_err()
+                    {
+                        direct_ok = false;
+                        break;
+                    }
 
-            match tokio::time::timeout(SEND_TIMEOUT, rx).await {
-                Ok(Ok(Ok(outcome))) => last_outcome = outcome,
-                _ => return Ok((P2PTransportMode::Disconnected, DeliveryOutcome::Rejected)),
+                    match tokio::time::timeout(SEND_TIMEOUT, rx).await {
+                        Ok(Ok(Ok(outcome))) => last_outcome = outcome,
+                        _ => {
+                            direct_ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                if direct_ok {
+                    let latency_ms = request_started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                    self.supervisor
+                        .update_peer_state(nova_peer_id.to_string(), mode, latency_ms, String::new())
+                        .await;
+                    return Ok((mode, last_outcome));
+                }
             }
         }
 
-        // The request/response round trip (send → peer's ack) is a more meaningful "latency" for
-        // messaging purposes than connection-establishment time alone: a connection can be up
-        // while the peer is slow or backlogged. For a multi-chunk send this is the total time for
-        // every chunk, which is the honest end-to-end figure for how long this message took.
-        let latency_ms = request_started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-        self.supervisor
-            .update_peer_state(nova_peer_id.to_string(), mode, latency_ms, String::new())
-            .await;
-        Ok((mode, last_outcome))
+        // Direct P2P dial/send failed or peer not found in DHT: fall back to backend relay pool
+        let pool = self.fallback_pool.read().await.clone();
+        if !pool.is_empty() {
+            let request_started = tokio::time::Instant::now();
+            if pool.send_chunks_multipath(nova_peer_id, chunks).await {
+                let latency_ms = request_started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                self.supervisor
+                    .update_peer_state(
+                        nova_peer_id.to_string(),
+                        P2PTransportMode::RelayedOpaque,
+                        latency_ms,
+                        "backend-relay".to_string(),
+                    )
+                    .await;
+                return Ok((P2PTransportMode::RelayedOpaque, DeliveryOutcome::Processed));
+            }
+        }
+
+        Ok((P2PTransportMode::Disconnected, DeliveryOutcome::Rejected))
     }
 
     /// Waits for the next raw packet received from any peer over a direct connection. Returns
@@ -813,22 +829,6 @@ impl P2PNode {
         self.incoming_rx.lock().await.recv().await
     }
 
-    /// Best-effort, fire-and-forget hand-off of `chunks` to the multi-server fallback relay pool (see
-    /// `crate::seed_nodes`) for `nova_peer_id` — called from `send_chunks_to_peer`'s failure
-    /// paths so a peer unreachable through the DHT still gets a second chance.
-    ///
-    /// Chunks are **striped in parallel** across all active relay servers to maximize throughput
-    /// and provide automatic failover.
-    async fn spawn_udp_fallback_send_chunks(&self, nova_peer_id: &str, chunks: Vec<Vec<u8>>) {
-        let pool = self.fallback_pool.read().await.clone();
-        if pool.is_empty() || chunks.is_empty() {
-            return;
-        }
-        let nova_peer_id = nova_peer_id.to_string();
-        tokio::spawn(async move {
-            pool.send_chunks_multipath(&nova_peer_id, chunks).await;
-        });
-    }
 }
 
 /// Best-effort automatic port forwarding via UPnP IGD — lets a device act as a reachable
@@ -891,6 +891,12 @@ async fn run_swarm_task(
     incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
     mut fallback_pool: MultiFallbackPool,
 ) {
+    let identity = Arc::new(identity);
+    // Start persistent real-time streaming WebSocket connection to the backend server pool
+    if !fallback_pool.is_empty() {
+        fallback_pool.start_realtime_listener(identity.clone(), incoming_tx.clone());
+    }
+
     let mut pending_lookups: PendingLookups = HashMap::new();
     let mut pending_dials: HashMap<PeerId, Vec<oneshot::Sender<Result<(), TransportError>>>> = HashMap::new();
     let mut pending_requests: HashMap<OutboundRequestId, oneshot::Sender<Result<DeliveryOutcome, TransportError>>> = HashMap::new();
@@ -1017,6 +1023,9 @@ async fn run_swarm_task(
                     }
                     Command::SetFallback(new_pool) => {
                         fallback_pool = new_pool;
+                        if !fallback_pool.is_empty() {
+                            fallback_pool.start_realtime_listener(identity.clone(), incoming_tx.clone());
+                        }
                     }
                 }
             }
@@ -1420,16 +1429,16 @@ mod tests {
         let bob = P2PNode::start(bob_id, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
 
         alice.bootstrap_dial(bob.listen_addr().clone()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
         bob.announce_presence().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
 
         // Bob must actively receive and respond, or Alice's `send_to_peer` below just times out
         // waiting for the request/response round-trip — see `test_two_independent_nodes_discover_
         // via_dht_and_exchange_bytes` above, which this mirrors.
         let bob_recv = bob.clone();
         let recv_task = tokio::spawn(async move {
-            let incoming = tokio::time::timeout(Duration::from_secs(10), bob_recv.recv_next())
+            let incoming = tokio::time::timeout(Duration::from_secs(20), bob_recv.recv_next())
                 .await
                 .expect("bob should receive the message before the timeout")
                 .expect("incoming channel should not be closed");

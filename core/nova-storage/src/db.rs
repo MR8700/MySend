@@ -1,7 +1,7 @@
 use crate::field_crypto::FieldCipher;
 use crate::models::{
-    AttachmentMeta, ContactRecord, ConversationRecord, DbMessageStatus, MessageRecord, OutboxItem,
-    UserProfileRecord,
+    AttachmentMeta, ContactRecord, ConversationRecord, DbMessageStatus, GroupMemberRecord,
+    GroupRecord, MessageRecord, OutboxItem, UserProfileRecord,
 };
 use nova_crypto::{
     derive_storage_key, generate_storage_salt, DeviceIdentity, DoubleRatchetSession,
@@ -176,12 +176,37 @@ impl StorageEngine {
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                avatar_data_url TEXT,
+                creator_peer_id TEXT NOT NULL,
+                my_role TEXT NOT NULL DEFAULT 'member',
+                ephemeral_timer_sec INTEGER NOT NULL DEFAULT 0,
+                created_at_utc INTEGER NOT NULL,
+                updated_at_utc INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                joined_at_utc INTEGER NOT NULL,
+                is_online INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (group_id, peer_id),
+                FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, timestamp_utc);
             CREATE INDEX IF NOT EXISTS idx_outbox_retry ON outbox_queue(next_retry_utc);
+            CREATE INDEX IF NOT EXISTS idx_group_members_group ON group_members(group_id);
             ",
         )?;
 
         conn.execute("ALTER TABLE contacts ADD COLUMN is_trusted INTEGER NOT NULL DEFAULT 0", []).ok();
+        conn.execute("ALTER TABLE conversations ADD COLUMN is_group INTEGER NOT NULL DEFAULT 0", []).ok();
 
         Ok(())
     }
@@ -1116,6 +1141,167 @@ impl StorageEngine {
         }))
     }
 
+    // --- Group Chat Operations ---
+
+    pub fn save_group(&self, group: &GroupRecord) -> Result<(), StorageError> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO groups (id, name, description, avatar_data_url, creator_peer_id, my_role, ephemeral_timer_sec, created_at_utc, updated_at_utc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                description = excluded.description,
+                avatar_data_url = excluded.avatar_data_url,
+                my_role = excluded.my_role,
+                ephemeral_timer_sec = excluded.ephemeral_timer_sec,
+                updated_at_utc = excluded.updated_at_utc",
+            params![
+                group.id,
+                group.name,
+                group.description,
+                group.avatar_data_url,
+                group.creator_peer_id,
+                group.my_role,
+                group.ephemeral_timer_sec,
+                group.created_at_utc,
+                group.updated_at_utc,
+            ],
+        )?;
+
+        // Ensure a matching conversation record exists so the group appears seamlessly in the chats list
+        let conv_id = format!("group_{}", group.id);
+        let now_utc = chrono::Utc::now().timestamp();
+        let aad = format!("conversations:last_msg:{}", conv_id);
+        let empty_msg_enc = self.cipher.encrypt_str("", aad.as_bytes());
+
+        conn.execute(
+            "INSERT INTO conversations (id, peer_id, title, last_message_text_enc, last_message_time_utc, unread_count, is_group)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 1)
+             ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title",
+            params![conv_id, group.id, group.name, empty_msg_enc, now_utc],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn get_groups(&self) -> Result<Vec<GroupRecord>, StorageError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, avatar_data_url, creator_peer_id, my_role, ephemeral_timer_sec, created_at_utc, updated_at_utc
+             FROM groups ORDER BY updated_at_utc DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GroupRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                avatar_data_url: row.get(3)?,
+                creator_peer_id: row.get(4)?,
+                my_role: row.get(5)?,
+                ephemeral_timer_sec: row.get(6)?,
+                created_at_utc: row.get(7)?,
+                updated_at_utc: row.get(8)?,
+            })
+        })?;
+
+        let mut groups = Vec::new();
+        for r in rows {
+            groups.push(r?);
+        }
+        Ok(groups)
+    }
+
+    pub fn get_group(&self, group_id: &str) -> Result<Option<GroupRecord>, StorageError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, avatar_data_url, creator_peer_id, my_role, ephemeral_timer_sec, created_at_utc, updated_at_utc
+             FROM groups WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![group_id], |row| {
+            Ok(GroupRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                avatar_data_url: row.get(3)?,
+                creator_peer_id: row.get(4)?,
+                my_role: row.get(5)?,
+                ephemeral_timer_sec: row.get(6)?,
+                created_at_utc: row.get(7)?,
+                updated_at_utc: row.get(8)?,
+            })
+        })?;
+
+        if let Some(res) = rows.next() {
+            Ok(Some(res?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn delete_group(&self, group_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock();
+        let conv_id = format!("group_{group_id}");
+        conn.execute("DELETE FROM group_members WHERE group_id = ?1", params![group_id])?;
+        conn.execute("DELETE FROM groups WHERE id = ?1", params![group_id])?;
+        conn.execute("DELETE FROM messages WHERE conversation_id = ?1", params![conv_id])?;
+        conn.execute("DELETE FROM conversations WHERE id = ?1", params![conv_id])?;
+        Ok(())
+    }
+
+    pub fn save_group_member(&self, member: &GroupMemberRecord) -> Result<(), StorageError> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO group_members (group_id, peer_id, display_name, role, joined_at_utc, is_online)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(group_id, peer_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                role = excluded.role,
+                is_online = excluded.is_online",
+            params![
+                member.group_id,
+                member.peer_id,
+                member.display_name,
+                member.role,
+                member.joined_at_utc,
+                member.is_online as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_group_members(&self, group_id: &str) -> Result<Vec<GroupMemberRecord>, StorageError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT group_id, peer_id, display_name, role, joined_at_utc, is_online
+             FROM group_members WHERE group_id = ?1 ORDER BY joined_at_utc ASC",
+        )?;
+        let rows = stmt.query_map(params![group_id], |row| {
+            Ok(GroupMemberRecord {
+                group_id: row.get(0)?,
+                peer_id: row.get(1)?,
+                display_name: row.get(2)?,
+                role: row.get(3)?,
+                joined_at_utc: row.get(4)?,
+                is_online: row.get::<_, i32>(5)? != 0,
+            })
+        })?;
+
+        let mut members = Vec::new();
+        for r in rows {
+            members.push(r?);
+        }
+        Ok(members)
+    }
+
+    pub fn remove_group_member(&self, group_id: &str, peer_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM group_members WHERE group_id = ?1 AND peer_id = ?2",
+            params![group_id, peer_id],
+        )?;
+        Ok(())
+    }
 }
 
 // Only the pool-roundtrip test still needs a fresh key id — `get_own_prekey_bundle` no longer
@@ -1677,4 +1863,66 @@ mod tests {
         assert_eq!(after[0].payload, b"original_payload", "retry bookkeeping must never touch the queued payload");
         assert_eq!(after[0].first_attempt_utc, first_attempt, "first_attempt_utc must survive retries — it anchors the give-up deadline");
     }
+
+    #[test]
+    fn test_group_storage_lifecycle() {
+        let storage = StorageEngine::open(":memory:", "unlock-pass").unwrap();
+        let group_id = "grp_test_999";
+        let group = GroupRecord {
+            id: group_id.to_string(),
+            name: "Alpha Group".to_string(),
+            description: Some("Alpha testing group".to_string()),
+            avatar_data_url: None,
+            creator_peer_id: "peer_owner".to_string(),
+            my_role: "owner".to_string(),
+            ephemeral_timer_sec: 0,
+            created_at_utc: chrono::Utc::now().timestamp(),
+            updated_at_utc: chrono::Utc::now().timestamp(),
+        };
+
+        storage.save_group(&group).unwrap();
+
+        let loaded = storage.get_group(group_id).unwrap().expect("group should exist");
+        assert_eq!(loaded.name, "Alpha Group");
+
+        // Verify conversation is automatically created for this group
+        let convs = storage.get_conversations().unwrap();
+        let matching_conv = convs.into_iter().find(|c| c.id == format!("group_{group_id}"));
+        assert!(matching_conv.is_some(), "matching conversation record should exist");
+
+        // Add members
+        let member1 = GroupMemberRecord {
+            group_id: group_id.to_string(),
+            peer_id: "peer_owner".to_string(),
+            display_name: "Owner".to_string(),
+            role: "owner".to_string(),
+            joined_at_utc: chrono::Utc::now().timestamp(),
+            is_online: true,
+        };
+        let member2 = GroupMemberRecord {
+            group_id: group_id.to_string(),
+            peer_id: "peer_member2".to_string(),
+            display_name: "Member 2".to_string(),
+            role: "member".to_string(),
+            joined_at_utc: chrono::Utc::now().timestamp(),
+            is_online: false,
+        };
+        storage.save_group_member(&member1).unwrap();
+        storage.save_group_member(&member2).unwrap();
+
+        let members = storage.get_group_members(group_id).unwrap();
+        assert_eq!(members.len(), 2);
+
+        // Remove one member
+        storage.remove_group_member(group_id, "peer_member2").unwrap();
+        let remaining = storage.get_group_members(group_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].peer_id, "peer_owner");
+
+        // Delete group
+        storage.delete_group(group_id).unwrap();
+        assert!(storage.get_group(group_id).unwrap().is_none());
+        assert_eq!(storage.get_group_members(group_id).unwrap().len(), 0);
+    }
 }
+

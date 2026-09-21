@@ -15,13 +15,14 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-/// Ceiling for control-plane datagrams (presence registration, lookups, directory profiles with avatars, small relayed blobs).
-pub const MAX_DATAGRAM_SIZE: usize = 64 * 1024;
+/// Ceiling for control-plane datagrams and relayed media blobs (up to 1 MiB).
+pub const MAX_DATAGRAM_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
     registry: Arc<PresenceRegistry>,
     relay: Arc<BlindRelay>,
+    sessions: Arc<tokio::sync::RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<ServerResponse>>>>,
 }
 
 #[derive(Deserialize)]
@@ -110,7 +111,11 @@ pub async fn bind(bind_addr: &str) -> std::io::Result<(TcpListener, Arc<Presence
     Ok((listener, registry, relay))
 }
 
-fn router(registry: Arc<PresenceRegistry>, relay: Arc<BlindRelay>) -> Router {
+fn router(
+    registry: Arc<PresenceRegistry>,
+    relay: Arc<BlindRelay>,
+    sessions: Arc<tokio::sync::RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<ServerResponse>>>>,
+) -> Router {
     Router::new()
         .route("/", get(ws_handler))
         .route("/health", get(|| async { "ok" }))
@@ -122,12 +127,13 @@ fn router(registry: Arc<PresenceRegistry>, relay: Arc<BlindRelay>) -> Router {
         .route("/admin/ban", post(handle_admin_ban))
         .route("/admin/unban", post(handle_admin_unban))
         .route("/admin/settings", post(handle_admin_settings))
-        .with_state(AppState { registry, relay })
+        .with_state(AppState { registry, relay, sessions })
 }
 
 /// Serves the discovery/signaling protocol forever over an already-bound listener.
 pub async fn serve_forever(listener: TcpListener, registry: Arc<PresenceRegistry>, relay: Arc<BlindRelay>) {
-    let app = router(registry, relay).into_make_service_with_connect_info::<SocketAddr>();
+    let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let app = router(registry, relay, sessions).into_make_service_with_connect_info::<SocketAddr>();
     if let Err(e) = axum::serve(listener, app).await {
         error!("WebSocket server exited: {e}");
     }
@@ -285,45 +291,153 @@ async fn handle_admin_settings(
 // WebSocket Signaling & Request Handling
 // -------------------------------------------------------------
 
-async fn handle_socket(mut socket: WebSocket, state: AppState, observed_ip: IpAddr) {
+async fn handle_socket(socket: WebSocket, state: AppState, observed_ip: IpAddr) {
+    use futures_util::{SinkExt, StreamExt};
     let observed_addr = SocketAddr::new(observed_ip, 0);
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<ServerResponse>();
 
-    while let Some(msg) = socket.recv().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("WebSocket recv error from {observed_ip}: {e}");
-                break;
+    let mut authenticated_peer_id: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            Some(push_msg) = push_rx.recv() => {
+                if let Ok(encoded) = push_msg.to_bytes() {
+                    if ws_sender.send(Message::Binary(encoded)).await.is_err() {
+                        break;
+                    }
+                }
             }
-        };
+            msg = ws_receiver.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        warn!("WebSocket recv error from {observed_ip}: {e}");
+                        break;
+                    }
+                    None => break,
+                };
 
-        let bytes = match msg {
-            Message::Binary(b) => b,
-            Message::Close(_) => break,
-            Message::Ping(_) | Message::Pong(_) | Message::Text(_) => continue,
-        };
+                match msg {
+                    Message::Binary(bytes) => {
+                        if bytes.len() > MAX_DATAGRAM_SIZE {
+                            let _ = ws_sender
+                                .send(Message::Binary(
+                                    ServerResponse::Error(format!("request exceeds {MAX_DATAGRAM_SIZE}-byte limit"))
+                                        .to_bytes()
+                                        .unwrap_or_default(),
+                                ))
+                                .await;
+                            continue;
+                        }
 
-        if bytes.len() > MAX_DATAGRAM_SIZE {
-            let _ = socket
-                .send(Message::Binary(
-                    ServerResponse::Error(format!("request exceeds {MAX_DATAGRAM_SIZE}-byte limit"))
-                        .to_bytes()
-                        .unwrap_or_default(),
-                ))
-                .await;
-            continue;
+                        let (response, register_peer) = handle_request_with_state(
+                            &state,
+                            &bytes,
+                            observed_addr,
+                        ).await;
+
+                        if let Some(peer_id) = register_peer {
+                            authenticated_peer_id = Some(peer_id.clone());
+                            state.sessions.write().await.insert(peer_id.clone(), push_tx.clone());
+
+                            // Instantly drain any pending packets in BlindRelay for this peer!
+                            if state.relay.pending_count(&peer_id).await > 0 {
+                                let pending = state.relay.drain_for_peer(&peer_id).await;
+                                if !pending.is_empty() {
+                                    let _ = push_tx.send(ServerResponse::RelayDrained(pending));
+                                }
+                            }
+                        }
+
+                        let encoded = match response.to_bytes() {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!("Failed to encode response for {observed_ip}: {e}");
+                                continue;
+                            }
+                        };
+                        if ws_sender.send(Message::Binary(encoded)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        if ws_sender.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    Message::Pong(_) | Message::Text(_) => continue,
+                }
+            }
         }
+    }
 
-        let response = handle_request(&state.registry, &state.relay, &bytes, observed_addr).await;
-        let encoded = match response.to_bytes() {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("Failed to encode response for {observed_ip}: {e}");
-                continue;
+    if let Some(peer_id) = authenticated_peer_id {
+        state.sessions.write().await.remove(&peer_id);
+    }
+}
+
+async fn handle_request_with_state(
+    state: &AppState,
+    bytes: &[u8],
+    observed_addr: SocketAddr,
+) -> (ServerResponse, Option<String>) {
+    let request = match ServerRequest::from_bytes(bytes) {
+        Ok(r) => r,
+        Err(e) => return (ServerResponse::Error(format!("malformed request: {e}")), None),
+    };
+
+    match request {
+        ServerRequest::Register(registration) => {
+            let peer_id = registration.endpoint.peer_id.clone();
+            match state.registry.register(registration, observed_addr).await {
+                Ok(()) => (ServerResponse::Registered, Some(peer_id)),
+                Err(e) => (ServerResponse::Error(e.to_string()), None),
             }
-        };
-        if socket.send(Message::Binary(encoded)).await.is_err() {
-            break;
+        }
+        ServerRequest::Lookup { peer_id } => {
+            (ServerResponse::LookupResult(state.registry.get_peer(&peer_id).await), None)
+        }
+        ServerRequest::RelayForward {
+            target_peer_id,
+            payload,
+        } => {
+            if state.registry.is_banned(&target_peer_id).await {
+                return (ServerResponse::Error("L'utilisateur cible est suspendu.".into()), None);
+            }
+            match state.relay.forward_opaque(&target_peer_id, payload).await {
+                Ok(()) => {
+                    // Real-Time Direct Push: if recipient is currently connected via WebSocket, deliver immediately!
+                    let sessions = state.sessions.read().await;
+                    if let Some(target_tx) = sessions.get(&target_peer_id) {
+                        let pending = state.relay.drain_for_peer(&target_peer_id).await;
+                        if !pending.is_empty() {
+                            let _ = target_tx.send(ServerResponse::RelayDrained(pending));
+                        }
+                    }
+                    (ServerResponse::RelayForwarded, None)
+                }
+                Err(e) => (ServerResponse::Error(e.to_string()), None),
+            }
+        }
+        ServerRequest::RelayDrain(drain_request) => match drain_request.verify() {
+            Ok(pubkey) => {
+                let peer_id = hex::encode(pubkey);
+                if state.registry.is_banned(&peer_id).await {
+                    return (ServerResponse::Error("Votre compte est suspendu.".into()), None);
+                }
+                (ServerResponse::RelayDrained(state.relay.drain_for_peer(&peer_id).await), None)
+            }
+            Err(e) => (ServerResponse::Error(e.to_string()), None),
+        },
+        ServerRequest::RegisterDirectory(entry) => match state.registry.register_directory(entry).await {
+            Ok(()) => (ServerResponse::DirectoryRegistered, None),
+            Err(e) => (ServerResponse::Error(e.to_string()), None),
+        },
+        ServerRequest::SearchDirectory { query } => {
+            let results = state.registry.search_directory(&query).await;
+            (ServerResponse::DirectorySearchResults(results), None)
         }
     }
 }
@@ -334,46 +448,12 @@ pub async fn handle_request(
     bytes: &[u8],
     observed_addr: SocketAddr,
 ) -> ServerResponse {
-    let request = match ServerRequest::from_bytes(bytes) {
-        Ok(r) => r,
-        Err(e) => return ServerResponse::Error(format!("malformed request: {e}")),
+    let dummy_sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let state = AppState {
+        registry: Arc::new(registry.clone()),
+        relay: Arc::new(relay.clone()),
+        sessions: dummy_sessions,
     };
-
-    match request {
-        ServerRequest::Register(registration) => match registry.register(registration, observed_addr).await {
-            Ok(()) => ServerResponse::Registered,
-            Err(e) => ServerResponse::Error(e.to_string()),
-        },
-        ServerRequest::Lookup { peer_id } => ServerResponse::LookupResult(registry.get_peer(&peer_id).await),
-        ServerRequest::RelayForward {
-            target_peer_id,
-            payload,
-        } => {
-            if registry.is_banned(&target_peer_id).await {
-                return ServerResponse::Error("L'utilisateur cible est suspendu.".into());
-            }
-            match relay.forward_opaque(&target_peer_id, payload).await {
-                Ok(()) => ServerResponse::RelayForwarded,
-                Err(e) => ServerResponse::Error(e.to_string()),
-            }
-        },
-        ServerRequest::RelayDrain(drain_request) => match drain_request.verify() {
-            Ok(pubkey) => {
-                let peer_id = hex::encode(pubkey);
-                if registry.is_banned(&peer_id).await {
-                    return ServerResponse::Error("Votre compte est suspendu.".into());
-                }
-                ServerResponse::RelayDrained(relay.drain_for_peer(&peer_id).await)
-            }
-            Err(e) => ServerResponse::Error(e.to_string()),
-        },
-        ServerRequest::RegisterDirectory(entry) => match registry.register_directory(entry).await {
-            Ok(()) => ServerResponse::DirectoryRegistered,
-            Err(e) => ServerResponse::Error(e.to_string()),
-        },
-        ServerRequest::SearchDirectory { query } => {
-            let results = registry.search_directory(&query).await;
-            ServerResponse::DirectorySearchResults(results)
-        }
-    }
+    let (resp, _) = handle_request_with_state(&state, bytes, observed_addr).await;
+    resp
 }

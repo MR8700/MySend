@@ -250,7 +250,7 @@ impl PresenceRegistry {
                     last_seen_utc: entry.last_updated_utc,
                 });
 
-                if results.len() >= 20 {
+                if results.len() >= 100 {
                     break;
                 }
             }
@@ -269,6 +269,7 @@ impl PresenceRegistry {
             a.is_online
         }
 
+        results.truncate(20);
         results
     }
 

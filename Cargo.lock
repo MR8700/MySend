@@ -3556,6 +3556,7 @@ dependencies = [
  "hex",
  "nova-crypto",
  "nova-protocol",
+ "nova-server",
  "nova-storage",
  "nova-transport",
  "rand 0.8.7",

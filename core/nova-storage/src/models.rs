@@ -112,3 +112,29 @@ pub struct UserProfileRecord {
     pub avatar_data_url: Option<String>,
 }
 
+/// A sovereign P2P group chat persisted in local SQLite.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupRecord {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub avatar_data_url: Option<String>,
+    pub creator_peer_id: String,
+    pub my_role: String,
+    pub ephemeral_timer_sec: i64,
+    pub created_at_utc: i64,
+    pub updated_at_utc: i64,
+}
+
+/// A member of a sovereign P2P group.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupMemberRecord {
+    pub group_id: String,
+    pub peer_id: String,
+    pub display_name: String,
+    pub role: String,
+    pub joined_at_utc: i64,
+    pub is_online: bool,
+}
+
+

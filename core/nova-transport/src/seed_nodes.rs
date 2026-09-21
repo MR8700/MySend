@@ -10,14 +10,17 @@
 
 use crate::error::TransportError;
 use crate::udp_fallback::UdpFallbackClient;
+use futures_util::{SinkExt, StreamExt};
 use nova_protocol::{
-    DirectorySearchResult, PeerEndpoint, SignedDrainRequest, SignedPresenceRegistration,
+    DirectorySearchResult, PeerEndpoint, ServerRequest, ServerResponse, SignedDrainRequest,
+    SignedPresenceRegistration,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 /// GitHub Raw URL for the dynamic node list.
@@ -179,6 +182,38 @@ impl MultiFallbackPool {
         self.clients.len()
     }
 
+    /// Registers directory entry on ALL fallback servers in parallel.
+    pub async fn register_directory_all(&self, entry: nova_protocol::SignedDirectoryEntry) -> Result<(), TransportError> {
+        if self.clients.is_empty() {
+            return Err(TransportError::Setup("no fallback server configured in pool".into()));
+        }
+
+        let mut handles = Vec::new();
+        for client in self.clients.iter() {
+            let client = client.clone();
+            let entry = entry.clone();
+            handles.push(tokio::spawn(async move {
+                client.register_directory_signed(entry).await
+            }));
+        }
+
+        let mut last_err = None;
+        let mut any_success = false;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => any_success = true,
+                Ok(Err(e)) => last_err = Some(e),
+                Err(_) => {}
+            }
+        }
+
+        if any_success {
+            Ok(())
+        } else {
+            Err(last_err.unwrap_or_else(|| TransportError::Setup("all fallback directory registrations failed".into())))
+        }
+    }
+
     /// Registers presence on ALL fallback servers in parallel so any peer on any relay can locate us.
     pub async fn register_presence_all(&self, registration: SignedPresenceRegistration) {
         let clients = self.clients.clone();
@@ -225,6 +260,111 @@ impl MultiFallbackPool {
         }
     }
 
+    /// Starts a persistent real-time streaming WebSocket connection to the server(s) in the pool.
+    /// Whenever an incoming message is pushed by the server, it is immediately emitted to `incoming_tx`.
+    pub fn start_realtime_listener(
+        &self,
+        identity: Arc<nova_crypto::DeviceIdentity>,
+        incoming_tx: mpsc::UnboundedSender<crate::dht_node::IncomingMessage>,
+    ) {
+        let clients = self.clients.clone();
+        for client in clients.iter() {
+            let server_url = client.server_url().to_string();
+            let identity = identity.clone();
+            let tx = incoming_tx.clone();
+            tokio::spawn(async move {
+                let mut retry_delay = Duration::from_millis(500);
+                loop {
+                    debug!("Connecting persistent real-time messaging WebSocket to {server_url}...");
+                    match tokio::time::timeout(
+                        Duration::from_secs(15),
+                        tokio_tungstenite::connect_async(&server_url),
+                    ).await {
+                        Ok(Ok((mut ws, _))) => {
+                            retry_delay = Duration::from_millis(500);
+                            info!("Connected persistent real-time messaging WebSocket to {server_url}");
+
+                            // 1. Announce presence to bind this WebSocket connection to our identity
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                            let endpoint = PeerEndpoint {
+                                peer_id: identity.public_id_hex(),
+                                public_ip: "0.0.0.0".to_string(),
+                                public_port: 0,
+                                local_ip: None,
+                                local_port: None,
+                            };
+                            let registration = SignedPresenceRegistration::sign(&identity, endpoint, now);
+                            if let Ok(bytes) = ServerRequest::Register(registration).to_bytes() {
+                                let _ = ws.send(Message::Binary(bytes)).await;
+                            }
+
+                            // 2. Initial drain of any offline queue
+                            let drain_req = SignedDrainRequest::sign(&identity, now);
+                            if let Ok(bytes) = ServerRequest::RelayDrain(drain_req).to_bytes() {
+                                let _ = ws.send(Message::Binary(bytes)).await;
+                            }
+
+                            // 3. Heartbeat + Receive loop
+                            let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+                            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+                            loop {
+                                tokio::select! {
+                                    _ = heartbeat.tick() => {
+                                        if ws.send(Message::Ping(Vec::new())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    msg = ws.next() => {
+                                        match msg {
+                                            Some(Ok(Message::Binary(bytes))) => {
+                                                if let Ok(response) = ServerResponse::from_bytes(&bytes) {
+                                                    match response {
+                                                        ServerResponse::RelayDrained(items) => {
+                                                            for payload in items {
+                                                                let _ = tx.send(crate::dht_node::IncomingMessage {
+                                                                    bytes: payload,
+                                                                    source: crate::dht_node::IncomingSource::UdpFallback,
+                                                                });
+                                                            }
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                            Some(Ok(Message::Ping(payload))) => {
+                                                let _ = ws.send(Message::Pong(payload)).await;
+                                            }
+                                            Some(Ok(Message::Pong(_))) => {}
+                                            Some(Ok(Message::Close(_))) | None => {
+                                                debug!("Real-time WebSocket connection to {server_url} closed");
+                                                break;
+                                            }
+                                            Some(Err(e)) => {
+                                                debug!("Real-time WebSocket error from {server_url}: {e}");
+                                                break;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            debug!("Failed to connect real-time WebSocket to {server_url}: {e}");
+                        }
+                        Err(_) => {
+                            debug!("Timeout connecting real-time WebSocket to {server_url}");
+                        }
+                    }
+
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(10));
+                }
+            });
+        }
+    }
+
     /// **Multipath Chunk Striping**: Distributes file chunks or message packets across all available
     /// relay servers in parallel using round-robin striping with automatic failover!
     ///
@@ -233,42 +373,53 @@ impl MultiFallbackPool {
     /// - Chunk $2 \to \text{Server } 2$
     /// - Chunk $3 \to \text{Server } 0$ ...
     ///
-    /// Multiplies transfer bandwidth across $N$ servers while ensuring delivery even if one fails.
-    pub async fn send_chunks_multipath(&self, target_peer_id: &str, chunks: Vec<Vec<u8>>) {
+    pub async fn send_chunks_multipath(&self, target_peer_id: &str, chunks: Vec<Vec<u8>>) -> bool {
         if self.clients.is_empty() || chunks.is_empty() {
-            return;
+            return false;
         }
 
         let num_clients = self.clients.len();
         let target_peer_id = target_peer_id.to_string();
         let clients = self.clients.clone();
+        let mut handles = Vec::new();
 
         for (i, chunk) in chunks.into_iter().enumerate() {
             let primary_idx = (self.round_robin_counter.fetch_add(1, Ordering::Relaxed) + i) % num_clients;
             let target = target_peer_id.clone();
             let pool_clients = clients.clone();
 
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 // Try assigned striped client first
                 let primary_client = &pool_clients[primary_idx];
-                if let Err(e) = primary_client.relay_forward(&target, chunk.clone()).await {
-                    debug!(
-                        "Striped relay_forward failed on {} ({e}) — attempting failover...",
-                        primary_client.server_url()
-                    );
-                    // Failover: try remaining clients in the pool
-                    for (alt_idx, alt_client) in pool_clients.iter().enumerate() {
-                        if alt_idx == primary_idx {
-                            continue;
-                        }
-                        if let Ok(()) = alt_client.relay_forward(&target, chunk.clone()).await {
-                            debug!("Failover relay_forward succeeded on {}", alt_client.server_url());
-                            break;
-                        }
+                if primary_client.relay_forward(&target, chunk.clone()).await.is_ok() {
+                    return true;
+                }
+                debug!(
+                    "Striped relay_forward failed on {} — attempting failover...",
+                    primary_client.server_url()
+                );
+                // Failover: try remaining clients in the pool
+                for (alt_idx, alt_client) in pool_clients.iter().enumerate() {
+                    if alt_idx == primary_idx {
+                        continue;
+                    }
+                    if alt_client.relay_forward(&target, chunk.clone()).await.is_ok() {
+                        debug!("Failover relay_forward succeeded on {}", alt_client.server_url());
+                        return true;
                     }
                 }
-            });
+                false
+            }));
         }
+
+        let mut all_ok = true;
+        for handle in handles {
+            match handle.await {
+                Ok(true) => {}
+                _ => all_ok = false,
+            }
+        }
+        all_ok
     }
 
     /// Queries all active relays in parallel for a peer's endpoint and returns the fastest response.

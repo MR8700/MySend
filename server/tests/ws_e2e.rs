@@ -163,3 +163,65 @@ async fn test_relay_forward_and_authenticated_drain_over_real_websocket() {
         other => panic!("expected drained packets, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn test_realtime_websocket_push() {
+    let server_addr = start_test_server().await;
+    let bob = identity("bob");
+    let bob_peer_id = bob.public_id_hex();
+
+    // 1. Bob opens a WebSocket and registers
+    let url = format!("ws://{server_addr}/");
+    let (mut bob_ws, _) = timeout(Duration::from_secs(2), tokio_tungstenite::connect_async(&url))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let endpoint = PeerEndpoint {
+        peer_id: String::new(),
+        public_ip: "0.0.0.0".into(),
+        public_port: 4433,
+        local_ip: None,
+        local_port: None,
+    };
+    let reg = SignedPresenceRegistration::sign(&bob, endpoint, now_secs());
+    bob_ws
+        .send(Message::Binary(ServerRequest::Register(reg).to_bytes().unwrap()))
+        .await
+        .unwrap();
+
+    let reg_msg = timeout(Duration::from_secs(2), bob_ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let Message::Binary(bytes) = reg_msg else { panic!("expected binary") };
+    assert!(matches!(ServerResponse::from_bytes(&bytes).unwrap(), ServerResponse::Registered));
+
+    // 2. Alice sends a message to Bob via RelayForward
+    let forward_resp = roundtrip(
+        &server_addr,
+        &ServerRequest::RelayForward {
+            target_peer_id: bob_peer_id.clone(),
+            payload: b"instant_push_payload".to_vec(),
+        },
+    )
+    .await;
+    assert!(matches!(forward_resp, ServerResponse::RelayForwarded));
+
+    // 3. Bob receives it IMMEDIATELY over his open WebSocket without draining!
+    let pushed_msg = timeout(Duration::from_secs(2), bob_ws.next())
+        .await
+        .expect("bob should receive instant push notification")
+        .unwrap()
+        .unwrap();
+    let Message::Binary(pushed_bytes) = pushed_msg else { panic!("expected binary push") };
+    match ServerResponse::from_bytes(&pushed_bytes).unwrap() {
+        ServerResponse::RelayDrained(items) => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0], b"instant_push_payload");
+        }
+        other => panic!("expected pushed RelayDrained, got {other:?}"),
+    }
+}
+

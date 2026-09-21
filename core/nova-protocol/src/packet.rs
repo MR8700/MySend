@@ -68,6 +68,8 @@ pub enum MessageContentType {
     Audio,
     File,
     SystemNotification,
+    GroupMessage,
+    GroupControl,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

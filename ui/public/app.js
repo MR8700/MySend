@@ -90,6 +90,7 @@ async function runPendingAction(el, fn) {
 
 const CLICK_ACTIONS = {
     navigate: (el) => navigateTo(el.dataset.screen),
+    navigateBack: () => navigateBackSafely(),
     createAccount: (el) => runPendingAction(el, createAccountReal),
     restoreAccount: (el) => runPendingAction(el, restoreAccountReal),
     openChat: (el) => openChatWithEl(el),
@@ -135,6 +136,9 @@ const CLICK_ACTIONS = {
     closeInspectUserModal: () => closeInspectUserModal(),
     addInspectedUser: (el) => runPendingAction(el, addInspectedUser),
     addDirectUser: (el) => runPendingAction(el, () => addDirectUser(el.dataset.peerId, el.dataset.username, el.dataset.name, el.dataset.bundle)),
+    triggerContactDirectorySearch: () => triggerContactDirectorySearchNow(),
+    refreshDirectoryNodes: () => runPendingAction(null, refreshDirectoryNodesAndSearch),
+    triggerContactsSearch: () => triggerContactsSearchNow(),
     toggleManualInviteAccordion: () => toggleManualInviteAccordion(),
     openMnemonicAuthModal: () => openMnemonicAuthModal(),
     closeMnemonicAuthModal: () => closeMnemonicAuthModal(),
@@ -148,6 +152,9 @@ const CLICK_ACTIONS = {
     copyOwnBundle: () => copyOwnBundle(),
     openQrCameraScanner: () => openQrCameraScanner(),
     closeQrCameraScanner: () => closeQrCameraScanner(),
+    triggerQrImagePicker: () => { const el = document.getElementById('qr-image-input'); if (el) el.click(); },
+    copyOwnPeerId: () => copyOwnPeerId(),
+    fillAddContactForm: (el) => fillAddContactForm(el.dataset.name, el.dataset.id),
     openImagePreview: (el) => openImagePreviewEl(el),
     closeImagePreview: () => closeImagePreview(),
     downloadCurrentImage: () => runPendingAction(null, downloadCurrentImage),
@@ -160,6 +167,10 @@ const CLICK_ACTIONS = {
     retryOwnBundle: (el) => runPendingAction(el, retryOwnBundleReal),
     openReportModal: (el) => openReportModal(el.dataset.peerId, el.dataset.name),
     closeReportModal: () => closeReportModal(),
+    confirmCreateGroup: (el) => runPendingAction(el, confirmCreateGroupReal),
+    toggleGroupMemberSelect: (el) => toggleGroupMemberSelect(el.dataset.peerId),
+    shareGroupInvitation: () => shareGroupInvitation(),
+    confirmLeaveGroup: (el) => runPendingAction(el, confirmLeaveGroupReal),
     confirmSubmitReport: (el) => runPendingAction(el, confirmSubmitReportReal),
     openFeedbackModal: () => openFeedbackModal(),
     closeFeedbackModal: () => closeFeedbackModal(),
@@ -221,12 +232,21 @@ document.addEventListener('click', (event) => {
 // blocked by the same CSP, for the same reason as onclick above.
 const ENTER_SUBMIT_MAP = {
     'account-name-input': () => createAccountReal(),
+    'restore-name-input': () => restoreAccountReal(),
     'chat-input': () => sendMessage(),
     'mnemonic-auth-pin': () => confirmMnemonicPin(),
     'edit-display-name-input': () => saveProfileChanges(),
     'media-caption-input': () => confirmAndSendPendingMedia(),
     'admin-token-input': () => saveAdminToken(),
+    'admin-threshold-input': () => adminSaveThresholdReal(),
     'setup-pin-confirm': () => saveNewPin(),
+    'contact-search-query': () => triggerContactDirectorySearchNow(),
+    'contacts-search-input': () => triggerContactsSearchNow(),
+    'add-display-name-input': () => addContactReal(),
+    'add-bundle-input': () => addContactReal(),
+    'create-group-name-input': () => confirmCreateGroupReal(),
+    'create-group-desc-input': () => confirmCreateGroupReal(),
+    'global-search-input': () => handleStrictSearch(document.getElementById('global-search-input')?.value || ''),
 };
 document.addEventListener('keydown', (event) => {
     if (state.isAppLocked) {
@@ -535,6 +555,7 @@ const screens = {
                 <div class="header-title">Conversations</div>
                 <div class="header-actions">
                     <button class="icon-btn" data-action="navigate" data-screen="global_search" title="Recherche">${icons.search}</button>
+                    <button class="icon-btn" data-action="navigate" data-screen="create_group" title="Nouveau groupe">${icons.users}</button>
                     <button class="icon-btn" data-action="navigate" data-screen="add_contact" title="Ajouter un contact">${icons.plus}</button>
                 </div>
             </header>
@@ -563,21 +584,28 @@ const screens = {
             <header class="app-header">
                 <div style="display: flex; align-items: center; gap: 10px;">
                     <button class="icon-btn" data-action="navigate" data-screen="conversations">${icons.arrowLeft}</button>
-                    <div class="avatar" style="width: 38px; height: 38px; font-size: 14px; cursor: pointer;" data-action="navigate" data-screen="contact_profile">
-                        ${escapeHtml(state.activeContact.name.charAt(0))}
-                        <div class="status-dot ${state.currentDiagnostics && state.currentDiagnostics.is_connected ? 'status-online' : 'status-offline'}"></div>
+                    <div class="avatar" style="width: 38px; height: 38px; font-size: 14px; cursor: pointer; ${state.activeContact.isGroup ? 'background: linear-gradient(135deg, #8b5cf6, #3b82f6);' : ''}" data-action="navigate" data-screen="${state.activeContact.isGroup ? 'group_info' : 'contact_profile'}">
+                        ${state.activeContact.isGroup ? icons.users : escapeHtml(state.activeContact.name.charAt(0))}
+                        <div class="status-dot ${state.activeContact.isGroup || (state.currentDiagnostics && state.currentDiagnostics.is_connected) ? 'status-online' : 'status-offline'}"></div>
                     </div>
-                    <div data-action="navigate" data-screen="contact_profile" style="cursor: pointer;">
-                        <div style="font-size: 15px; font-weight: 700; color: white;">${escapeHtml(state.activeContact.name)}</div>
-                        <div id="chat-header-status" style="font-size: 11px; color: ${state.currentDiagnostics && state.currentDiagnostics.is_connected ? 'var(--status-success)' : 'var(--text-muted)'}; font-weight: 500; display: flex; align-items: center; gap: 4px;">
-                            ${chatHeaderStatusHtml()}
+                    <div data-action="navigate" data-screen="${state.activeContact.isGroup ? 'group_info' : 'contact_profile'}" style="cursor: pointer;">
+                        <div style="font-size: 15px; font-weight: 700; color: white; display: flex; align-items: center; gap: 6px;">
+                            ${state.activeContact.isGroup ? '<span>👥</span>' : ''}
+                            ${escapeHtml(state.activeContact.name)}
+                        </div>
+                        <div id="chat-header-status" style="font-size: 11px; color: var(--accent-purple-light); font-weight: 500; display: flex; align-items: center; gap: 4px;">
+                            ${state.activeContact.isGroup ? 'Groupe souverain P2P Mesh' : chatHeaderStatusHtml()}
                         </div>
                     </div>
                 </div>
                 <div class="header-actions">
-                    <button class="icon-btn" data-name="${escapeHtml(state.activeContact.name)}" data-action="callVoice" title="Appel vocal">${icons.phone}</button>
-                    <button class="icon-btn" data-name="${escapeHtml(state.activeContact.name)}" data-action="callVideo" title="Appel vidéo">${icons.video}</button>
-                    <button class="icon-btn" data-action="navigate" data-screen="contact_profile" title="Infos du contact">${icons.user}</button>
+                    ${state.activeContact.isGroup ? `
+                        <button class="icon-btn" data-action="navigate" data-screen="group_info" title="Infos du groupe">${icons.users}</button>
+                    ` : `
+                        <button class="icon-btn" data-name="${escapeHtml(state.activeContact.name)}" data-action="callVoice" title="Appel vocal">${icons.phone}</button>
+                        <button class="icon-btn" data-name="${escapeHtml(state.activeContact.name)}" data-action="callVideo" title="Appel vidéo">${icons.video}</button>
+                        <button class="icon-btn" data-action="navigate" data-screen="contact_profile" title="Infos du contact">${icons.user}</button>
+                    `}
                 </div>
             </header>
 
@@ -872,9 +900,10 @@ const screens = {
             </header>
 
             <div class="search-bar-wrap">
-                <div class="search-input-box">
+                <div class="search-input-box" style="position: relative;">
                     ${icons.search}
-                    <input type="text" id="contacts-search-input" placeholder="Rechercher un contact...">
+                    <input type="text" id="contacts-search-input" inputmode="search" enterkeyhint="search" placeholder="Nom, @pseudo ou identifiant..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                    <button class="btn-primary" style="padding: 5px 10px; font-size: 11px; border-radius: 6px; margin-right: 2px; flex-shrink: 0;" data-action="triggerContactsSearch">Chercher</button>
                 </div>
             </div>
 
@@ -931,16 +960,45 @@ const screens = {
             </header>
 
             <div style="padding: 20px 16px; overflow-y: auto; padding-bottom: 90px;">
-                <!-- Main Search Bar -->
+                <!-- Direct Contact Addition Form (Always visible & prominent) -->
+                <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 18px 16px; margin-bottom: 22px; box-shadow: 0 4px 20px rgba(0,0,0,0.25);">
+                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 14px;">
+                        <div style="width: 32px; height: 32px; border-radius: 50%; background: rgba(139, 92, 246, 0.15); display: flex; align-items: center; justify-content: center; color: var(--accent-purple-light); font-size: 16px;">
+                            ${icons.user || '👤'}
+                        </div>
+                        <div>
+                            <div style="font-size: 14px; font-weight: 700; color: white;">Ajouter directement un contact</div>
+                            <div style="font-size: 11px; color: var(--text-muted);">Saisissez le nom et l'identifiant, @pseudo ou lien de votre contact</div>
+                        </div>
+                    </div>
+
+                    <label style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Nom ou surnom du contact *</label>
+                    <div class="search-input-box" style="margin: 6px 0 12px;">
+                        <input type="text" id="add-display-name-input" placeholder="ex: Alice, Bob, Bureau..." autocomplete="off" autocorrect="off" autocapitalize="words" spellcheck="false">
+                    </div>
+
+                    <label style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Identifiant, @pseudo, clé publique ou lien reçu *</label>
+                    <div style="background-color: var(--bg-surface-2); border-radius: var(--radius-md); padding: 10px 12px; margin: 6px 0 14px; border: 1px solid var(--border-subtle);">
+                        <textarea id="add-bundle-input" placeholder="Collez l'identifiant public (ex: 8f4b2a...), le @pseudo, ou le lien nova://invite..." rows="2" style="width: 100%; background: none; border: none; color: white; font-size: 12px; font-family: monospace; resize: none; outline: none; word-break: break-all;"></textarea>
+                    </div>
+
+                    <button class="btn-primary" style="width: 100%; padding: 12px; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="addContact">
+                        ${icons.plus}
+                        <span>Ajouter ce contact</span>
+                    </button>
+                </div>
+
+                <!-- Online Search in Decentralized Directory -->
                 <div style="margin-bottom: 16px;">
-                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 6px;">Rechercher un contact</div>
-                    <div class="search-input-box">
+                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 6px;">Ou rechercher sur l'annuaire de découverte</div>
+                    <div class="search-input-box" style="position: relative;">
                         ${icons.search}
-                        <input type="text" id="contact-search-query" placeholder="Tapez un @pseudo, un nom ou un identifiant..." autofocus>
+                        <input type="text" id="contact-search-query" inputmode="search" enterkeyhint="search" placeholder="Tapez un @pseudo, un nom ou un identifiant..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                        <button class="btn-primary" style="padding: 6px 12px; font-size: 11px; border-radius: 6px; margin-right: 2px; flex-shrink: 0;" data-action="triggerContactDirectorySearch">Chercher</button>
                     </div>
                 </div>
 
-                <!-- Fast Actions -->
+                <!-- Fast Actions: QR Code Scanner and Display -->
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px;">
                     <button class="btn-secondary" style="font-size: 12px; padding: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="openQrCameraScanner">
                         ${icons.qr}
@@ -954,31 +1012,10 @@ const screens = {
 
                 <!-- Dynamic Search Results -->
                 <div id="directory-search-results" style="margin-bottom: 24px;">
-                    <div style="text-align: center; color: var(--text-dim); padding: 30px 16px; font-size: 13px;">
-                        <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--accent-purple-light);">
-                            ${icons.search}
-                        </div>
-                        <div style="color: white; font-weight: 600; margin-bottom: 4px; font-size: 15px;">Trouver un contact</div>
-                        <div style="max-width: 280px; margin: 0 auto; line-height: 1.4; color: var(--text-muted);">Tapez un @pseudo ou un nom pour démarrer une nouvelle conversation instantanément.</div>
-                    </div>
-                </div>
-
-                <!-- Manual fallback methods in collapsible accordion -->
-                <div style="border-top: 1px solid var(--border-subtle); padding-top: 16px;">
-                    <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer; padding: 6px 0;" data-action="toggleManualInviteAccordion">
-                        <span style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Ajouter avec un lien d'invitation</span>
-                        <span id="manual-invite-chevron" style="color: var(--text-muted); font-size: 12px;">▼</span>
-                    </div>
-                    <div id="manual-invite-body" style="display: none; margin-top: 14px;">
-                        <label style="font-size: 12px; color: var(--text-muted);">Nom du contact</label>
-                        <div class="search-input-box" style="margin: 6px 0 12px;">
-                            <input type="text" id="add-display-name-input" placeholder="ex: Alice">
-                        </div>
-                        <label style="font-size: 12px; color: var(--text-muted);">Lien d'invitation reçu</label>
-                        <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 10px; margin: 6px 0 12px; border: 1px solid var(--border-subtle);">
-                            <textarea id="add-bundle-input" placeholder="Collez le lien nova://invite... ici" rows="2" style="width: 100%; background: none; border: none; color: white; font-size: 11px; font-family: monospace; resize: none; outline: none; word-break: break-all;"></textarea>
-                        </div>
-                        <button class="btn-primary" style="width: 100%; padding: 10px; font-size: 13px;" data-action="addContact">Ajouter ce contact</button>
+                    <div style="text-align: center; color: var(--text-dim); padding: 20px 16px; font-size: 12px; background: rgba(255,255,255,0.02); border-radius: var(--radius-md); border: 1px dashed var(--border-subtle);">
+                        <div style="font-size: 20px; margin-bottom: 6px;">🌐</div>
+                        <div style="color: white; font-weight: 600; margin-bottom: 4px;">Recherche globale décentralisée</div>
+                        <div style="max-width: 280px; margin: 0 auto; line-height: 1.4; color: var(--text-muted);">Vous pouvez aussi rechercher des pairs connectés via leur @pseudo public.</div>
                     </div>
                 </div>
             </div>
@@ -1028,6 +1065,97 @@ const screens = {
             </div>
         </div>
     `,
+
+    // Nouveau Groupe Souverain P2P
+    create_group: () => `
+        <div class="screen-view">
+            <header class="app-header">
+                <button class="icon-btn" data-action="navigate" data-screen="conversations">${icons.arrowLeft}</button>
+                <div class="header-title">Nouveau groupe</div>
+                <div style="width: 38px;"></div>
+            </header>
+
+            <div class="scroll-content" style="padding: 16px;">
+                <div style="background: var(--bg-surface); border-radius: var(--radius-md); padding: 18px; border: 1px solid var(--border-subtle); margin-bottom: 20px;">
+                    <div style="display: flex; gap: 14px; align-items: center; margin-bottom: 16px;">
+                        <div style="width: 52px; height: 52px; border-radius: 50%; background: linear-gradient(135deg, #8b5cf6, #3b82f6); display: flex; align-items: center; justify-content: center; color: white; flex-shrink: 0;">
+                            ${icons.users}
+                        </div>
+                        <div style="flex: 1;">
+                            <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px;">Nom du groupe *</label>
+                            <input type="text" id="create-group-name-input" placeholder="ex: Projet Nova, Famille..." style="width: 100%; background: var(--bg-surface-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 10px 12px; color: white; font-size: 14px; margin-top: 4px; outline: none;">
+                        </div>
+                    </div>
+
+                    <div>
+                        <label style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px;">Description (facultative)</label>
+                        <input type="text" id="create-group-desc-input" placeholder="Objectif ou sujet du groupe" style="width: 100%; background: var(--bg-surface-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 10px 12px; color: white; font-size: 13px; margin-top: 4px; outline: none;">
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 16px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <span style="font-size: 12px; font-weight: 700; color: white; text-transform: uppercase; letter-spacing: 0.5px;">Sélectionner les membres</span>
+                        <span style="font-size: 11px; color: var(--accent-purple-light);" id="group-selected-count">0 sélectionné(s)</span>
+                    </div>
+
+                    <div style="background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle); overflow: hidden; max-height: 280px; overflow-y: auto;" id="group-contacts-selection-list">
+                        ${renderGroupContactsSelectionHtml()}
+                    </div>
+                </div>
+
+                <div style="padding: 12px; background: rgba(139, 92, 246, 0.08); border-radius: var(--radius-md); border: 1px solid rgba(139, 92, 246, 0.2); margin-bottom: 20px; font-size: 11px; color: var(--text-muted); line-height: 1.4; display: flex; gap: 8px; align-items: flex-start;">
+                    <span style="color: var(--accent-purple-light); font-size: 14px;">🔒</span>
+                    <span>Ce groupe fonctionne en réseau mesh pair-à-pair décentralisé : chaque message est chiffré individuellement avec le double ratchet de chaque membre.</span>
+                </div>
+
+                <button class="btn-primary" style="width: 100%; padding: 14px; font-size: 14px; font-weight: 700;" data-action="confirmCreateGroup">Créer le groupe</button>
+            </div>
+        </div>
+    `,
+
+    // Détails et gestion du groupe (Membres, Invitation, Quitter)
+    group_info: () => {
+        if (!state.activeContact || !state.activeContact.isGroup) return screens._noActiveContact('conversations');
+        return `
+        <div class="screen-view">
+            <header class="app-header">
+                <button class="icon-btn" data-action="navigate" data-screen="chat">${icons.arrowLeft}</button>
+                <div class="header-title">Infos du groupe</div>
+                <div style="width: 38px;"></div>
+            </header>
+
+            <div class="scroll-content" style="padding: 16px;" id="group-info-container">
+                <div style="text-align: center; padding: 20px 0 24px;">
+                    <div style="width: 72px; height: 72px; border-radius: 50%; background: linear-gradient(135deg, #8b5cf6, #3b82f6); display: flex; align-items: center; justify-content: center; color: white; margin: 0 auto 12px; font-size: 28px;">
+                        ${icons.users}
+                    </div>
+                    <div style="font-size: 18px; font-weight: 800; color: white;">${escapeHtml(state.activeContact.name)}</div>
+                    <div style="font-size: 12px; color: var(--accent-purple-light); margin-top: 4px;">Groupe Souverain P2P Mesh</div>
+                </div>
+
+                <div style="display: flex; gap: 10px; margin-bottom: 24px;">
+                    <button class="btn-primary" style="flex: 1; padding: 10px; font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 6px;" data-action="shareGroupInvitation">
+                        ${icons.share || icons.copy} <span>Inviter des amis</span>
+                    </button>
+                </div>
+
+                <div style="margin-bottom: 24px;">
+                    <div style="font-size: 12px; font-weight: 700; color: white; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;">Membres du groupe</div>
+                    <div style="background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle); overflow: hidden;" id="group-members-list">
+                        <div style="text-align: center; padding: 20px; color: var(--text-dim); font-size: 12px;">Chargement des membres...</div>
+                    </div>
+                </div>
+
+                <div style="border-top: 1px solid var(--border-subtle); padding-top: 20px;">
+                    <button class="btn-secondary" style="width: 100%; padding: 12px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.3); font-weight: 600;" data-action="confirmLeaveGroup">
+                        Quitter et supprimer le groupe
+                    </button>
+                </div>
+            </div>
+        </div>
+        `;
+    },
 
     // 8. Médias partagés (1-to-1)
     shared_media: () => { if (!state.activeContact) return screens._noActiveContact('conversations'); const conversationId = state.activeContact.conversationId;
@@ -1197,9 +1325,10 @@ const screens = {
                         <div style="font-size: 13px; font-weight: 600; color: white;">Dossier des médias reçus</div>
                         <span style="font-size: 11px; background: rgba(34, 197, 94, 0.15); color: var(--status-success); padding: 2px 8px; border-radius: var(--radius-full); font-weight: 600;">Automatique</span>
                     </div>
-                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 12px;">
+                    <div style="font-size: 12px; color: var(--text-muted); line-height: 1.4; margin-bottom: 8px;">
                         Vos photos, vidéos et documents reçus sont automatiquement enregistrés dans le dossier <strong>Téléchargements/NOVA</strong> pour ne jamais les perdre.
                     </div>
+                    <div style="font-size: 11px; color: var(--accent-purple-light); font-family: monospace; word-break: break-all; margin-bottom: 12px;" id="settings-media-folder-path"></div>
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
                         <div>
                             <div style="font-size: 13px; color: white;">Téléchargement automatique</div>
@@ -1334,7 +1463,15 @@ const screens = {
                 </div>
 
                 <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; margin-bottom: 12px; border: 1px solid var(--border-subtle); text-align: left;">
-                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; font-weight: 600;">Mon lien direct de profil :</div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                        <div style="font-size: 11px; color: var(--text-muted); font-weight: 600;">Mon identifiant public (Peer ID) :</div>
+                        <button class="btn-secondary" style="font-size: 10px; padding: 2px 8px;" data-action="copyOwnPeerId">Copier</button>
+                    </div>
+                    <div style="font-family: monospace; font-size: 11px; color: var(--accent-purple-light); word-break: break-all; user-select: all;" id="my-peer-id-display">${escapeHtml(state.currentUser.peerId || 'Identifiant non disponible')}</div>
+                </div>
+
+                <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; margin-bottom: 12px; border: 1px solid var(--border-subtle); text-align: left;">
+                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; font-weight: 600;">Mon lien direct d'invitation :</div>
                     <textarea id="my-bundle-output" readonly rows="2" style="width: 100%; background: none; border: none; color: var(--accent-purple-light); font-family: monospace; font-size: 11px; resize: none; outline: none; word-break: break-all;">${escapeHtml(state.currentUser.invitationUri || state.currentUser.bundleHex) || (state.currentUser.linkGenerationError ? `Échec : ${escapeHtml(state.currentUser.linkGenerationError)}` : (hasBackend ? 'Génération du lien en cours…' : 'Compte non créé.'))}</textarea>
                 </div>
                 <button class="btn-primary" style="width: 100%;" data-action="copyOwnBundle">Copier mon lien</button>
@@ -1634,6 +1771,9 @@ let conversationsPollInterval = null;
 // navigateTo() doesn't push a *new* history entry on top of the one the back action just landed
 // on — that would turn one back-press into a no-op (pop one, push one right back).
 let suppressHistoryPush = false;
+// Explicit in-memory screen stack for reliable back navigation (sub-screens -> root)
+const navStack = [];
+let lastBackPressTime = 0;
 
 async function navigateTo(screenKey) {
     closeQrCameraScanner();
@@ -1658,6 +1798,9 @@ async function navigateTo(screenKey) {
             await refreshContactsFromBackend();
         } else if (screenKey === 'contacts') {
             await refreshContactsFromBackend();
+            tauriInvoke('publish_directory_profile').catch(() => {});
+        } else if (screenKey === 'add_contact') {
+            tauriInvoke('publish_directory_profile').catch(() => {});
         } else if (screenKey === 'chat' && state.activeContact) {
             await refreshMessagesFromBackend(state.activeContact.conversationId);
             await refreshDiagnostics(state.activeContact.peerId);
@@ -1675,8 +1818,14 @@ async function navigateTo(screenKey) {
             await refreshMessagesFromBackend(state.activeContact.conversationId);
         } else if (screenKey === 'identity') {
             await refreshOwnBundleHex();
+            tauriInvoke('publish_directory_profile').catch(() => {});
         } else if (screenKey === 'settings') {
             await refreshMediaFolderPath();
+        } else if (screenKey === 'create_group') {
+            await refreshContactsFromBackend();
+            state.selectedGroupMemberIds = new Set();
+        } else if (screenKey === 'group_info' && state.activeContact) {
+            await refreshGroupMembersInfo(state.activeContact.peerId);
         } else if (screenKey === 'admin_dashboard') {
             if (state.adminState.token && !state.adminState.overview) {
                 await loadAdminOverviewReal();
@@ -1690,6 +1839,15 @@ async function navigateTo(screenKey) {
     if (screenKey === 'identity') {
         renderOwnQrCode();
     }
+
+    // On mobile webviews, dynamically injected inputs with 'autofocus' often don't trigger the virtual keyboard.
+    // Explicitly focusing after DOM injection ensures keyboard and text cursor appear reliably.
+    setTimeout(() => {
+        const autofocusInput = container.querySelector('input[autofocus]');
+        if (autofocusInput) {
+            autofocusInput.focus();
+        }
+    }, 100);
 
     // Update bottom nav & rail tabs
     document.querySelectorAll('.nav-tab, .rail-item').forEach(tab => {
@@ -1723,6 +1881,7 @@ async function navigateTo(screenKey) {
                         const chatBody = document.getElementById('chat-body');
                         const isNearBottom = chatBody ? (chatBody.scrollHeight - chatBody.scrollTop - chatBody.clientHeight < 140) : true;
                         newOnes.forEach(appendChatMessageToBody);
+                        newOnes.filter(m => m.attachmentId && !m.url).forEach(ensureAttachmentLoaded);
                         if (chatBody && isNearBottom) {
                             chatBody.scrollTo({ top: chatBody.scrollHeight, behavior: 'smooth' });
                         }
@@ -1730,7 +1889,7 @@ async function navigateTo(screenKey) {
                     const statusEl = document.getElementById('chat-header-status');
                     if (statusEl) statusEl.innerHTML = chatHeaderStatusHtml();
                 }
-            }, 2000);
+            }, 800);
         }
 
         setTimeout(() => {
@@ -1740,12 +1899,12 @@ async function navigateTo(screenKey) {
                 // Automatically dismiss keyboard when touching / scrolling message history
                 body.addEventListener('touchstart', () => {
                     const input = document.getElementById('chat-input');
-                    if (document.activeElement === input) {
+                    if (input && document.activeElement === input) {
                         input.blur();
                     }
                 }, { passive: true });
             }
-        }, 50);
+        }, 100);
     } else if (messagePollInterval) {
         clearInterval(messagePollInterval);
         messagePollInterval = null;
@@ -1761,7 +1920,7 @@ async function navigateTo(screenKey) {
                 if (state.currentScreen === 'conversations') {
                     updateConversationsListDom();
                 }
-            }, 2500);
+            }, 1500);
         }
     } else if (conversationsPollInterval) {
         clearInterval(conversationsPollInterval);
@@ -1774,26 +1933,49 @@ async function navigateTo(screenKey) {
     // handling (go back in WebView history, else close the app) had nothing to go back to and
     // closed the entire app from any screen — see the `popstate` listener below for the other
     // half of this fix.
+    // Maintain in-memory navigation stack for safe back navigation
     if (!suppressHistoryPush) {
+        if (navStack.length === 0 || navStack[navStack.length - 1] !== screenKey) {
+            navStack.push(screenKey);
+        }
         if (history.state && history.state.screen === screenKey) {
             // Re-render of the same screen (e.g. a poll refresh) — nothing to add to history.
         } else if (history.state && history.state.screen) {
             history.pushState({ screen: screenKey }, '', '#' + screenKey);
         } else {
-            // First navigation since page load: replace rather than push, so this root screen
-            // is the one single back-press away from exiting the app, not two.
+            // First navigation since page load: replace rather than push
             history.replaceState({ screen: screenKey }, '', '#' + screenKey);
         }
     }
 }
 
-// True while any modal/drawer/sheet is actually visible in the DOM — checked fresh at each
-// back-press rather than tracked via a separate counter, so it can never drift out of sync with
-// what's really on screen (e.g. an overlay closed by tapping outside it, or a "Annuler" button,
-// rather than by the back button).
+// All possible modals, overlays and drawers present across the app
+const ALL_MODAL_IDS = [
+    'qr-camera-modal',
+    'media-preview-modal',
+    'location-modal',
+    'location-action-modal',
+    'mnemonic-auth-modal',
+    'mnemonic-display-modal',
+    'image-preview-modal',
+    'edit-profile-modal',
+    'inspect-user-modal',
+    'block-contact-modal',
+    'report-modal',
+    'feedback-modal',
+    'setup-pin-modal',
+    'message-actions-modal',
+    'forward-message-modal',
+    'ephemeral-timer-modal',
+    'document-viewer-modal',
+    'video-player-modal',
+    'executable-warning-modal',
+    'incoming-call-modal',
+];
+
+// True while any modal/drawer/sheet is actually visible in the DOM
 function isAnyOverlayOpen() {
-    const modalIds = ['qr-camera-modal', 'media-preview-modal', 'location-modal', 'mnemonic-auth-modal', 'mnemonic-display-modal', 'image-preview-modal', 'edit-profile-modal', 'inspect-user-modal', 'block-contact-modal'];
-    if (modalIds.some(id => {
+    if (ALL_MODAL_IDS.some(id => {
         const el = document.getElementById(id);
         return el && el.classList.contains('show');
     })) return true;
@@ -1802,36 +1984,87 @@ function isAnyOverlayOpen() {
     return !!((drawer && drawer.classList.contains('show')) || (emojiPanel && emojiPanel.classList.contains('show')));
 }
 
-// Handles the Android hardware/gesture back button (and desktop browser back/forward, for free)
-// once there is real history to pop — see the pushState/replaceState call at the end of
-// navigateTo() above.
+// Closes any open modal/drawer/sheet cleanly
+function closeAllActiveOverlays() {
+    closeQrCameraScanner();
+    closeMediaPreviewModal();
+    closeLocationModal();
+    closeMnemonicAuthModal();
+    closeMnemonicDisplayModal();
+    closeImagePreview();
+    closeEditProfileModal();
+    closeInspectUserModal();
+    closeBlockModal();
+    closeReportModal();
+    closeFeedbackModal();
+    closeSetupPinModal();
+    closeMessageActionsModal();
+    closeForwardMessageModal();
+    closeEphemeralTimerModal();
+    closeDocumentViewer();
+    closeVideoPlayerModal();
+    closeExecutableWarningModal();
+    closePanels();
+    const incomingCallModal = document.getElementById('incoming-call-modal');
+    if (incomingCallModal && incomingCallModal.classList.contains('show')) {
+        rejectIncomingCallReal();
+    }
+}
+
+// Safely navigates backwards in the application hierarchy.
+// Returns true if the back action was consumed inside the app (modal closed or screen changed),
+// or false if the app is at the root screen and exit is requested.
+function navigateBackSafely() {
+    // 1. If any modal, sheet or drawer is open, dismiss it first
+    if (isAnyOverlayOpen()) {
+        closeAllActiveOverlays();
+        return true;
+    }
+
+    // 2. Active call in progress: prompt or hangup
+    const activeCallModal = document.getElementById('active-call-modal');
+    if (activeCallModal && activeCallModal.classList.contains('show')) {
+        hangupCall(true, 'Fin de l\'appel');
+        return true;
+    }
+
+    // 3. Sub-screens: navigate back to previous screen
+    const rootScreen = state.currentUser.peerId ? 'conversations' : 'onboarding';
+    if (state.currentScreen !== rootScreen) {
+        // Pop current screen from nav stack
+        if (navStack.length > 0 && navStack[navStack.length - 1] === state.currentScreen) {
+            navStack.pop();
+        }
+        const prevScreen = navStack.length > 0 ? navStack.pop() : rootScreen;
+        suppressHistoryPush = true;
+        navigateTo(prevScreen).finally(() => {
+            suppressHistoryPush = false;
+        });
+        return true;
+    }
+
+    // 4. Already at root screen ('conversations' or 'onboarding')
+    const now = Date.now();
+    if (now - lastBackPressTime < 2000) {
+        // Double-tap confirmed: allow app to close
+        return false;
+    }
+    lastBackPressTime = now;
+    showToastNotification('Appuyez à nouveau pour quitter NOVA');
+    return true;
+}
+
+// Bridge function invoked by Android native layer (MainActivity.kt)
+window.handleAndroidBack = function() {
+    return navigateBackSafely();
+};
+
+// Handles browser/WebView popstate events
 let handlingPopState = false;
 window.addEventListener('popstate', (event) => {
-    // A second popstate firing while the first is still being processed (a back GESTURE can
-    // sometimes fire twice in quick succession) used to race two concurrent navigateTo() calls
-    // against each other, occasionally leaving the rendered screen out of sync with
-    // history.state. Simplest safe fix: the second one is a no-op — the user just needs one more
-    // back-press, instead of risking corrupted navigation state.
     if (handlingPopState) return;
-
-    // If a modal/drawer/sheet was open, this back-press's only job is to close it — matching
-    // standard mobile app behavior (e.g. WhatsApp: one press closes the emoji picker/attachment
-    // drawer/a confirmation sheet, a *separate* second press leaves the screen), rather than
-    // closing it AND leaving the whole screen in a single press. None of these overlays push
-    // their own history entry, so the browser already popped a screen-level entry for this
-    // press — immediately pushing the current screen back restores it, so the *next* back-press
-    // still lands on the real previous screen instead of skipping past it.
     if (isAnyOverlayOpen()) {
-        closeQrCameraScanner();
-        closeMediaPreviewModal();
-        closeLocationModal();
-        closeMnemonicAuthModal();
-        closeMnemonicDisplayModal();
-        closeImagePreview();
-        closeEditProfileModal();
-        closeInspectUserModal();
-        closeBlockModal();
-        closePanels();
+        closeAllActiveOverlays();
         history.pushState({ screen: state.currentScreen }, '', '#' + state.currentScreen);
         return;
     }
@@ -2034,27 +2267,42 @@ async function logoutReal() {
     navigateTo('onboarding');
 }
 
-function openChatWith(name, handle) {
-    // `handle` is the peer's real identifier (hex Ed25519 public key) for any contact added via
-    // addContactReal — see the field comment on `state.contacts` entries. The conversation id
-    // matches nova-engine's own convention (`conv_<peer_id>`, see NovaEngine::add_contact) so
-    // that fetching this conversation's history from the backend finds the right one.
-    const contact = state.contacts.find(c => c.name === name || c.handle === handle);
-    const peerId = contact ? contact.handle : handle;
-    state.activeContact = {
-        name: contact ? contact.name : name,
-        handle: peerId,
-        peerId: peerId,
-        conversationId: 'conv_' + peerId,
-        publicKey: (contact && contact.key) || 'Non disponible',
-        safetyNumber: (contact && contact.safetyNumber) || 'Non disponible',
-        isOnline: !!(contact && contact.online),
-        p2pMode: (contact && contact.p2pMode) || 'Non connecté',
-        isBlocked: !!(contact && contact.isBlocked),
-        isTrusted: !!(contact && contact.isTrusted),
-    };
-    // Reset stale diagnostics from whatever contact was previously open — navigateTo('chat')
-    // below fetches fresh ones for this contact before rendering.
+function openChatWith(name, handle, conversationId) {
+    const isGroup = (conversationId && conversationId.startsWith('group_')) || (handle && handle.startsWith('group_'));
+    const actualConvId = conversationId || (isGroup ? (handle.startsWith('group_') ? handle : 'group_' + handle) : 'conv_' + handle);
+    const peerId = isGroup ? actualConvId.replace(/^group_/, '') : handle;
+
+    if (isGroup) {
+        state.activeContact = {
+            name: name || 'Groupe',
+            handle: peerId,
+            peerId: peerId,
+            conversationId: actualConvId,
+            isGroup: true,
+            publicKey: 'Souverain P2P',
+            safetyNumber: 'Chiffrement P2P Mesh',
+            isOnline: true,
+            p2pMode: 'Groupe Décentralisé',
+            isBlocked: false,
+            isTrusted: true,
+        };
+    } else {
+        const contact = state.contacts.find(c => c.name === name || c.handle === handle);
+        const resolvedPeerId = contact ? contact.handle : peerId;
+        state.activeContact = {
+            name: contact ? contact.name : name,
+            handle: resolvedPeerId,
+            peerId: resolvedPeerId,
+            conversationId: actualConvId,
+            isGroup: false,
+            publicKey: (contact && contact.key) || 'Non disponible',
+            safetyNumber: (contact && contact.safetyNumber) || 'Non disponible',
+            isOnline: !!(contact && contact.online),
+            p2pMode: (contact && contact.p2pMode) || 'Non connecté',
+            isBlocked: !!(contact && contact.isBlocked),
+            isTrusted: !!(contact && contact.isTrusted),
+        };
+    }
     state.currentDiagnostics = null;
 
     // 1. Clear unread notification badge on this conversation
@@ -2193,15 +2441,20 @@ function renderConversationsListHtml(query) {
     }
 
     if (filtered.length > 0) {
-        return filtered.map(c => `
-            <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
-                <div class="avatar">
-                    ${escapeHtml(c.name.charAt(0))}
-                    <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
+        return filtered.map(c => {
+            const isGroup = (c.id && c.id.startsWith('group_')) || (c.handle && c.handle.startsWith('group_'));
+            return `
+            <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-conv-id="${escapeHtml(c.id || '')}" data-action="openChat">
+                <div class="avatar" style="${isGroup ? 'background: linear-gradient(135deg, #8b5cf6, #3b82f6);' : ''}">
+                    ${isGroup ? icons.users : escapeHtml(c.name.charAt(0))}
+                    <div class="status-dot ${isGroup ? 'status-online' : (c.online ? 'status-online' : 'status-offline')}"></div>
                 </div>
                 <div class="item-content">
                     <div class="item-header">
-                        <span class="item-name" style="${c.unread > 0 ? 'font-weight: 700; color: white;' : ''}">${escapeHtml(c.name)}</span>
+                        <span class="item-name" style="${c.unread > 0 ? 'font-weight: 700; color: white;' : ''}">
+                            ${isGroup ? '<span style="color: var(--accent-purple-light); font-size: 11px; margin-right: 4px;">👥</span>' : ''}
+                            ${escapeHtml(c.name)}
+                        </span>
                         <span class="item-time" style="${c.unread > 0 ? 'color: var(--accent-purple-light); font-weight: 600;' : ''}">${escapeHtml(c.time)}</span>
                     </div>
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 2px;">
@@ -2210,15 +2463,26 @@ function renderConversationsListHtml(query) {
                     </div>
                 </div>
             </div>
-        `).join('');
+        `;
+        }).join('');
     }
 
     if (q) {
         return `
-            <div style="text-align: center; color: var(--text-muted); padding: 40px 20px;">
+            <div style="text-align: center; color: var(--text-muted); padding: 30px 16px;">
                 <div style="font-size: 14px; font-weight: 600; color: white;">Aucun échange correspondant</div>
-                <p style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">Aucune conversation ne contient « ${escapeHtml(query)} ».</p>
+                <p style="font-size: 12px; color: var(--text-muted); margin: 6px 0 16px;">Aucune conversation locale ne contient « ${escapeHtml(query)} ».</p>
+                <div style="display: flex; flex-direction: column; gap: 8px; max-width: 300px; margin: 0 auto;">
+                    <button class="btn-primary" style="font-size: 12px; padding: 10px 14px; display: flex; align-items: center; justify-content: center; gap: 6px;" data-action="fillAddContactForm" data-name="${escapeHtml(query)}" data-id="${escapeHtml(query)}">
+                        <span>🔍</span>
+                        <span>Chercher / Ajouter « ${escapeHtml(query)} »</span>
+                    </button>
+                    <button class="btn-secondary" style="font-size: 11px; padding: 8px 12px;" data-action="navigate" data-screen="contacts">
+                        Voir la liste des contacts
+                    </button>
+                </div>
             </div>
+            <div id="conversations-search-contacts-preview" style="margin-top: 10px;"></div>
         `;
     }
 
@@ -2234,12 +2498,81 @@ function renderConversationsListHtml(query) {
     `;
 }
 
+let conversationsSearchDebounceTimer = null;
+
 function filterConversationsList(query) {
     state.conversationsSearchQuery = query || '';
     const container = document.getElementById('conversations-list-container');
     if (container) {
         container.innerHTML = renderConversationsListHtml(state.conversationsSearchQuery);
     }
+
+    // Also look up contacts & directory if typing a query
+    const rawQ = (query || '').trim();
+    if (!rawQ) return;
+
+    if (conversationsSearchDebounceTimer) clearTimeout(conversationsSearchDebounceTimer);
+    conversationsSearchDebounceTimer = setTimeout(async () => {
+        const previewContainer = document.getElementById('conversations-search-contacts-preview');
+        if (!previewContainer) return;
+
+        const qLower = rawQ.toLowerCase().replace(/^@+/, '');
+        const matchingContacts = state.contacts.filter(c =>
+            !c.isBlocked &&
+            (c.name.toLowerCase().includes(qLower) || c.handle.toLowerCase().includes(qLower))
+        );
+
+        let html = '';
+        if (matchingContacts.length > 0) {
+            html += `
+                <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); margin: 10px 0 8px 4px;">CONTACTS CORRESPONDANTS (${matchingContacts.length})</div>
+                ${matchingContacts.map(c => `
+                    <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
+                        <div class="avatar">
+                            ${escapeHtml(c.name.charAt(0))}
+                            <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
+                        </div>
+                        <div class="item-content">
+                            <div class="item-name">${escapeHtml(c.name)}</div>
+                            <div class="item-sub">@${escapeHtml(c.handle)}</div>
+                        </div>
+                    </div>
+                `).join('')}
+            `;
+        }
+
+        // Search directory if backend available
+        if (hasBackend) {
+            try {
+                const dirUsers = await tauriInvoke('search_directory', { query: qLower }) || [];
+                const notContacts = dirUsers.filter(u => !state.contacts.some(c => c.handle === u.peer_id || c.peerId === u.peer_id) && u.peer_id !== state.currentUser.peerId);
+                if (notContacts.length > 0) {
+                    html += `
+                        <div style="font-size: 11px; font-weight: 600; color: var(--accent-purple-light); margin: 14px 0 8px 4px;">ANNUAIRE DE DÉCOUVERTE (${notContacts.length})</div>
+                        ${notContacts.slice(0, 5).map(u => `
+                            <div class="item-card" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); margin-bottom: 6px; padding: 10px 12px;">
+                                <div class="avatar" style="width: 36px; height: 36px; font-size: 14px;">
+                                    ${escapeHtml(u.display_name.charAt(0) || '?')}
+                                    <div class="status-dot ${u.is_online ? 'status-online' : 'status-offline'}"></div>
+                                </div>
+                                <div class="item-content" style="cursor: pointer;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">
+                                    <div class="item-name" style="font-size: 13px; font-weight: 600; color: white;">${escapeHtml(u.display_name)}</div>
+                                    <div class="item-sub" style="color: var(--accent-purple-light); font-size: 11px;">@${escapeHtml(u.username)}</div>
+                                </div>
+                                <button class="btn-primary" style="font-size: 10px; padding: 5px 10px;" data-action="addDirectUser" data-peer-id="${escapeHtml(u.peer_id)}" data-username="${escapeHtml(u.username)}" data-name="${escapeHtml(u.display_name)}" data-bundle="${escapeHtml(u.prekey_bundle_hex)}">Ajouter</button>
+                            </div>
+                        `).join('')}
+                    `;
+                }
+            } catch (err) {
+                console.warn('Conversations search directory query error:', err);
+            }
+        }
+
+        if (html && document.getElementById('conversations-search-contacts-preview')) {
+            document.getElementById('conversations-search-contacts-preview').innerHTML = html;
+        }
+    }, 200);
 }
 
 function clearConversationsSearch() {
@@ -2577,6 +2910,38 @@ function copyOwnBundle() {
         document.execCommand('copy');
     }
     alert('Lien d\'invitation sécurisé copié ! Vous pouvez l\'envoyer par SMS, WhatsApp ou tout autre moyen.');
+}
+
+function copyOwnPeerId() {
+    const peerId = state.currentUser.peerId;
+    if (!peerId) {
+        alert('Identifiant indisponible. Créez d\'abord votre compte.');
+        return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(peerId).catch(() => {});
+    }
+    alert('Votre identifiant public (Peer ID) a été copié dans le presse-papier !');
+}
+
+function fillAddContactForm(name, idOrBundle) {
+    state.prefillContact = { name: name || '', id: idOrBundle || '' };
+    navigateTo('add_contact').then(() => {
+        const nameInput = document.getElementById('add-display-name-input');
+        const bundleInput = document.getElementById('add-bundle-input');
+        if (nameInput && state.prefillContact && state.prefillContact.name) {
+            nameInput.value = state.prefillContact.name;
+        }
+        if (bundleInput && state.prefillContact && state.prefillContact.id) {
+            bundleInput.value = state.prefillContact.id;
+        }
+        if (bundleInput && bundleInput.value) {
+            bundleInput.focus();
+        } else if (nameInput) {
+            nameInput.focus();
+        }
+        state.prefillContact = null;
+    });
 }
 
 function maybeNotifyIncomingMessage(msg) {
@@ -3182,7 +3547,7 @@ async function deleteContactReal(peerId, name) {
 // Routing the value through `dataset` (a plain string property, never re-parsed as code) avoids
 // that class of bug entirely.
 function openChatWithEl(el) {
-    openChatWith(el.dataset.name || '', el.dataset.handle || '');
+    openChatWith(el.dataset.name || '', el.dataset.handle || '', el.dataset.convId || '');
 }
 
 function openImagePreviewEl(el) {
@@ -4274,7 +4639,7 @@ function formatFileSize(bytes) {
 // Sends a File's actual bytes through the real chunked media pipeline (see
 // nova_engine::NovaEngine::send_media) — split into MEDIA_CHUNK_SIZE wire packets on the Rust
 // side, stored encrypted in their own attachment table, never inline in the message text.
-async function sendFileAsStructuredMessage(file, mediaType, label, metaTextOverride, existingDataUrl) {
+async function sendFileAsStructuredMessage(file, mediaType, label, metaTextOverride, existingDataUrl, rawFileName, rawCaption) {
     if (!state.activeContact || !requireBackend()) return;
     if (file.size > MAX_MEDIA_BYTES) {
         alert(`Fichier trop volumineux (${formatFileSize(file.size)}). Limite actuelle : ${formatFileSize(MAX_MEDIA_BYTES)}.`);
@@ -4299,21 +4664,24 @@ async function sendFileAsStructuredMessage(file, mediaType, label, metaTextOverr
     const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     const metaText = metaTextOverride || sizeStr;
 
+    const actualFileName = rawFileName || file.name || label || 'file';
+    const actualCaption = (rawCaption !== undefined && rawCaption !== null) ? rawCaption : (label || actualFileName);
+
     try {
         const record = await tauriInvoke('send_media', {
             conversationId: state.activeContact.conversationId,
             recipientPeerId: state.activeContact.peerId,
             contentType: mediaType,
-            fileName: label,
+            fileName: actualFileName,
             mimeType,
             dataBase64,
-            caption: label,
+            caption: actualCaption,
         });
         const newMsg = {
             id: record.id,
             conversationId: state.activeContact.conversationId,
             type: mediaType,
-            text: label,
+            text: actualCaption,
             meta: metaText,
             // Already have the bytes locally (we just uploaded them) — no need to round-trip
             // through get_attachment_data for our own just-sent message.
@@ -4386,7 +4754,7 @@ async function confirmAndSendPendingMedia() {
     closeMediaPreviewModal();
 
     const label = caption ? `${caption} (${name})` : (mediaType === 'image' ? (name.match(/\.(mp4|webm|mov)$/i) ? '🎬 ' : '📷 ') + name : '📄 ' + name);
-    await sendFileAsStructuredMessage(file, mediaType, label, formatFileSize(size), dataUrl);
+    await sendFileAsStructuredMessage(file, mediaType, label, formatFileSize(size), dataUrl, name, caption || label);
 }
 
 async function compressImageIfNeeded(file, maxDimension = 2048, quality = 0.82) {
@@ -4798,7 +5166,8 @@ async function stopAndSendVoiceRecording() {
         return;
     }
 
-    await sendFileAsStructuredMessage(blob, 'voice', `🎤 Note vocale (${durationStr})`, durationStr);
+    const voiceFileName = `voice_${Date.now()}.webm`;
+    await sendFileAsStructuredMessage(blob, 'voice', `🎤 Note vocale (${durationStr})`, durationStr, null, voiceFileName, `🎤 Note vocale (${durationStr})`);
 }
 
 // =============================================================================
@@ -4989,11 +5358,36 @@ const processedCallSignalIds = new Set();
 
 const RTC_ICE_CONFIG = {
     iceServers: [
+        // STUN servers (Fast P2P NAT punch for Wi-Fi and open networks)
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun2.l.google.com:19302' },
         { urls: 'stun:stun.cloudflare.com:3478' },
-    ]
+        { urls: 'stun:stun.services.mozilla.com' },
+
+        // Free OpenRelay / Metered TURN servers (Traverse symmetric NATs on 4G/5G mobile carriers)
+        {
+            urls: 'turn:openrelay.metered.ca:80',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: 'turn:openrelay.metered.ca:443',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: 'turns:openrelay.metered.ca:443?transport=tcp',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        }
+    ],
+    iceCandidatePoolSize: 10
 };
 
 async function sendCallSignalToPeer(recipientPeerId, signalObj) {
@@ -5677,11 +6071,19 @@ async function sendMessage() {
     const conversationId = state.activeContact.conversationId;
 
     try {
-        const record = await tauriInvoke('send_message', {
-            conversationId,
-            recipientPeerId: state.activeContact.peerId,
-            text,
-        });
+        let record;
+        if (state.activeContact.isGroup) {
+            record = await tauriInvoke('send_group_message', {
+                groupId: state.activeContact.peerId,
+                text,
+            });
+        } else {
+            record = await tauriInvoke('send_message', {
+                conversationId,
+                recipientPeerId: state.activeContact.peerId,
+                text,
+            });
+        }
         const newMsg = {
             id: record.id,
             conversationId,
@@ -5858,6 +6260,13 @@ function scanQrCameraFrame() {
             if (navigator.vibrate) {
                 navigator.vibrate(100);
             }
+            if (detected.startsWith('nova://group-invite')) {
+                setTimeout(() => {
+                    if (confirm('Lien d\'invitation à un groupe détecté ! Souhaitez-vous rejoindre ce groupe immédiatement ?')) {
+                        addContactReal();
+                    }
+                }, 100);
+            }
             return;
         }
     }
@@ -5906,11 +6315,14 @@ function handleQrImageSelect(event) {
 
         const bundleInput = document.getElementById('add-bundle-input');
         if (bundleInput) bundleInput.value = result.data.trim();
-        // Both entry points into this image-import path (the footer button and the camera-error
-        // fallback) live inside the qr-camera-modal — a successful decode here must close that
-        // modal too (and, if the live camera was still running underneath, stop its stream),
-        // exactly like a successful live-camera scan already does in scanQrCameraFrame().
         closeQrCameraScanner();
+        if (result.data.trim().startsWith('nova://group-invite')) {
+            setTimeout(() => {
+                if (confirm('Lien d\'invitation à un groupe détecté ! Souhaitez-vous rejoindre ce groupe immédiatement ?')) {
+                    addContactReal();
+                }
+            }, 100);
+        }
     };
     img.onerror = () => alert('Impossible de charger cette image.');
     img.src = URL.createObjectURL(file);
@@ -5925,13 +6337,26 @@ async function addContactReal() {
     const displayName = (displayNameInput && displayNameInput.value.trim()) || '';
     const bundleHex = (bundleInput && bundleInput.value.trim()) || '';
 
-    if (!displayName) {
+    if (!displayName && !bundleHex.startsWith('nova://group-invite')) {
         alert('Entrez un nom pour ce contact.');
         return;
     }
     if (!bundleHex) {
         alert('Collez le lien ou code reçu de votre contact.');
         return;
+    }
+
+    if (bundleHex.startsWith('nova://group-invite')) {
+        try {
+            const group = await tauriInvoke('join_group_by_invitation', { uri: bundleHex });
+            await refreshConversationsFromBackend();
+            alert(`Vous avez rejoint le groupe "${group.name}" !`);
+            openChatWith(group.name, group.id, 'group_' + group.id);
+            return;
+        } catch (e) {
+            alert('Impossible de rejoindre le groupe — vérifiez le lien d\'invitation : ' + e);
+            return;
+        }
     }
 
     try {
@@ -5950,79 +6375,135 @@ async function addContactReal() {
 
 // --- ZERO-CONFIG DIRECTORY SEARCH & USER PROFILE INSPECTION ---
 let contactSearchDebounceTimer = null;
+let mainContactsSearchDebounceTimer = null;
+
+async function performDirectorySearch(query, isRetry) {
+    const container = document.getElementById('directory-search-results');
+    if (!container) return;
+    const rawQ = (query || '').trim();
+    const q = rawQ.replace(/^@+/, '').trim();
+    if (!q) {
+        container.innerHTML = `
+            <div style="text-align: center; color: var(--text-dim); padding: 30px 16px; font-size: 13px;">
+                <div style="font-size: 28px; margin-bottom: 8px;">🔍</div>
+                <div style="color: white; font-weight: 600; margin-bottom: 4px;">Recherche globale Zero-Config</div>
+                <div>Tapez un identifiant (ex: 8f4b2...) ou un @pseudo pour trouver et ajouter un contact instantanément.</div>
+            </div>
+        `;
+        state.directorySearchResults = [];
+        return;
+    }
+
+    container.innerHTML = `
+        <div style="text-align: center; color: var(--accent-purple-light); padding: 24px 16px; font-size: 13px;">
+            <div style="margin-bottom: 8px;">⏳</div>
+            Connexion au serveur de découverte${isRetry ? ' (démarrage en cours...)' : ''}...
+        </div>
+    `;
+
+    let results = [];
+    let searchError = null;
+    if (hasBackend) {
+        try {
+            results = await tauriInvoke('search_directory', { query: q }) || [];
+        } catch (e) {
+            searchError = e;
+            console.error('search_directory failed', e);
+        }
+    }
+    state.directorySearchResults = results;
+
+    if (results.length === 0) {
+        // If this is the first attempt, it might be a Render cold start (up to 30s).
+        // Show a warm-up message and auto-retry once after 18s.
+        if (!isRetry) {
+            container.innerHTML = `
+                <div style="text-align: center; color: var(--text-muted); padding: 24px 16px; font-size: 13px; background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
+                    <div style="font-size: 20px; margin-bottom: 8px;">🌐</div>
+                    <div style="color: white; font-weight: 600; margin-bottom: 4px;">Serveur de découverte en démarrage...</div>
+                    <div style="color: var(--text-muted); font-size: 12px; margin-bottom: 10px;">Le serveur gratuit peut prendre jusqu'à 30 secondes à se réveiller. Nouvelle tentative automatique...</div>
+                    <div style="display: flex; justify-content: center; gap: 8px;">
+                        <button class="btn-secondary" style="font-size: 11px; padding: 6px 12px;" data-action="refreshDirectoryNodes">🔄 Réessayer maintenant</button>
+                    </div>
+                </div>
+            `;
+            // Auto-retry once after 18 seconds
+            setTimeout(() => {
+                const stillSameContainer = document.getElementById('directory-search-results');
+                if (stillSameContainer) performDirectorySearch(rawQ, true);
+            }, 18000);
+        } else {
+            container.innerHTML = `
+                <div style="text-align: center; color: var(--text-muted); padding: 24px 16px; font-size: 13px; background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
+                    <div style="color: white; font-weight: 600; margin-bottom: 4px;">Aucun utilisateur trouvé sur l'annuaire</div>
+                    <div style="font-size: 12px;">Aucun pair distant ne correspond à « ${escapeHtml(rawQ)} ».</div>
+                    <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 8px;">
+                        <button class="btn-primary" style="font-size: 12px; padding: 10px;" data-action="fillAddContactForm" data-name="${escapeHtml(rawQ)}" data-id="${escapeHtml(rawQ)}">➕ Ajouter « ${escapeHtml(rawQ)} » directement comme contact</button>
+                        <button class="btn-secondary" style="font-size: 11px; padding: 6px 12px;" data-action="refreshDirectoryNodes">🔄 Rafraîchir les relais & Réessayer</button>
+                    </div>
+                </div>
+            `;
+        }
+        return;
+    }
+
+    container.innerHTML = results.map(u => {
+        const shortId = u.peer_id.slice(0, 8) + '…' + u.peer_id.slice(-6);
+        const isSelf = u.peer_id === state.currentUser.peerId;
+        const isAlreadyContact = state.contacts.some(c => c.handle === u.peer_id || c.peerId === u.peer_id);
+        return `
+            <div class="item-card" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); margin-bottom: 8px; padding: 12px 14px;">
+                <div class="avatar" style="width: 44px; height: 44px; font-size: 18px; position: relative;">
+                    ${u.avatar_data_url ? `<img src="${u.avatar_data_url}" style="width: 100%; height: 100%; object-fit: cover;">` : escapeHtml(u.display_name.charAt(0) || u.username.charAt(0) || '?')}
+                    <div class="status-dot ${u.is_online ? 'status-online' : 'status-offline'}" style="position: absolute; bottom: -2px; right: -2px;"></div>
+                </div>
+                <div class="item-content" style="cursor: pointer;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">
+                    <div class="item-name" style="font-size: 14px; font-weight: 600; color: white;">${escapeHtml(u.display_name)}</div>
+                    <div class="item-sub" style="color: var(--accent-purple-light); font-size: 12px;">@${escapeHtml(u.username)} • <span style="font-family: monospace; font-size: 10px; color: var(--text-dim);">${shortId}</span></div>
+                </div>
+                <div style="display: flex; gap: 6px;">
+                    <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">Afficher</button>
+                    ${isSelf ? `
+                        <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px; opacity: 0.6;" disabled>C'est vous</button>
+                    ` : isAlreadyContact ? `
+                        <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px; color: var(--status-success);" data-action="openChat" data-name="${escapeHtml(u.display_name)}" data-handle="${escapeHtml(u.peer_id)}">Discuter</button>
+                    ` : `
+                        <button class="btn-primary" style="font-size: 11px; padding: 6px 12px;" data-action="addDirectUser" data-peer-id="${escapeHtml(u.peer_id)}" data-username="${escapeHtml(u.username)}" data-name="${escapeHtml(u.display_name)}" data-bundle="${escapeHtml(u.prekey_bundle_hex)}">Ajouter</button>
+                    `}
+                </div>
+            </div>
+        `;
+    }).join('');
+}
 
 function handleContactDirectorySearch(query) {
     if (contactSearchDebounceTimer) clearTimeout(contactSearchDebounceTimer);
-    contactSearchDebounceTimer = setTimeout(async () => {
-        const container = document.getElementById('directory-search-results');
-        if (!container) return;
-        const q = (query || '').trim();
-        if (!q) {
-            container.innerHTML = `
-                <div style="text-align: center; color: var(--text-dim); padding: 30px 16px; font-size: 13px;">
-                    <div style="font-size: 28px; margin-bottom: 8px;">🔍</div>
-                    <div style="color: white; font-weight: 600; margin-bottom: 4px;">Recherche globale Zero-Config</div>
-                    <div>Tapez un identifiant (ex: 8f4b2...) ou un @pseudo pour trouver et ajouter un contact instantanément.</div>
-                </div>
-            `;
-            state.directorySearchResults = [];
-            return;
-        }
+    contactSearchDebounceTimer = setTimeout(() => {
+        performDirectorySearch(query);
+    }, 150);
+}
 
-        container.innerHTML = `
-            <div style="text-align: center; color: var(--accent-purple-light); padding: 24px 16px; font-size: 13px;">
-                Recherche de « ${escapeHtml(q)} » sur le serveur de découverte...
-            </div>
-        `;
+function triggerContactDirectorySearchNow() {
+    if (contactSearchDebounceTimer) clearTimeout(contactSearchDebounceTimer);
+    const input = document.getElementById('contact-search-query');
+    performDirectorySearch(input ? input.value : '');
+}
 
-        let results = [];
-        if (hasBackend) {
-            try {
-                results = await tauriInvoke('search_directory', { query: q }) || [];
-            } catch (e) {
-                console.error('search_directory failed', e);
-            }
-        }
-        state.directorySearchResults = results;
+// Called when user clicks "Chercher" or presses Enter from the contacts screen
+function triggerContactsSearchNow() {
+    const input = document.getElementById('contacts-search-input');
+    const q = input ? input.value.trim() : '';
+    filterContactsList(q);
+}
 
-        if (results.length === 0) {
-            container.innerHTML = `
-                <div style="text-align: center; color: var(--text-muted); padding: 24px 16px; font-size: 13px; background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
-                    <div style="color: white; font-weight: 600; margin-bottom: 4px;">Aucun utilisateur trouvé</div>
-                    <div>Aucun pair correspondant à « ${escapeHtml(q)} ». Vérifiez l'orthographe ou utilisez un code d'invitation ci-dessous.</div>
-                </div>
-            `;
-            return;
-        }
-
-        container.innerHTML = results.map(u => {
-            const shortId = u.peer_id.slice(0, 8) + '…' + u.peer_id.slice(-6);
-            const isSelf = u.peer_id === state.currentUser.peerId;
-            const isAlreadyContact = state.contacts.some(c => c.handle === u.peer_id || c.peerId === u.peer_id);
-            return `
-                <div class="item-card" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); margin-bottom: 8px; padding: 12px 14px;">
-                    <div class="avatar" style="width: 44px; height: 44px; font-size: 18px; position: relative;">
-                        ${u.avatar_data_url ? `<img src="${u.avatar_data_url}" style="width: 100%; height: 100%; object-fit: cover;">` : escapeHtml(u.display_name.charAt(0) || u.username.charAt(0) || '?')}
-                        <div class="status-dot ${u.is_online ? 'status-online' : 'status-offline'}" style="position: absolute; bottom: -2px; right: -2px;"></div>
-                    </div>
-                    <div class="item-content" style="cursor: pointer;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">
-                        <div class="item-name" style="font-size: 14px; font-weight: 600; color: white;">${escapeHtml(u.display_name)}</div>
-                        <div class="item-sub" style="color: var(--accent-purple-light); font-size: 12px;">@${escapeHtml(u.username)} • <span style="font-family: monospace; font-size: 10px; color: var(--text-dim);">${shortId}</span></div>
-                    </div>
-                    <div style="display: flex; gap: 6px;">
-                        <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">Afficher</button>
-                        ${isSelf ? `
-                            <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px; opacity: 0.6;" disabled>C'est vous</button>
-                        ` : isAlreadyContact ? `
-                            <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px; color: var(--status-success);" data-action="openChat" data-name="${escapeHtml(u.display_name)}" data-handle="${escapeHtml(u.peer_id)}">Discuter</button>
-                        ` : `
-                            <button class="btn-primary" style="font-size: 11px; padding: 6px 12px;" data-action="addDirectUser" data-peer-id="${escapeHtml(u.peer_id)}" data-username="${escapeHtml(u.username)}" data-name="${escapeHtml(u.display_name)}" data-bundle="${escapeHtml(u.prekey_bundle_hex)}">Ajouter</button>
-                        `}
-                    </div>
-                </div>
-            `;
-        }).join('');
-    }, 250);
+async function refreshDirectoryNodesAndSearch() {
+    if (hasBackend) {
+        try {
+            await tauriInvoke('refresh_remote_seed_nodes');
+            await tauriInvoke('publish_directory_profile');
+        } catch (_) {}
+    }
+    triggerContactDirectorySearchNow();
 }
 
 function inspectDirectoryUser(peerId) {
@@ -6126,24 +6607,125 @@ function filterContactsList(query) {
     const container = document.getElementById('contacts-list-container');
     if (!container) return;
 
-    const filtered = state.contacts.filter(c =>
+    const rawQ = (query || '').trim();
+    if (!rawQ) {
+        container.innerHTML = state.contacts.filter(c => !c.isBlocked).length > 0 ? state.contacts.filter(c => !c.isBlocked).map(c => `
+            <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
+                <div class="avatar">
+                    ${escapeHtml(c.name.charAt(0))}
+                    <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
+                </div>
+                <div class="item-content">
+                    <div class="item-name">${escapeHtml(c.name)}</div>
+                    <div class="item-sub">@${escapeHtml(c.handle)} • ${escapeHtml(c.p2pMode)}</div>
+                </div>
+            </div>
+        `).join('') : `
+            <div style="text-align: center; color: var(--text-muted); padding: 60px 24px;">
+                <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--text-dim);">
+                    ${icons.users}
+                </div>
+                <div style="font-size: 15px; font-weight: 600; color: white;">Aucun contact actif</div>
+                <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">Ajoutez un contact pour commencer à échanger en toute confidentialité.</p>
+                <button class="btn-primary" style="margin-top: 18px;" data-action="navigate" data-screen="add_contact">Ajouter un contact</button>
+            </div>
+        `;
+        return;
+    }
+
+    const q = rawQ.toLowerCase().replace(/^@+/, '');
+    const filteredLocal = state.contacts.filter(c =>
         !c.isBlocked &&
-        (c.name.toLowerCase().includes(query.toLowerCase()) ||
-        c.handle.toLowerCase().includes(query.toLowerCase()))
+        (c.name.toLowerCase().includes(q) ||
+        c.handle.toLowerCase().includes(q))
     );
 
-    container.innerHTML = filtered.length > 0 ? filtered.map(c => `
-        <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
-            <div class="avatar">
-                ${escapeHtml(c.name.charAt(0))}
-                <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
-            </div>
-            <div class="item-content">
-                <div class="item-name">${escapeHtml(c.name)}</div>
-                <div class="item-sub">@${escapeHtml(c.handle)} • ${escapeHtml(c.p2pMode)}</div>
+    let localHtml = '';
+    if (filteredLocal.length > 0) {
+        localHtml = `
+            <div style="font-size: 11px; font-weight: 600; color: var(--text-muted); margin: 6px 0 8px 4px;">VOS CONTACTS (${filteredLocal.length})</div>
+            ${filteredLocal.map(c => `
+                <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-action="openChat">
+                    <div class="avatar">
+                        ${escapeHtml(c.name.charAt(0))}
+                        <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
+                    </div>
+                    <div class="item-content">
+                        <div class="item-name">${escapeHtml(c.name)}</div>
+                        <div class="item-sub">@${escapeHtml(c.handle)} • ${escapeHtml(c.p2pMode)}</div>
+                    </div>
+                </div>
+            `).join('')}
+        `;
+    }
+
+    container.innerHTML = `
+        ${localHtml}
+        <div id="contacts-global-dir-section" style="margin-top: 16px;">
+            <div style="font-size: 11px; font-weight: 600; color: var(--accent-purple-light); margin: 6px 0 8px 4px;">ANNUAIRE GLOBAL (RELAIS DE DÉCOUVERTE)</div>
+            <div id="contacts-global-dir-results" style="padding: 12px; text-align: center; color: var(--text-dim); font-size: 12px; background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
+                Recherche de « ${escapeHtml(rawQ)} » sur l'annuaire...
             </div>
         </div>
-    `).join('') : `<div style="text-align: center; color: var(--text-dim); padding: 40px 20px; font-size: 13px;">Aucun contact ne correspond à « ${escapeHtml(query)} ».</div>`;
+    `;
+
+    if (mainContactsSearchDebounceTimer) clearTimeout(mainContactsSearchDebounceTimer);
+    mainContactsSearchDebounceTimer = setTimeout(async () => {
+        const dirResultsContainer = document.getElementById('contacts-global-dir-results');
+        if (!dirResultsContainer) return;
+        let results = [];
+        if (hasBackend) {
+            try {
+                results = await tauriInvoke('search_directory', { query: q }) || [];
+            } catch (e) {
+                console.error('search_directory in contacts failed', e);
+            }
+        }
+        if (results.length === 0) {
+            if (filteredLocal.length === 0) {
+                dirResultsContainer.innerHTML = `
+                    <div style="color: white; font-weight: 500; margin-bottom: 4px;">Aucun résultat pour « ${escapeHtml(rawQ)} »</div>
+                    <div style="color: var(--text-muted); font-size: 11px; margin-bottom: 10px;">Aucun contact local ou distant correspondant.</div>
+                    <div style="display: flex; flex-direction: column; gap: 8px; max-width: 320px; margin: 0 auto;">
+                        <button class="btn-primary" style="font-size: 11px; padding: 8px 12px;" data-action="fillAddContactForm" data-name="${escapeHtml(rawQ)}" data-id="${escapeHtml(rawQ)}">➕ Ajouter « ${escapeHtml(rawQ)} » comme contact</button>
+                        <button class="btn-secondary" style="font-size: 11px; padding: 6px 12px;" data-action="navigate" data-screen="add_contact">Aller à l'écran Ajouter un contact</button>
+                    </div>
+                `;
+            } else {
+                dirResultsContainer.innerHTML = `
+                    <div style="color: var(--text-dim); font-size: 11px;">Aucun autre utilisateur trouvé dans l'annuaire global.</div>
+                `;
+            }
+            return;
+        }
+
+        dirResultsContainer.innerHTML = results.map(u => {
+            const shortId = u.peer_id.slice(0, 8) + '…' + u.peer_id.slice(-6);
+            const isSelf = u.peer_id === state.currentUser.peerId;
+            const isAlreadyContact = state.contacts.some(c => c.handle === u.peer_id || c.peerId === u.peer_id);
+            return `
+                <div class="item-card" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); margin-bottom: 8px; padding: 10px 12px;">
+                    <div class="avatar" style="width: 40px; height: 40px; font-size: 16px; position: relative;">
+                        ${u.avatar_data_url ? `<img src="${u.avatar_data_url}" style="width: 100%; height: 100%; object-fit: cover;">` : escapeHtml(u.display_name.charAt(0) || u.username.charAt(0) || '?')}
+                        <div class="status-dot ${u.is_online ? 'status-online' : 'status-offline'}" style="position: absolute; bottom: -2px; right: -2px;"></div>
+                    </div>
+                    <div class="item-content" style="cursor: pointer;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">
+                        <div class="item-name" style="font-size: 13px; font-weight: 600; color: white;">${escapeHtml(u.display_name)}</div>
+                        <div class="item-sub" style="color: var(--accent-purple-light); font-size: 11px;">@${escapeHtml(u.username)} • <span style="font-family: monospace; font-size: 10px; color: var(--text-dim);">${shortId}</span></div>
+                    </div>
+                    <div style="display: flex; gap: 6px;">
+                        ${isSelf ? `
+                            <button class="btn-secondary" style="font-size: 10px; padding: 4px 8px; opacity: 0.6;" disabled>Moi</button>
+                        ` : isAlreadyContact ? `
+                            <button class="btn-secondary" style="font-size: 10px; padding: 4px 8px; color: var(--status-success);" data-action="openChat" data-name="${escapeHtml(u.display_name)}" data-handle="${escapeHtml(u.peer_id)}">Discuter</button>
+                        ` : `
+                            <button class="btn-primary" style="font-size: 10px; padding: 4px 10px;" data-action="addDirectUser" data-peer-id="${escapeHtml(u.peer_id)}" data-username="${escapeHtml(u.username)}" data-name="${escapeHtml(u.display_name)}" data-bundle="${escapeHtml(u.prekey_bundle_hex)}">Ajouter</button>
+                        `}
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }, 150);
 }
 
 async function handleStrictSearch(query) {
@@ -6311,3 +6893,172 @@ function updateOfflineBanner() {
 window.addEventListener('online', updateOfflineBanner);
 window.addEventListener('offline', updateOfflineBanner);
 updateOfflineBanner();
+
+// ============================================================================
+// P2P SOVEREIGN GROUP CHAT LOGIC & UI HELPERS
+// ============================================================================
+
+state.selectedGroupMemberIds = new Set();
+
+function renderGroupContactsSelectionHtml() {
+    if (!state.contacts || state.contacts.length === 0) {
+        return `
+            <div style="text-align: center; padding: 20px; color: var(--text-muted); font-size: 13px;">
+                Aucun contact enregistré.<br>
+                <span style="font-size: 11px; color: var(--text-dim);">Vous pourrez créer le groupe et inviter des contacts plus tard par lien d'invitation.</span>
+            </div>
+        `;
+    }
+
+    return state.contacts.map(c => {
+        const isSelected = state.selectedGroupMemberIds.has(c.peerId);
+        return `
+            <div class="item-card" data-action="toggleGroupMemberSelect" data-peer-id="${escapeHtml(c.peerId)}" style="cursor: pointer; padding: 10px 14px; border-bottom: 1px solid var(--border-subtle); display: flex; align-items: center; justify-content: space-between;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <div class="avatar" style="width: 34px; height: 34px; font-size: 13px;">
+                        ${escapeHtml(c.name.charAt(0))}
+                        <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
+                    </div>
+                    <div>
+                        <div style="font-size: 13px; font-weight: 600; color: white;">${escapeHtml(c.name)}</div>
+                        <div style="font-size: 10px; color: var(--text-dim); font-family: monospace;">${escapeHtml(c.peerId.slice(0, 12))}...</div>
+                    </div>
+                </div>
+                <div style="width: 20px; height: 20px; border-radius: 4px; border: 2px solid ${isSelected ? 'var(--accent-purple)' : 'var(--border-subtle)'}; background: ${isSelected ? 'var(--accent-purple)' : 'transparent'}; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px;">
+                    ${isSelected ? '✓' : ''}
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function toggleGroupMemberSelect(peerId) {
+    if (!peerId) return;
+    if (state.selectedGroupMemberIds.has(peerId)) {
+        state.selectedGroupMemberIds.delete(peerId);
+    } else {
+        state.selectedGroupMemberIds.add(peerId);
+    }
+
+    const countEl = document.getElementById('group-selected-count');
+    if (countEl) {
+        countEl.textContent = `${state.selectedGroupMemberIds.size} sélectionné(s)`;
+    }
+
+    const listEl = document.getElementById('group-contacts-selection-list');
+    if (listEl) {
+        listEl.innerHTML = renderGroupContactsSelectionHtml();
+    }
+}
+
+async function confirmCreateGroupReal() {
+    if (!requireBackend()) return;
+    const nameInput = document.getElementById('create-group-name-input');
+    const descInput = document.getElementById('create-group-desc-input');
+    const name = nameInput ? nameInput.value.trim() : '';
+    const description = descInput && descInput.value.trim() ? descInput.value.trim() : null;
+
+    if (!name) {
+        alert('Veuillez spécifier un nom pour le groupe.');
+        if (nameInput) nameInput.focus();
+        return;
+    }
+
+    const members = Array.from(state.selectedGroupMemberIds);
+
+    try {
+        const group = await tauriInvoke('create_group', {
+            name,
+            description,
+            avatarDataUrl: null,
+            members,
+        });
+
+        await refreshConversationsFromBackend();
+        openChatWith(group.name, group.id, 'group_' + group.id);
+    } catch (e) {
+        alert('Erreur lors de la création du groupe : ' + e);
+    }
+}
+
+async function refreshGroupMembersInfo(groupId) {
+    if (!hasBackend || !groupId) return;
+    const container = document.getElementById('group-members-list');
+    if (!container) return;
+
+    try {
+        const members = await tauriInvoke('get_group_members', { groupId });
+        if (!members || members.length === 0) {
+            container.innerHTML = `<div style="text-align: center; padding: 20px; color: var(--text-dim); font-size: 12px;">Aucun membre répertorié.</div>`;
+            return;
+        }
+
+        container.innerHTML = members.map(m => `
+            <div style="padding: 12px 14px; border-bottom: 1px solid var(--border-subtle); display: flex; align-items: center; justify-content: space-between;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <div class="avatar" style="width: 34px; height: 34px; font-size: 13px;">
+                        ${escapeHtml(m.display_name.charAt(0))}
+                        <div class="status-dot ${m.is_online ? 'status-online' : 'status-offline'}"></div>
+                    </div>
+                    <div>
+                        <div style="font-size: 13px; font-weight: 600; color: white; display: flex; align-items: center; gap: 6px;">
+                            ${escapeHtml(m.display_name)}
+                            ${m.peer_id === state.currentUser.peerId ? '<span style="font-size: 10px; background: rgba(139, 92, 246, 0.2); color: var(--accent-purple-light); padding: 1px 6px; border-radius: 4px;">Vous</span>' : ''}
+                        </div>
+                        <div style="font-size: 10px; color: var(--text-dim); font-family: monospace;">${escapeHtml(m.peer_id.slice(0, 12))}...</div>
+                    </div>
+                </div>
+                <div>
+                    <span style="font-size: 11px; font-weight: 600; color: ${m.role === 'owner' ? '#f59e0b' : (m.role === 'admin' ? 'var(--accent-purple-light)' : 'var(--text-muted)')}; text-transform: uppercase;">
+                        ${escapeHtml(m.role)}
+                    </span>
+                </div>
+            </div>
+        `).join('');
+    } catch (e) {
+        container.innerHTML = `<div style="text-align: center; padding: 20px; color: var(--status-danger); font-size: 12px;">Échec chargement membres: ${escapeHtml(String(e))}</div>`;
+    }
+}
+
+async function shareGroupInvitation() {
+    if (!state.activeContact || !state.activeContact.isGroup || !requireBackend()) return;
+    try {
+        const uri = await tauriInvoke('create_group_invitation', {
+            groupId: state.activeContact.peerId,
+            ttlSeconds: 86400 * 7, // 7 days
+        });
+
+        if (navigator.share) {
+            try {
+                await navigator.share({
+                    title: `Invitation au groupe ${state.activeContact.name}`,
+                    text: `Rejoignez notre groupe sécurisé "${state.activeContact.name}" sur NOVA Chat via ce lien pair-à-pair :\n${uri}`,
+                });
+                return;
+            } catch (err) {}
+        }
+
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(uri);
+        }
+        alert(`Lien d'invitation au groupe copié dans le presse-papiers !\n\n${uri}`);
+    } catch (e) {
+        alert('Erreur lors de la génération de l\'invitation : ' + e);
+    }
+}
+
+async function confirmLeaveGroupReal() {
+    if (!state.activeContact || !state.activeContact.isGroup || !requireBackend()) return;
+    if (!confirm(`Êtes-vous sûr de vouloir quitter le groupe "${state.activeContact.name}" ? Vous ne recevrez plus ses messages.`)) {
+        return;
+    }
+
+    try {
+        await tauriInvoke('leave_group', { groupId: state.activeContact.peerId });
+        await refreshConversationsFromBackend();
+        navigateTo('conversations');
+    } catch (e) {
+        alert('Erreur pour quitter le groupe : ' + e);
+    }
+}
+

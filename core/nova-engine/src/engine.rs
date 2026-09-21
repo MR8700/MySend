@@ -4,10 +4,13 @@ use nova_crypto::{
 };
 use nova_protocol::{
     prekey_bundle_from_bytes, prekey_bundle_to_bytes, EncryptedFrame, FrameType,
-    HandshakeInitPayload, MessagePayload, NovaPacket, ParsedInvitation,
+    GroupControlAction, GroupMemberInfo, GroupMessageEnvelope, GroupRole,
+    HandshakeInitPayload, MessageContentType, MessagePayload, NovaPacket, ParsedInvitation,
+    SignedGroupInvitation,
 };
 use nova_storage::{
-    ContactRecord, ConversationRecord, DbMessageStatus, MessageRecord, StorageEngine, StorageError,
+    ContactRecord, ConversationRecord, DbMessageStatus, GroupMemberRecord, GroupRecord,
+    MessageRecord, StorageEngine, StorageError,
 };
 use nova_transport::{P2PNode, PeerConnectionInfo, TransportSupervisor};
 use rand::Rng;
@@ -134,6 +137,7 @@ struct PartialMedia {
     recipient_id: String,
     timestamp_utc: i64,
     chunks: HashMap<u32, Vec<u8>>,
+    created_at: std::time::Instant,
 }
 
 pub struct NovaEngine {
@@ -236,8 +240,25 @@ impl NovaEngine {
                 if let Err(e) = announce_node.announce_presence().await {
                     debug!("announce_presence failed, will retry: {e}");
                 }
-                if let Err(e) = announce_engine.publish_directory_profile().await {
-                    debug!("publish_directory_profile failed, will retry: {e}");
+                // Publish directory profile with fast retry on failure (handles Render cold start).
+                // On free-tier PaaS hosts the server can take up to 30s to wake up;
+                // we retry up to 3 times with 12s gaps before waiting the full interval.
+                let mut dir_published = false;
+                for attempt in 0..4u32 {
+                    match announce_engine.publish_directory_profile().await {
+                        Ok(()) => { dir_published = true; break; }
+                        Err(e) => {
+                            if attempt < 3 {
+                                debug!("publish_directory_profile attempt {attempt} failed ({e}), retrying in 12s");
+                                tokio::time::sleep(Duration::from_secs(12)).await;
+                            } else {
+                                debug!("publish_directory_profile failed after 4 attempts: {e}");
+                            }
+                        }
+                    }
+                }
+                if dir_published {
+                    tracing::info!("Directory profile published successfully");
                 }
                 interval.tick().await;
             }
@@ -515,7 +536,14 @@ impl NovaEngine {
 
                     match resolved_bundle {
                         Some(b) => (b, Vec::new()),
-                        None => (bundle_from_raw_bytes(invitation_code_or_bytes)?, Vec::new()),
+                        None => {
+                            let raw_bytes = if let Ok(s) = std::str::from_utf8(invitation_code_or_bytes) {
+                                hex::decode(s.trim()).unwrap_or_else(|_| invitation_code_or_bytes.to_vec())
+                            } else {
+                                invitation_code_or_bytes.to_vec()
+                            };
+                            (bundle_from_raw_bytes(&raw_bytes)?, Vec::new())
+                        }
                     }
                 }
             },
@@ -786,6 +814,12 @@ impl NovaEngine {
             )
         };
         let now = chrono::Utc::now().timestamp();
+
+        if bytes.len() as u64 > 100 * 1024 * 1024 {
+            return Err(EngineError::Protocol(nova_protocol::ProtocolError::PacketTooLarge(
+                bytes.len(),
+            )));
+        }
 
         let sha256_checksum = {
             use sha2::{Digest, Sha256};
@@ -1090,6 +1124,24 @@ impl NovaEngine {
         // is the one initiating. Caught by the 2026-08-25 three-device mesh test: it showed real
         // `Delivered` status on the sender's outbox while the recipient's own `get_messages` on
         // its natural conversation id never found anything.
+        // Check if this is a group control action or group message
+        if payload.content_type == MessageContentType::GroupControl {
+            if let Some(text) = payload.text_content.as_ref() {
+                if let Ok(action) = serde_json::from_str::<GroupControlAction>(text) {
+                    self.handle_incoming_group_control(sender_peer_id, action)?;
+                    return Ok(ReceiveOutcome::ProcessedNoOp);
+                }
+            }
+        }
+
+        if payload.content_type == MessageContentType::GroupMessage {
+            if let Some(text) = payload.text_content.as_ref() {
+                if let Ok(env) = serde_json::from_str::<GroupMessageEnvelope>(text) {
+                    return self.handle_incoming_group_message(sender_peer_id, env).await;
+                }
+            }
+        }
+
         let conv_id = format!("conv_{sender_peer_id}");
 
         // Check if message was already persisted to avoid duplicate notifications / double unread
@@ -1109,6 +1161,44 @@ impl NovaEngine {
         conv.unread_count += 1;
         conv.last_message_text = text.clone();
         conv.last_message_time_utc = payload.timestamp_utc;
+
+        // Auto-resolve contact info if sender is not yet in contacts
+        if self.storage.get_contact(sender_peer_id).ok().flatten().is_none() {
+            let sender_id_str = sender_peer_id.to_string();
+            let network = self.network.lock().await.clone();
+            let storage = self.storage.clone();
+            tokio::spawn(async move {
+                if let Some(node) = network {
+                    if let Ok(results) = node.search_directory(&sender_id_str).await {
+                        if let Some(matching) = results.into_iter().find(|u| u.peer_id.eq_ignore_ascii_case(&sender_id_str)) {
+                            if let Ok(bundle_bytes) = hex::decode(&matching.prekey_bundle_hex) {
+                                if let Ok(bundle) = bundle_from_raw_bytes(&bundle_bytes) {
+                                    let now = chrono::Utc::now().timestamp();
+                                    let contact = nova_storage::ContactRecord {
+                                        peer_id: sender_id_str.clone(),
+                                        username: matching.username.clone(),
+                                        display_name: matching.display_name.clone(),
+                                        prekey_bundle: bundle,
+                                        safety_number: String::new(),
+                                        is_online: matching.is_online,
+                                        is_blocked: false,
+                                        is_trusted: false,
+                                        last_seen_utc: now,
+                                    };
+                                    let _ = storage.save_contact(&contact);
+                                    let conv_id = format!("conv_{sender_id_str}");
+                                    if let Ok(Some(mut c)) = storage.get_conversations().map(|cs| cs.into_iter().find(|c| c.id == conv_id)) {
+                                        c.title = matching.display_name;
+                                        let _ = storage.save_conversation(&c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         self.storage.save_conversation(&conv)?;
 
         let msg_record = MessageRecord {
@@ -1134,19 +1224,46 @@ impl NovaEngine {
         sender_peer_id: &str,
         timestamp_utc: i64,
     ) -> Result<ConversationRecord, EngineError> {
-        Ok(self
+        let existing = self
             .storage
             .get_conversations()?
             .into_iter()
-            .find(|c| c.id == conv_id)
-            .unwrap_or_else(|| ConversationRecord {
-                id: conv_id.to_string(),
-                peer_id: sender_peer_id.to_string(),
-                title: sender_peer_id.to_string(),
-                last_message_text: String::new(),
-                last_message_time_utc: timestamp_utc,
-                unread_count: 0,
-            }))
+            .find(|c| c.id == conv_id);
+
+        if let Some(conv) = existing {
+            return Ok(conv);
+        }
+
+        let contact_name = self
+            .storage
+            .get_contact(sender_peer_id)
+            .ok()
+            .flatten()
+            .map(|c| {
+                if !c.display_name.is_empty() {
+                    c.display_name
+                } else if !c.username.is_empty() {
+                    format!("@{}", c.username)
+                } else {
+                    c.peer_id
+                }
+            })
+            .unwrap_or_else(|| {
+                if sender_peer_id.len() >= 12 {
+                    format!("Pair {}...{}", &sender_peer_id[..6], &sender_peer_id[sender_peer_id.len()-4..])
+                } else {
+                    sender_peer_id.to_string()
+                }
+            });
+
+        Ok(ConversationRecord {
+            id: conv_id.to_string(),
+            peer_id: sender_peer_id.to_string(),
+            title: contact_name,
+            last_message_text: String::new(),
+            last_message_time_utc: timestamp_utc,
+            unread_count: 0,
+        })
     }
 
     /// Accumulates one media chunk into the in-memory reassembly buffer for its `message_id`,
@@ -1166,6 +1283,19 @@ impl NovaEngine {
         let key = (sender_peer_id.to_string(), payload.message_id.clone());
 
         let mut buffers = self.media_reassembly.lock().await;
+
+        // Evict expired reassemblies (older than 10 minutes)
+        let now_instant = std::time::Instant::now();
+        buffers.retain(|_, partial| now_instant.duration_since(partial.created_at).as_secs() < 600);
+
+        if let Some(ref meta) = payload.media_meta {
+            if meta.size_bytes > 100 * 1024 * 1024 {
+                return Err(EngineError::Protocol(nova_protocol::ProtocolError::PacketTooLarge(
+                    meta.size_bytes as usize,
+                )));
+            }
+        }
+
         let entry = buffers.entry(key.clone()).or_insert_with(|| PartialMedia {
             media_meta: None,
             caption: None,
@@ -1176,6 +1306,7 @@ impl NovaEngine {
             recipient_id: payload.recipient_id.clone(),
             timestamp_utc: payload.timestamp_utc,
             chunks: HashMap::new(),
+            created_at: now_instant,
         });
 
         if let Some(meta) = payload.media_meta {
@@ -1557,13 +1688,16 @@ impl NovaEngine {
             nova_protocol::SignedDirectoryEntry::sign(id, profile, now_utc)
         };
 
-        if let Err(e) = node.register_directory_entry(signed_entry).await {
-            tracing::warn!("Failed to publish directory profile to fallback server: {e}");
-        } else {
-            tracing::info!("Directory profile published to fallback server successfully");
+        match node.register_directory_entry(signed_entry).await {
+            Ok(()) => {
+                tracing::info!("Directory profile published to fallback server successfully");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Failed to publish directory profile to fallback server: {e}");
+                Err(EngineError::Transport(e))
+            }
         }
-
-        Ok(())
     }
 
     /// Searches the public fallback directory for users matching `query` (by peer_id, @username, or display name).
@@ -1572,6 +1706,485 @@ impl NovaEngine {
             return Ok(Vec::new());
         };
         Ok(node.search_directory(query).await.unwrap_or_default())
+    }
+
+    // --- P2P Sovereign Group Chat Methods ---
+
+    pub async fn create_group(
+        &self,
+        name: &str,
+        description: Option<String>,
+        avatar_data_url: Option<String>,
+        initial_member_peer_ids: Vec<String>,
+    ) -> Result<GroupRecord, EngineError> {
+        let id_lock = self.identity.lock().await;
+        let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
+        let my_peer_id = identity.public_id_hex();
+        let my_name = identity.username.clone();
+        drop(id_lock);
+
+        let group_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+
+        let group = GroupRecord {
+            id: group_id.clone(),
+            name: name.to_string(),
+            description: description.clone(),
+            avatar_data_url,
+            creator_peer_id: my_peer_id.clone(),
+            my_role: "owner".into(),
+            ephemeral_timer_sec: 0,
+            created_at_utc: now,
+            updated_at_utc: now,
+        };
+        self.storage.save_group(&group)?;
+
+        let owner_member = GroupMemberRecord {
+            group_id: group_id.clone(),
+            peer_id: my_peer_id.clone(),
+            display_name: my_name.clone(),
+            role: "owner".into(),
+            joined_at_utc: now,
+            is_online: true,
+        };
+        self.storage.save_group_member(&owner_member)?;
+
+        let mut all_members = vec![GroupMemberInfo {
+            peer_id: my_peer_id.clone(),
+            display_name: my_name.clone(),
+            role: GroupRole::Owner,
+            joined_at_utc: now,
+        }];
+
+        for peer_id in initial_member_peer_ids {
+            if peer_id == my_peer_id {
+                continue;
+            }
+            let display_name = self.storage.get_contact(&peer_id)?
+                .map(|c| c.display_name)
+                .unwrap_or_else(|| peer_id.chars().take(8).collect());
+
+            let member = GroupMemberRecord {
+                group_id: group_id.clone(),
+                peer_id: peer_id.clone(),
+                display_name: display_name.clone(),
+                role: "member".into(),
+                joined_at_utc: now,
+                is_online: false,
+            };
+            self.storage.save_group_member(&member)?;
+
+            all_members.push(GroupMemberInfo {
+                peer_id,
+                display_name,
+                role: GroupRole::Member,
+                joined_at_utc: now,
+            });
+        }
+
+        let genesis_action = GroupControlAction::Genesis {
+            group_id: group_id.clone(),
+            name: name.to_string(),
+            description,
+            members: all_members,
+        };
+        let action_json = serde_json::to_string(&genesis_action).unwrap_or_default();
+
+        let members = self.storage.get_group_members(&group_id)?;
+        for m in members {
+            if m.peer_id == my_peer_id {
+                continue;
+            }
+            let _ = self.send_raw_group_control(&m.peer_id, &action_json).await;
+        }
+
+        Ok(group)
+    }
+
+    pub fn get_groups(&self) -> Result<Vec<GroupRecord>, EngineError> {
+        Ok(self.storage.get_groups()?)
+    }
+
+    pub fn get_group(&self, group_id: &str) -> Result<Option<GroupRecord>, EngineError> {
+        Ok(self.storage.get_group(group_id)?)
+    }
+
+    pub fn get_group_members(&self, group_id: &str) -> Result<Vec<GroupMemberRecord>, EngineError> {
+        Ok(self.storage.get_group_members(group_id)?)
+    }
+
+    pub async fn create_group_invitation(
+        &self,
+        group_id: &str,
+        ttl_seconds: i64,
+    ) -> Result<String, EngineError> {
+        let id_lock = self.identity.lock().await;
+        let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
+        let bundle = self.storage.get_own_prekey_bundle(identity)?;
+
+        let group = self.storage.get_group(group_id)?
+            .ok_or_else(|| EngineError::Storage(StorageError::NotFound(group_id.into())))?;
+
+        let rendezvous = self.own_full_listen_addrs().await;
+
+        let signed_invite = SignedGroupInvitation::create(
+            identity,
+            group.id,
+            group.name,
+            group.description,
+            bundle,
+            ttl_seconds,
+            rendezvous,
+        )?;
+
+        Ok(signed_invite.to_uri()?)
+    }
+
+    pub async fn join_group_by_invitation_uri(&self, uri: &str) -> Result<GroupRecord, EngineError> {
+        let ticket = SignedGroupInvitation::from_uri(uri)?;
+        let now = chrono::Utc::now().timestamp();
+        let payload = ticket.verify(now)?;
+
+        let id_lock = self.identity.lock().await;
+        let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
+        let my_peer_id = identity.public_id_hex();
+        let my_name = identity.username.clone();
+        drop(id_lock);
+
+        let group = GroupRecord {
+            id: payload.group_id.clone(),
+            name: payload.group_name.clone(),
+            description: payload.group_description.clone(),
+            avatar_data_url: None,
+            creator_peer_id: payload.inviter_peer_id.clone(),
+            my_role: "member".into(),
+            ephemeral_timer_sec: 0,
+            created_at_utc: payload.created_at_utc,
+            updated_at_utc: now,
+        };
+        self.storage.save_group(&group)?;
+
+        let me_member = GroupMemberRecord {
+            group_id: payload.group_id.clone(),
+            peer_id: my_peer_id.clone(),
+            display_name: my_name.clone(),
+            role: "member".into(),
+            joined_at_utc: now,
+            is_online: true,
+        };
+        self.storage.save_group_member(&me_member)?;
+
+        let inviter_member = GroupMemberRecord {
+            group_id: payload.group_id.clone(),
+            peer_id: payload.inviter_peer_id.clone(),
+            display_name: payload.inviter_name.clone(),
+            role: "admin".into(),
+            joined_at_utc: payload.created_at_utc,
+            is_online: false,
+        };
+        self.storage.save_group_member(&inviter_member)?;
+
+        let member_added = GroupControlAction::MemberAdded {
+            group_id: payload.group_id.clone(),
+            new_member: GroupMemberInfo {
+                peer_id: my_peer_id,
+                display_name: my_name,
+                role: GroupRole::Member,
+                joined_at_utc: now,
+            },
+            added_by: payload.inviter_peer_id.clone(),
+        };
+        let action_json = serde_json::to_string(&member_added).unwrap_or_default();
+        let _ = self.send_raw_group_control(&payload.inviter_peer_id, &action_json).await;
+
+        Ok(group)
+    }
+
+    pub async fn send_group_message(
+        &self,
+        group_id: &str,
+        text: &str,
+    ) -> Result<MessageRecord, EngineError> {
+        let id_lock = self.identity.lock().await;
+        let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
+        let my_peer_id = identity.public_id_hex();
+        let my_name = identity.username.clone();
+        drop(id_lock);
+
+        let group = self.storage.get_group(group_id)?
+            .ok_or_else(|| EngineError::Storage(StorageError::NotFound(group_id.into())))?;
+
+        let now = chrono::Utc::now().timestamp();
+        let msg_id = Uuid::new_v4().to_string();
+        let conv_id = format!("group_{group_id}");
+
+        let envelope = GroupMessageEnvelope {
+            group_id: group_id.to_string(),
+            sender_peer_id: my_peer_id.clone(),
+            sender_name: my_name,
+            timestamp_utc: now,
+            text: text.to_string(),
+            reply_to_id: None,
+            media_meta: None,
+        };
+        let envelope_json = serde_json::to_string(&envelope).unwrap_or_default();
+
+        let local_record = MessageRecord {
+            id: msg_id.clone(),
+            conversation_id: conv_id.clone(),
+            sender_id: my_peer_id.clone(),
+            recipient_id: group_id.to_string(),
+            text_content: text.to_string(),
+            timestamp_utc: now,
+            status: DbMessageStatus::Sent,
+            is_outgoing: true,
+            content_type: MessageContentType::GroupMessage,
+            attachment: None,
+        };
+        self.storage.save_message(&local_record)?;
+
+        let mut conv = self.storage.get_conversations()?
+            .into_iter()
+            .find(|c| c.id == conv_id)
+            .unwrap_or_else(|| ConversationRecord {
+                id: conv_id.clone(),
+                peer_id: group.id.clone(),
+                title: group.name.clone(),
+                last_message_text: String::new(),
+                last_message_time_utc: now,
+                unread_count: 0,
+            });
+        conv.last_message_text = text.to_string();
+        conv.last_message_time_utc = now;
+        self.storage.save_conversation(&conv)?;
+
+        let members = self.storage.get_group_members(group_id)?;
+        for m in members {
+            if m.peer_id == my_peer_id {
+                continue;
+            }
+            let chunk_id = Uuid::new_v4().to_string();
+            let mut payload = MessagePayload::new_text(
+                chunk_id,
+                conv_id.clone(),
+                my_peer_id.clone(),
+                m.peer_id.clone(),
+                envelope_json.clone(),
+            );
+            payload.content_type = MessageContentType::GroupMessage;
+            let _ = self.encrypt_and_enqueue_payload(payload, &m.peer_id).await;
+        }
+
+        Ok(local_record)
+    }
+
+    pub async fn leave_group(&self, group_id: &str) -> Result<(), EngineError> {
+        let id_lock = self.identity.lock().await;
+        let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
+        let my_peer_id = identity.public_id_hex();
+        drop(id_lock);
+
+        let left_action = GroupControlAction::MemberLeft {
+            group_id: group_id.to_string(),
+            member_peer_id: my_peer_id.clone(),
+        };
+        let action_json = serde_json::to_string(&left_action).unwrap_or_default();
+
+        let members = self.storage.get_group_members(group_id)?;
+        for m in members {
+            if m.peer_id == my_peer_id {
+                continue;
+            }
+            let _ = self.send_raw_group_control(&m.peer_id, &action_json).await;
+        }
+
+        self.storage.delete_group(group_id)?;
+        Ok(())
+    }
+
+    async fn send_raw_group_control(&self, recipient_peer_id: &str, action_json: &str) -> Result<(), EngineError> {
+        let id_lock = self.identity.lock().await;
+        let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
+        let my_peer_id = identity.public_id_hex();
+        drop(id_lock);
+
+        let msg_id = Uuid::new_v4().to_string();
+        let conv_id = format!("conv_{recipient_peer_id}");
+        let mut payload = MessagePayload::new_text(
+            msg_id,
+            conv_id,
+            my_peer_id,
+            recipient_peer_id.to_string(),
+            action_json.to_string(),
+        );
+        payload.content_type = MessageContentType::GroupControl;
+        self.encrypt_and_enqueue_payload(payload, recipient_peer_id).await
+    }
+
+    async fn encrypt_and_enqueue_payload(&self, payload: MessagePayload, recipient_peer_id: &str) -> Result<(), EngineError> {
+        let payload_bytes = payload.to_bytes()?;
+        let (verifying_key_bytes, dh_public_bytes, sender_id) = {
+            let id_lock = self.identity.lock().await;
+            let identity = id_lock.as_ref().ok_or(EngineError::NoIdentity)?;
+            (
+                identity.verifying_key_bytes,
+                identity.dh_public_bytes,
+                identity.public_id_hex(),
+            )
+        };
+
+        let handshake_material = self
+            .ensure_session_for_send(recipient_peer_id)
+            .await?;
+
+        let mut sessions_lock = self.sessions.lock().await;
+        let session = sessions_lock
+            .get_mut(recipient_peer_id)
+            .expect("session was just established or loaded above");
+
+        let (header, ciphertext) = session.ratchet_encrypt(&payload_bytes, b"NOVA_MSG")?;
+        self.storage.save_session(recipient_peer_id, session)?;
+        drop(sessions_lock);
+
+        let frame = EncryptedFrame { header, ciphertext };
+        let (frame_type, packet_payload) = frame_to_packet_payload(
+            handshake_material.as_ref(),
+            verifying_key_bytes,
+            dh_public_bytes,
+            frame,
+        )?;
+
+        let packet = NovaPacket::new(
+            frame_type,
+            sender_id,
+            packet_payload,
+        );
+        let wire_bytes = packet.to_cbor()?;
+        let outbox_blob = wrap_chunks_for_outbox(&[wire_bytes])?;
+
+        self.storage.enqueue_outbox(
+            &payload.message_id,
+            &payload.conversation_id,
+            recipient_peer_id,
+            &outbox_blob,
+        )?;
+
+        Ok(())
+    }
+
+    fn handle_incoming_group_control(&self, sender_peer_id: &str, action: GroupControlAction) -> Result<(), EngineError> {
+        let now = chrono::Utc::now().timestamp();
+        match action {
+            GroupControlAction::Genesis { group_id, name, description, members } => {
+                let group = GroupRecord {
+                    id: group_id.clone(),
+                    name,
+                    description,
+                    avatar_data_url: None,
+                    creator_peer_id: sender_peer_id.to_string(),
+                    my_role: "member".into(),
+                    ephemeral_timer_sec: 0,
+                    created_at_utc: now,
+                    updated_at_utc: now,
+                };
+                self.storage.save_group(&group)?;
+                for m in members {
+                    let member = GroupMemberRecord {
+                        group_id: group_id.clone(),
+                        peer_id: m.peer_id,
+                        display_name: m.display_name,
+                        role: m.role.as_str().into(),
+                        joined_at_utc: m.joined_at_utc,
+                        is_online: false,
+                    };
+                    self.storage.save_group_member(&member)?;
+                }
+            }
+            GroupControlAction::MemberAdded { group_id, new_member, .. } => {
+                let member = GroupMemberRecord {
+                    group_id,
+                    peer_id: new_member.peer_id,
+                    display_name: new_member.display_name,
+                    role: new_member.role.as_str().into(),
+                    joined_at_utc: new_member.joined_at_utc,
+                    is_online: false,
+                };
+                self.storage.save_group_member(&member)?;
+            }
+            GroupControlAction::MemberLeft { group_id, member_peer_id } => {
+                self.storage.remove_group_member(&group_id, &member_peer_id)?;
+            }
+            GroupControlAction::MemberKicked { group_id, kicked_peer_id, .. } => {
+                self.storage.remove_group_member(&group_id, &kicked_peer_id)?;
+            }
+            GroupControlAction::MetadataUpdated { group_id, name, description, avatar_data_url } => {
+                if let Some(mut group) = self.storage.get_group(&group_id)? {
+                    group.name = name;
+                    group.description = description;
+                    group.avatar_data_url = avatar_data_url;
+                    group.updated_at_utc = now;
+                    self.storage.save_group(&group)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_incoming_group_message(
+        &self,
+        _sender_peer_id: &str,
+        env: GroupMessageEnvelope,
+    ) -> Result<ReceiveOutcome, EngineError> {
+        let conv_id = format!("group_{}", env.group_id);
+        let now = env.timestamp_utc;
+        let msg_id = Uuid::new_v4().to_string();
+
+        let group = self.storage.get_group(&env.group_id)?
+            .unwrap_or_else(|| GroupRecord {
+                id: env.group_id.clone(),
+                name: format!("Groupe {}", env.group_id.chars().take(6).collect::<String>()),
+                description: None,
+                avatar_data_url: None,
+                creator_peer_id: env.sender_peer_id.clone(),
+                my_role: "member".into(),
+                ephemeral_timer_sec: 0,
+                created_at_utc: now,
+                updated_at_utc: now,
+            });
+        self.storage.save_group(&group)?;
+
+        let mut conv = self.storage.get_conversations()?
+            .into_iter()
+            .find(|c| c.id == conv_id)
+            .unwrap_or_else(|| ConversationRecord {
+                id: conv_id.clone(),
+                peer_id: env.group_id.clone(),
+                title: group.name.clone(),
+                last_message_text: String::new(),
+                last_message_time_utc: now,
+                unread_count: 0,
+            });
+
+        conv.unread_count += 1;
+        conv.last_message_text = format!("{}: {}", env.sender_name, env.text);
+        conv.last_message_time_utc = now;
+        self.storage.save_conversation(&conv)?;
+
+        let msg_record = MessageRecord {
+            id: msg_id,
+            conversation_id: conv_id,
+            sender_id: env.sender_peer_id,
+            recipient_id: env.group_id,
+            text_content: env.text,
+            timestamp_utc: now,
+            status: DbMessageStatus::Delivered,
+            is_outgoing: false,
+            content_type: MessageContentType::GroupMessage,
+            attachment: None,
+        };
+        self.storage.save_message(&msg_record)?;
+
+        Ok(ReceiveOutcome::New(msg_record))
     }
 }
 
@@ -2586,4 +3199,53 @@ mod tests {
         let requeued = pending.iter().find(|i| i.message_id == sent.id).expect("message must be back in the outbox after a manual retry");
         assert_eq!(requeued.attempt_count, 0, "a manual retry must get a fresh attempt counter, not resume the old one");
     }
+
+    #[tokio::test]
+    async fn test_group_end_to_end_lifecycle() {
+        let alice = NovaEngine::new(":memory:", "alice-pass").unwrap();
+        let bob = NovaEngine::new(":memory:", "bob-pass").unwrap();
+
+        let (_alice_pub, _) = alice.create_account("alice").await.unwrap();
+        let (bob_pub, _) = bob.create_account("bob").await.unwrap();
+
+        let bob_bundle = bob.get_own_prekey_bundle_bytes().await.unwrap();
+        alice.add_contact("bob", "Bob", &bob_bundle).await.unwrap();
+
+        // Alice creates a group with Bob
+        let group = alice
+            .create_group(
+                "Nova Team",
+                Some("Development chat".to_string()),
+                None,
+                vec![bob_pub.clone()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(group.name, "Nova Team");
+
+        // Alice sends a message to the group
+        let msg = alice.send_group_message(&group.id, "Hello Nova Team!").await.unwrap();
+        assert_eq!(msg.text_content, "Hello Nova Team!");
+
+        // Alice creates an invitation URI for the group
+        let uri = alice.create_group_invitation(&group.id, 86400).await.unwrap();
+        assert!(uri.starts_with("nova://group-invite?d="));
+
+        // A third peer Charlie joins via the invitation URI
+        let charlie = NovaEngine::new(":memory:", "charlie-pass").unwrap();
+        let (_charlie_pub, _) = charlie.create_account("charlie").await.unwrap();
+
+        let joined_group = charlie.join_group_by_invitation_uri(&uri).await.unwrap();
+        assert_eq!(joined_group.id, group.id);
+        assert_eq!(joined_group.name, "Nova Team");
+
+        let charlie_members = charlie.get_group_members(&group.id).unwrap();
+        assert_eq!(charlie_members.len(), 2); // Alice + Charlie
+
+        // Charlie leaves the group
+        charlie.leave_group(&group.id).await.unwrap();
+        assert!(charlie.get_group(&group.id).unwrap().is_none());
+    }
 }
+

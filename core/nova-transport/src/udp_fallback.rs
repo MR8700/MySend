@@ -57,14 +57,11 @@ use tokio_tungstenite::tungstenite::Message;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for individual message send/receive roundtrips once connected.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-/// Matches `nova_server::service::MAX_DATAGRAM_SIZE` — signaling / profile search endpoint limit.
-const MAX_RESPONSE_SIZE: usize = 64 * 1024;
-/// Also matches `nova_server::service::MAX_DATAGRAM_SIZE`: `relay_forward` checks this up front
-/// so an oversized `RelayForward { payload, .. }` — e.g. one of `nova-engine`'s
-/// `MEDIA_CHUNK_SIZE` chunks, sized for the primary DHT/QUIC transport's ~1 MiB request ceiling,
-/// not this control-plane one — fails cleanly and immediately instead of being rejected by the
-/// server mid-flight.
-const MAX_RELAY_PAYLOAD_SIZE: usize = 15 * 1024;
+/// Matches `nova_server::service::MAX_DATAGRAM_SIZE` — signaling / profile search endpoint limit (up to 1 MiB).
+const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
+/// Matches `nova_protocol::packet::MAX_PACKET_SIZE` (900 KiB) so `MEDIA_CHUNK_SIZE` (512 KiB)
+/// media chunks (images, voice notes, files, videos) can travel over the fallback relay smoothly.
+const MAX_RELAY_PAYLOAD_SIZE: usize = 900 * 1024;
 
 /// Client for the discovery/signaling/blind-relay fallback server (`nova-server`), spoken over a
 /// WebSocket connection — see this module's doc comment for why.

@@ -14,7 +14,7 @@
 
 use nova_crypto::{DeviceIdentity, MnemonicPhrase};
 use nova_engine::{EngineError, NovaEngine};
-use nova_storage::{ConversationRecord, MessageRecord};
+use nova_storage::{ConversationRecord, GroupMemberRecord, GroupRecord, MessageRecord};
 use nova_transport::P2PNode;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -266,6 +266,11 @@ async fn search_directory(
 }
 
 #[tauri::command]
+async fn publish_directory_profile(state: State<'_, AppState>) -> Result<(), String> {
+    state.engine.publish_directory_profile().await.map_err(engine_err)
+}
+
+#[tauri::command]
 fn get_contacts(state: State<'_, AppState>) -> Result<Vec<nova_storage::ContactRecord>, String> {
     state.engine.get_contacts().map_err(engine_err)
 }
@@ -438,35 +443,39 @@ fn save_attachment_to_disk(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("nova_media_{}", message_id));
 
-    let sanitized_raw: String = raw_name
+    let (raw_stem, raw_ext) = if let Some(dot_idx) = raw_name.rfind('.') {
+        let (s, e) = raw_name.split_at(dot_idx);
+        (s, &e[1..])
+    } else {
+        (raw_name.as_str(), "")
+    };
+
+    let safe_stem: String = raw_stem
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let safe_ext: String = raw_ext
+        .chars()
+        .filter(|c| c.is_alphanumeric())
         .collect();
 
-    let stem = std::path::Path::new(&sanitized_raw)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("fichier");
-    let ext = std::path::Path::new(&sanitized_raw)
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let stem = if safe_stem.is_empty() { "fichier" } else { &safe_stem };
 
     // Standardized format: <nom>_<horodatage>.<ext>
-    let timestamped_name = if ext.is_empty() {
+    let timestamped_name = if safe_ext.is_empty() {
         format!("{}_{}", stem, now_str)
     } else {
-        format!("{}_{}.{}", stem, now_str, ext)
+        format!("{}_{}.{}", stem, now_str, safe_ext)
     };
 
     let mut target_path = nova_media_dir.join(&timestamped_name);
     let mut counter = 1;
 
     while target_path.exists() {
-        let new_name = if ext.is_empty() {
+        let new_name = if safe_ext.is_empty() {
             format!("{}_{}_{}", stem, now_str, counter)
         } else {
-            format!("{}_{}_{}.{}", stem, now_str, counter, ext)
+            format!("{}_{}_{}.{}", stem, now_str, counter, safe_ext)
         };
         target_path = nova_media_dir.join(new_name);
         counter += 1;
@@ -480,10 +489,17 @@ fn save_attachment_to_disk(
 
 #[tauri::command]
 fn open_file_with_default_app(path: String) -> Result<(), String> {
+    let file_path = std::path::Path::new(&path);
+    if !file_path.exists() {
+        return Err("Le fichier n'existe pas sur le disque.".into());
+    }
+
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &path])
+        // Avoid cmd.exe /C start to prevent arbitrary command injection.
+        // Direct invocation of explorer safely opens files with their default program.
+        std::process::Command::new("explorer")
+            .arg(&path)
             .spawn()
             .map_err(|e| format!("Impossible d'ouvrir le fichier : {e}"))?;
     }
@@ -933,6 +949,90 @@ async fn admin_update_settings(_admin_token: String, _auto_ban_threshold: usize)
     Err("Build utilisateur standard.".into())
 }
 
+#[tauri::command]
+async fn create_group(
+    state: State<'_, AppState>,
+    name: String,
+    description: Option<String>,
+    avatar_data_url: Option<String>,
+    members: Vec<String>,
+) -> Result<GroupRecord, String> {
+    state
+        .engine
+        .create_group(&name, description, avatar_data_url, members)
+        .await
+        .map_err(|e| format!("Erreur lors de la création du groupe: {e}"))
+}
+
+#[tauri::command]
+async fn get_groups(state: State<'_, AppState>) -> Result<Vec<GroupRecord>, String> {
+    state
+        .engine
+        .get_groups()
+        .map_err(|e| format!("Erreur récupération groupes: {e}"))
+}
+
+#[tauri::command]
+async fn get_group(state: State<'_, AppState>, group_id: String) -> Result<Option<GroupRecord>, String> {
+    state
+        .engine
+        .get_group(&group_id)
+        .map_err(|e| format!("Erreur récupération groupe: {e}"))
+}
+
+#[tauri::command]
+async fn get_group_members(state: State<'_, AppState>, group_id: String) -> Result<Vec<GroupMemberRecord>, String> {
+    state
+        .engine
+        .get_group_members(&group_id)
+        .map_err(|e| format!("Erreur récupération membres: {e}"))
+}
+
+#[tauri::command]
+async fn create_group_invitation(
+    state: State<'_, AppState>,
+    group_id: String,
+    ttl_seconds: Option<i64>,
+) -> Result<String, String> {
+    let ttl = ttl_seconds.unwrap_or(86400 * 7); // Default 7 days
+    state
+        .engine
+        .create_group_invitation(&group_id, ttl)
+        .await
+        .map_err(|e| format!("Erreur génération invitation groupe: {e}"))
+}
+
+#[tauri::command]
+async fn join_group_by_invitation(state: State<'_, AppState>, uri: String) -> Result<GroupRecord, String> {
+    state
+        .engine
+        .join_group_by_invitation_uri(&uri)
+        .await
+        .map_err(|e| format!("Erreur rejoindre groupe: {e}"))
+}
+
+#[tauri::command]
+async fn send_group_message(
+    state: State<'_, AppState>,
+    group_id: String,
+    text: String,
+) -> Result<MessageRecord, String> {
+    state
+        .engine
+        .send_group_message(&group_id, &text)
+        .await
+        .map_err(|e| format!("Erreur envoi message de groupe: {e}"))
+}
+
+#[tauri::command]
+async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
+    state
+        .engine
+        .leave_group(&group_id)
+        .await
+        .map_err(|e| format!("Erreur quitter groupe: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt::try_init().ok();
@@ -1040,6 +1140,7 @@ pub fn run() {
             get_fallback_server_urls,
             refresh_remote_seed_nodes,
             search_directory,
+            publish_directory_profile,
             get_user_profile,
             update_user_profile,
             get_network_status,
@@ -1050,6 +1151,14 @@ pub fn run() {
             admin_ban_user,
             admin_unban_user,
             admin_update_settings,
+            create_group,
+            get_groups,
+            get_group,
+            get_group_members,
+            create_group_invitation,
+            join_group_by_invitation,
+            send_group_message,
+            leave_group,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the NOVA Chat desktop app");

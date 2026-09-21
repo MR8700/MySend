@@ -333,3 +333,271 @@ mod tests {
         assert!(invitation.verify(now).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// SOVEREIGN P2P GROUP INVITATIONS & CONTROL STRUCTURES
+// ---------------------------------------------------------------------------
+
+const GROUP_INVITE_SIG_DOMAIN: &[u8] = b"NOVA_GROUP_INVITE_V1:";
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GroupRole {
+    Owner,
+    Admin,
+    Member,
+}
+
+impl GroupRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GroupRole::Owner => "owner",
+            GroupRole::Admin => "admin",
+            GroupRole::Member => "member",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "owner" => GroupRole::Owner,
+            "admin" => GroupRole::Admin,
+            _ => GroupRole::Member,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupInvitationPayload {
+    pub version: u32,
+    pub group_id: String,
+    pub group_name: String,
+    pub group_description: Option<String>,
+    pub inviter_peer_id: String,
+    pub inviter_name: String,
+    pub created_at_utc: i64,
+    pub expires_at_utc: i64,
+    pub inviter_bundle: PreKeyBundle,
+    pub rendezvous_addrs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedGroupInvitation {
+    #[serde(with = "serde_bytes")]
+    pub payload_cbor: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+impl SignedGroupInvitation {
+    pub fn create(
+        identity: &DeviceIdentity,
+        group_id: String,
+        group_name: String,
+        group_description: Option<String>,
+        inviter_bundle: PreKeyBundle,
+        ttl_seconds: i64,
+        rendezvous_addrs: Vec<String>,
+    ) -> Result<Self, InvitationError> {
+        let now = chrono::Utc::now().timestamp();
+        let expires_at_utc = now.saturating_add(ttl_seconds);
+
+        let payload = GroupInvitationPayload {
+            version: 1,
+            group_id,
+            group_name,
+            group_description,
+            inviter_peer_id: identity.public_id_hex(),
+            inviter_name: identity.username.clone(),
+            created_at_utc: now,
+            expires_at_utc,
+            inviter_bundle,
+            rendezvous_addrs,
+        };
+
+        let mut payload_cbor = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_cbor)
+            .map_err(|e| InvitationError::Serialization(e.to_string()))?;
+
+        let mut signed_data = Vec::with_capacity(GROUP_INVITE_SIG_DOMAIN.len() + payload_cbor.len());
+        signed_data.extend_from_slice(GROUP_INVITE_SIG_DOMAIN);
+        signed_data.extend_from_slice(&payload_cbor);
+
+        let signature = identity.sign(&signed_data).to_vec();
+
+        Ok(Self {
+            payload_cbor,
+            signature,
+        })
+    }
+
+    pub fn verify(&self, now_utc: i64) -> Result<GroupInvitationPayload, InvitationError> {
+        let payload: GroupInvitationPayload = ciborium::from_reader(self.payload_cbor.as_slice())
+            .map_err(|e| InvitationError::Serialization(e.to_string()))?;
+
+        if payload.expires_at_utc > 0 && now_utc > payload.expires_at_utc {
+            return Err(InvitationError::Expired {
+                expires_at_utc: payload.expires_at_utc,
+                now_utc,
+            });
+        }
+
+        let mut signed_data = Vec::with_capacity(GROUP_INVITE_SIG_DOMAIN.len() + self.payload_cbor.len());
+        signed_data.extend_from_slice(GROUP_INVITE_SIG_DOMAIN);
+        signed_data.extend_from_slice(&self.payload_cbor);
+
+        let sig_64: &[u8; 64] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| InvitationError::InvalidSignature("Signature length must be 64 bytes".into()))?;
+
+        verify_signature(
+            &payload.inviter_bundle.identity_ed25519_pub,
+            &signed_data,
+            sig_64,
+        )
+        .map_err(|e| InvitationError::InvalidSignature(e.to_string()))?;
+
+        Ok(payload)
+    }
+
+    pub fn to_uri(&self) -> Result<String, InvitationError> {
+        let mut ticket_cbor = Vec::new();
+        ciborium::into_writer(self, &mut ticket_cbor)
+            .map_err(|e| InvitationError::Serialization(e.to_string()))?;
+        Ok(format!("nova://group-invite?d={}", hex::encode(ticket_cbor)))
+    }
+
+    pub fn from_uri(uri: &str) -> Result<Self, InvitationError> {
+        let trimmed = uri.trim();
+        let hex_data = if let Some(stripped) = trimmed.strip_prefix("nova://group-invite?d=") {
+            stripped
+        } else if let Some(stripped) = trimmed.strip_prefix("nova://group-invite/") {
+            stripped
+        } else {
+            return Err(InvitationError::MalformedUri(
+                "Le lien doit commencer par nova://group-invite?d=".into(),
+            ));
+        };
+
+        let raw_cbor = hex::decode(hex_data)
+            .map_err(|e| InvitationError::MalformedUri(format!("Hexadécimal invalide: {e}")))?;
+
+        let invitation: Self = ciborium::from_reader(raw_cbor.as_slice())
+            .map_err(|e| InvitationError::Serialization(e.to_string()))?;
+
+        Ok(invitation)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupMemberInfo {
+    pub peer_id: String,
+    pub display_name: String,
+    pub role: GroupRole,
+    pub joined_at_utc: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GroupControlAction {
+    Genesis {
+        group_id: String,
+        name: String,
+        description: Option<String>,
+        members: Vec<GroupMemberInfo>,
+    },
+    MemberAdded {
+        group_id: String,
+        new_member: GroupMemberInfo,
+        added_by: String,
+    },
+    MemberLeft {
+        group_id: String,
+        member_peer_id: String,
+    },
+    MemberKicked {
+        group_id: String,
+        kicked_peer_id: String,
+        kicked_by: String,
+    },
+    MetadataUpdated {
+        group_id: String,
+        name: String,
+        description: Option<String>,
+        avatar_data_url: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupMessageEnvelope {
+    pub group_id: String,
+    pub sender_peer_id: String,
+    pub sender_name: String,
+    pub timestamp_utc: i64,
+    pub text: String,
+    pub reply_to_id: Option<String>,
+    pub media_meta: Option<crate::packet::MediaMetadata>,
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use nova_crypto::{generate_signed_prekey, MnemonicPhrase};
+
+    fn test_identity_and_bundle(name: &str) -> (DeviceIdentity, PreKeyBundle) {
+        let mnemonic = MnemonicPhrase::generate().unwrap();
+        let identity = DeviceIdentity::from_mnemonic(&mnemonic, name).unwrap();
+        let (_spk_sec, spk_pub) = generate_signed_prekey(&identity, 1);
+        let bundle = PreKeyBundle {
+            identity_ed25519_pub: identity.verifying_key_bytes,
+            identity_x25519_pub: identity.dh_public_bytes,
+            signed_prekey: spk_pub,
+            one_time_prekey: None,
+        };
+        (identity, bundle)
+    }
+
+    #[test]
+    fn test_signed_group_invitation_lifecycle_and_uri_roundtrip() {
+        let (alice_id, alice_bundle) = test_identity_and_bundle("alice");
+        let ttl = 86400; // 24 hours
+        let addrs = vec!["/ip4/127.0.0.1/udp/9999/quic-v1".to_string()];
+        let group_id = "test-grp-1234".to_string();
+        let group_name = "Nova Pioneers".to_string();
+
+        let inv = SignedGroupInvitation::create(
+            &alice_id,
+            group_id.clone(),
+            group_name.clone(),
+            Some("P2P Sovereign Group".to_string()),
+            alice_bundle.clone(),
+            ttl,
+            addrs.clone(),
+        )
+        .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let payload = inv.verify(now).unwrap();
+
+        assert_eq!(payload.group_id, group_id);
+        assert_eq!(payload.group_name, group_name);
+        assert_eq!(payload.inviter_peer_id, alice_id.public_id_hex());
+        assert_eq!(payload.inviter_bundle, alice_bundle);
+        assert_eq!(payload.rendezvous_addrs, addrs);
+
+        let uri = inv.to_uri().unwrap();
+        assert!(uri.starts_with("nova://group-invite?d="));
+
+        let parsed = SignedGroupInvitation::from_uri(&uri).unwrap();
+        let parsed_payload = parsed.verify(now).unwrap();
+        assert_eq!(parsed_payload.group_id, group_id);
+
+        // Tampering test
+        let mut tampered = inv.clone();
+        if let Some(b) = tampered.payload_cbor.get_mut(5) {
+            *b ^= 0xAA;
+        }
+        assert!(tampered.verify(now).is_err());
+    }
+}
+
+
