@@ -623,22 +623,15 @@ impl NovaEngine {
         };
         self.storage.save_contact(&contact)?;
 
+        // If a conversation already exists with this peer, update its title with the new display name.
+        // Do NOT create an empty ghost conversation just because a contact was added (Google Messages model).
         let conv_id = format!("conv_{peer_id}");
-        let conv = match self.storage.get_conversations()?.into_iter().find(|c| c.id == conv_id) {
-            Some(mut existing) => {
+        if let Ok(convos) = self.storage.get_conversations() {
+            if let Some(mut existing) = convos.into_iter().find(|c| c.id == conv_id) {
                 existing.title = display_name.to_string();
-                existing
+                let _ = self.storage.save_conversation(&existing);
             }
-            None => ConversationRecord {
-                id: conv_id,
-                peer_id: peer_id.clone(),
-                title: display_name.to_string(),
-                last_message_text: String::new(),
-                last_message_time_utc: now_utc,
-                unread_count: 0,
-            },
-        };
-        self.storage.save_conversation(&conv)?;
+        }
 
         // Automatically dial the friend's rendezvous/relay addresses in the background — a
         // best-effort convenience (adding the contact must still succeed even if this device is
@@ -801,6 +794,33 @@ impl NovaEngine {
             attachment: None,
         };
 
+        let mut conv = match self.storage.get_conversations()?.into_iter().find(|c| c.id == conversation_id) {
+            Some(c) => c,
+            None => {
+                let title = self.storage.get_contact(recipient_peer_id).ok().flatten()
+                    .map(|c| if !c.display_name.is_empty() { c.display_name } else { c.username })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        if recipient_peer_id.len() >= 12 {
+                            format!("Pair {}...{}", &recipient_peer_id[..6], &recipient_peer_id[recipient_peer_id.len()-4..])
+                        } else {
+                            recipient_peer_id.to_string()
+                        }
+                    });
+                ConversationRecord {
+                    id: conversation_id.to_string(),
+                    peer_id: recipient_peer_id.to_string(),
+                    title,
+                    last_message_text: text.to_string(),
+                    last_message_time_utc: now,
+                    unread_count: 0,
+                }
+            }
+        };
+        conv.last_message_text = text.to_string();
+        conv.last_message_time_utc = now;
+        self.storage.save_conversation(&conv)?;
+
         self.storage.save_message(&msg_record)?;
         let wrapped = wrap_chunks_for_outbox(&[packet_cbor])?;
         self.storage
@@ -934,7 +954,7 @@ impl NovaEngine {
             conversation_id: conversation_id.to_string(),
             sender_id,
             recipient_id: recipient_peer_id.to_string(),
-            text_content: caption,
+            text_content: caption.clone(),
             timestamp_utc: now,
             status: DbMessageStatus::Sent,
             is_outgoing: true,
@@ -945,6 +965,34 @@ impl NovaEngine {
                 size_bytes: bytes.len() as u64,
             }),
         };
+
+        let mut conv = match self.storage.get_conversations()?.into_iter().find(|c| c.id == conversation_id) {
+            Some(c) => c,
+            None => {
+                let title = self.storage.get_contact(recipient_peer_id).ok().flatten()
+                    .map(|c| if !c.display_name.is_empty() { c.display_name } else { c.username })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        if recipient_peer_id.len() >= 12 {
+                            format!("Pair {}...{}", &recipient_peer_id[..6], &recipient_peer_id[recipient_peer_id.len()-4..])
+                        } else {
+                            recipient_peer_id.to_string()
+                        }
+                    });
+                ConversationRecord {
+                    id: conversation_id.to_string(),
+                    peer_id: recipient_peer_id.to_string(),
+                    title,
+                    last_message_text: caption.clone(),
+                    last_message_time_utc: now,
+                    unread_count: 0,
+                }
+            }
+        };
+        conv.last_message_text = caption.clone();
+        conv.last_message_time_utc = now;
+        self.storage.save_conversation(&conv)?;
+
         self.storage.save_message_with_attachment(&msg_record, &sha256_checksum, &bytes)?;
 
         let wrapped = wrap_chunks_for_outbox(&packets)?;
@@ -1530,8 +1578,22 @@ impl NovaEngine {
     }
 
     /// Retrieve all conversations for the main UI screen.
+    /// Only returns conversations with actual activity (messages exchanged), matching Google Messages model.
     pub fn get_conversations(&self) -> Result<Vec<ConversationRecord>, EngineError> {
-        Ok(self.storage.get_conversations()?)
+        let list = self.storage.get_conversations()?;
+        let active = list
+            .into_iter()
+            .filter(|c| {
+                if !c.last_message_text.trim().is_empty() {
+                    return true;
+                }
+                if let Ok(msgs) = self.storage.get_messages(&c.id) {
+                    return !msgs.is_empty();
+                }
+                false
+            })
+            .collect();
+        Ok(active)
     }
 
     /// Retrieve message history for a conversation. Attachment binary data is NOT included (see

@@ -104,6 +104,9 @@ const CLICK_ACTIONS = {
     toggleCallTorch: () => toggleCallTorch(),
     hangupActiveCall: () => hangupCall(true, 'Fin de l\'appel'),
     clearConversationsSearch: () => clearConversationsSearch(),
+    clearNewChatSearch: () => clearNewChatSearch(),
+    startDirectChatFromQuery: (el) => startDirectChatFromQuery(el.dataset.query),
+    startDirectChatFromDirectoryUser: (el) => runPendingAction(el, () => startDirectChatFromDirectoryUser(el.dataset.peerId, el.dataset.username, el.dataset.name, el.dataset.bundle)),
     triggerMediaPicker: () => triggerDeviceMediaPicker(),
     triggerDocPicker: () => triggerDeviceDocPicker(),
     startVoiceRecording: () => startVoiceRecording(),
@@ -272,6 +275,7 @@ document.addEventListener('keydown', (event) => {
 
 const INPUT_HANDLERS = {
     'conversations-search-input': filterConversationsList,
+    'new-chat-search-input': filterNewChatList,
     'contacts-search-input': filterContactsList,
     'global-search-input': handleStrictSearch,
     'contact-search-query': handleContactDirectorySearch,
@@ -352,6 +356,7 @@ const state = {
     currentScreen: 'onboarding',
     networkOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
     conversationsSearchQuery: '',
+    newChatSearchQuery: '',
     appLock: {
         enabled: localStorage.getItem('nova_app_lock_enabled') === 'true',
         pinHash: localStorage.getItem('nova_app_lock_pin_hash') || '',
@@ -570,6 +575,36 @@ const screens = {
 
             <div class="scroll-list" id="conversations-list-container">
                 ${renderConversationsListHtml(state.conversationsSearchQuery)}
+            </div>
+
+            <button class="fab-start-chat" data-action="navigate" data-screen="new_chat" title="Démarrer une discussion">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path>
+                </svg>
+                <span>Démarrer une discussion</span>
+            </button>
+        </div>
+    `,
+
+    // 3b. Démarrer une nouvelle discussion (Modèle Google Messages LLC)
+    new_chat: () => `
+        <div class="screen-view">
+            <header class="app-header">
+                <button class="icon-btn" data-action="navigate" data-screen="conversations">${icons.arrowLeft}</button>
+                <div class="header-title">Nouvelle discussion</div>
+                <button class="icon-btn" data-action="navigate" data-screen="create_group" title="Nouveau groupe">${icons.users}</button>
+            </header>
+
+            <div class="search-bar-wrap" style="padding: 10px 16px 6px;">
+                <div class="search-input-box">
+                    ${icons.search}
+                    <input type="text" id="new-chat-search-input" placeholder="Saisir un nom, @pseudo ou identifiant..." value="${escapeHtml(state.newChatSearchQuery || '')}">
+                    ${state.newChatSearchQuery ? `<button style="background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 0 4px; font-size: 14px;" data-action="clearNewChatSearch">✕</button>` : ''}
+                </div>
+            </div>
+
+            <div class="scroll-list" id="new-chat-results-container" style="padding: 10px 16px 80px;">
+                ${renderNewChatResultsHtml(state.newChatSearchQuery)}
             </div>
         </div>
     `,
@@ -2493,15 +2528,282 @@ function renderConversationsListHtml(query) {
     }
 
     return `
-        <div style="text-align: center; color: var(--text-muted); padding: 60px 24px;">
-            <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--bg-surface); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; color: var(--text-dim);">
-                ${icons.chat}
+        <div class="empty-conversations-state">
+            <div class="empty-conversations-bubble">
+                <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                    <line x1="8" y1="10" x2="16" y2="10"></line>
+                    <line x1="8" y1="14" x2="12" y2="14"></line>
+                </svg>
             </div>
-            <div style="font-size: 15px; font-weight: 600; color: white;">Aucune conversation</div>
-            <p style="font-size: 13px; color: var(--text-muted); margin-top: 6px; max-width: 260px; margin-left: auto; margin-right: auto;">Ajoutez un contact pour démarrer votre première conversation.</p>
-            <button class="btn-primary" style="margin-top: 18px;" data-action="navigate" data-screen="add_contact">Ajouter un contact</button>
+            <div style="font-size: 17px; font-weight: 700; color: white; margin-bottom: 8px;">Aucune discussion</div>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 24px; max-width: 290px; line-height: 1.5;">
+                Démarrez une conversation chiffrée de bout en bout avec vos contacts ou recherchez un correspondant sur le réseau.
+            </p>
+            <button class="btn-primary" style="padding: 12px 24px; font-size: 13.5px; font-weight: 600; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border-radius: 24px; box-shadow: 0 4px 16px rgba(124, 58, 237, 0.35);" data-action="navigate" data-screen="new_chat">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path>
+                </svg>
+                <span>Démarrer une discussion</span>
+            </button>
         </div>
     `;
+}
+
+function renderNewChatResultsHtml(query) {
+    const rawQ = (query || '').trim();
+    const q = rawQ.toLowerCase().replace(/^@+/, '');
+
+    let html = '';
+
+    // Quick Action row (Google Messages LLC style)
+    if (!q) {
+        html += `
+            <div style="margin-bottom: 12px;">
+                <div class="new-chat-quick-action" data-action="navigate" data-screen="create_group">
+                    <div class="new-chat-quick-icon" style="background: rgba(139, 92, 246, 0.18); color: var(--accent-purple-light);">
+                        ${icons.users}
+                    </div>
+                    <div>
+                        <div style="font-size: 13.5px; font-weight: 600; color: white;">Nouveau groupe</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">Créer un échange chiffré à plusieurs</div>
+                    </div>
+                </div>
+                <div class="new-chat-quick-action" data-action="navigate" data-screen="add_contact">
+                    <div class="new-chat-quick-icon" style="background: rgba(56, 189, 248, 0.18); color: #38bdf8;">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="3" width="7" height="7"></rect>
+                            <rect x="14" y="3" width="7" height="7"></rect>
+                            <rect x="14" y="14" width="7" height="7"></rect>
+                            <rect x="3" y="14" width="7" height="7"></rect>
+                        </svg>
+                    </div>
+                    <div>
+                        <div style="font-size: 13.5px; font-weight: 600; color: white;">Ajouter par lien ou QR Code</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">Coller une clé d'invitation ou scanner</div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    // Direct Action if user is typing
+    if (rawQ) {
+        html += `
+            <div style="margin-bottom: 14px;">
+                <div class="new-chat-quick-action" style="border-color: rgba(139, 92, 246, 0.4); background: rgba(139, 92, 246, 0.08);" data-action="startDirectChatFromQuery" data-query="${escapeHtml(rawQ)}">
+                    <div class="new-chat-quick-icon" style="background: var(--accent-purple); color: white;">
+                        ${icons.chat}
+                    </div>
+                    <div style="flex: 1; min-width: 0;">
+                        <div style="font-size: 13.5px; font-weight: 600; color: white;">Écrire directement à</div>
+                        <div style="font-size: 12px; color: var(--accent-purple-light); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">« ${escapeHtml(rawQ)} »</div>
+                    </div>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent-purple-light)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="9 18 15 12 9 6"></polyline>
+                    </svg>
+                </div>
+            </div>
+        `;
+    }
+
+    // Local Contacts
+    let matchingContacts = state.contacts.filter(c => !c.isBlocked);
+    if (q) {
+        matchingContacts = matchingContacts.filter(c =>
+            (c.name && c.name.toLowerCase().includes(q)) ||
+            (c.handle && c.handle.toLowerCase().includes(q))
+        );
+    }
+
+    if (matchingContacts.length > 0) {
+        html += `
+            <div class="new-chat-section-header">Contacts (${matchingContacts.length})</div>
+            <div style="display: flex; flex-direction: column; gap: 4px;">
+                ${matchingContacts.map(c => `
+                    <div class="item-card" data-name="${escapeHtml(c.name)}" data-handle="${escapeHtml(c.handle)}" data-conv-id="conv_${escapeHtml(c.handle)}" data-action="openChat">
+                        <div class="avatar">
+                            ${escapeHtml(c.name.charAt(0).toUpperCase())}
+                            <div class="status-dot ${c.online ? 'status-online' : 'status-offline'}"></div>
+                        </div>
+                        <div class="item-content">
+                            <div class="item-header">
+                                <span class="item-name" style="font-size: 14px; font-weight: 600; color: white;">${escapeHtml(c.name)}</span>
+                            </div>
+                            <div class="item-sub" style="font-size: 11.5px; color: var(--text-muted);">
+                                ${escapeHtml(c.handle.length > 16 ? c.handle.slice(0, 8) + '...' + c.handle.slice(-6) : c.handle)}
+                            </div>
+                        </div>
+                        <div style="color: var(--accent-purple-light); font-size: 12px; font-weight: 600; padding: 4px 10px; background: rgba(139, 92, 246, 0.12); border-radius: 12px;">
+                            Discuter
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    } else if (!q) {
+        html += `
+            <div class="new-chat-section-header">Contacts (0)</div>
+            <div style="text-align: center; color: var(--text-muted); padding: 24px 12px; background: var(--bg-surface); border: 1px dashed var(--border-subtle); border-radius: var(--radius-md);">
+                <div style="font-size: 13px; color: white; font-weight: 600; margin-bottom: 4px;">Aucun contact enregistré</div>
+                <div style="font-size: 11.5px; color: var(--text-muted); max-width: 260px; margin: 0 auto 12px;">
+                    Tapez un @pseudo ou un identifiant ci-dessus pour chercher un utilisateur sur le réseau et lui écrire directement.
+                </div>
+                <button class="btn-secondary" style="font-size: 11px; padding: 6px 14px;" data-action="navigate" data-screen="add_contact">
+                    Ajouter un contact par invitation
+                </button>
+            </div>
+        `;
+    }
+
+    // Directory Search Results Container (populated asynchronously)
+    html += `<div id="new-chat-directory-results" style="margin-top: 14px;"></div>`;
+
+    return html;
+}
+
+let newChatSearchDebounceTimer = null;
+
+function filterNewChatList(query) {
+    state.newChatSearchQuery = query || '';
+    const container = document.getElementById('new-chat-results-container');
+    if (container) {
+        container.innerHTML = renderNewChatResultsHtml(state.newChatSearchQuery);
+    }
+
+    const rawQ = (query || '').trim();
+    if (!rawQ) return;
+
+    if (newChatSearchDebounceTimer) clearTimeout(newChatSearchDebounceTimer);
+    newChatSearchDebounceTimer = setTimeout(async () => {
+        const dirContainer = document.getElementById('new-chat-directory-results');
+        if (!dirContainer) return;
+
+        const qLower = rawQ.toLowerCase().replace(/^@+/, '');
+        if (hasBackend) {
+            try {
+                const dirUsers = await tauriInvoke('search_directory', { query: qLower }) || [];
+                state.directorySearchResults = dirUsers;
+                const notContacts = dirUsers.filter(u =>
+                    !state.contacts.some(c => c.handle === u.peer_id || c.peerId === u.peer_id) &&
+                    u.peer_id !== state.currentUser.peerId
+                );
+
+                if (notContacts.length > 0) {
+                    dirContainer.innerHTML = `
+                        <div class="new-chat-section-header">Réseau de découverte (${notContacts.length})</div>
+                        <div style="display: flex; flex-direction: column; gap: 6px;">
+                            ${notContacts.slice(0, 6).map(u => `
+                                <div class="item-card" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 10px 12px; display: flex; align-items: center; gap: 12px;">
+                                    <div class="avatar" style="width: 38px; height: 38px; font-size: 15px; border-radius: 50%;">
+                                        ${escapeHtml((u.display_name || u.username || '?').charAt(0).toUpperCase())}
+                                        <div class="status-dot ${u.is_online ? 'status-online' : 'status-offline'}"></div>
+                                    </div>
+                                    <div class="item-content" style="flex: 1; min-width: 0;">
+                                        <div class="item-name" style="font-size: 13.5px; font-weight: 600; color: white;">${escapeHtml(u.display_name || u.username)}</div>
+                                        <div class="item-sub" style="font-size: 11px; color: var(--accent-purple-light);">@${escapeHtml(u.username)}</div>
+                                    </div>
+                                    <button class="btn-primary" style="font-size: 12px; padding: 7px 14px; border-radius: 16px; display: inline-flex; align-items: center; gap: 6px;" data-action="startDirectChatFromDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}" data-username="${escapeHtml(u.username)}" data-name="${escapeHtml(u.display_name)}" data-bundle="${escapeHtml(u.prekey_bundle_hex)}">
+                                        <span>💬</span>
+                                        <span>Discuter</span>
+                                    </button>
+                                </div>
+                            `).join('')}
+                        </div>
+                    `;
+                } else {
+                    dirContainer.innerHTML = `
+                        <div style="text-align: center; color: var(--text-dim); padding: 16px 8px; font-size: 12px;">
+                            Aucun utilisateur supplémentaire trouvé sur le réseau pour « ${escapeHtml(rawQ)} ».
+                        </div>
+                    `;
+                }
+            } catch (err) {
+                console.warn('New chat directory search error:', err);
+            }
+        }
+    }, 220);
+}
+
+function clearNewChatSearch() {
+    state.newChatSearchQuery = '';
+    const input = document.getElementById('new-chat-search-input');
+    if (input) input.value = '';
+    const container = document.getElementById('new-chat-results-container');
+    if (container) {
+        container.innerHTML = renderNewChatResultsHtml('');
+    }
+}
+
+async function startDirectChatFromDirectoryUser(peerId, username, name, bundleHex) {
+    if (!requireBackend()) return;
+    try {
+        const existing = state.contacts.find(c => c.handle === peerId || c.peerId === peerId);
+        if (!existing && bundleHex) {
+            await tauriInvoke('add_contact', {
+                username: username || '',
+                displayName: name || username || 'Contact',
+                bundleHex: bundleHex
+            });
+            await refreshContactsFromBackend();
+        }
+        openChatWith(name || username || 'Contact', peerId, 'conv_' + peerId);
+    } catch (e) {
+        console.error('startDirectChatFromDirectoryUser error', e);
+        openChatWith(name || username || 'Contact', peerId, 'conv_' + peerId);
+    }
+}
+
+async function startDirectChatFromQuery(rawQ) {
+    const q = (rawQ || '').trim();
+    if (!q) return;
+
+    // 1. Check local contacts
+    const qLower = q.toLowerCase().replace(/^@+/, '');
+    const localContact = state.contacts.find(c =>
+        c.name.toLowerCase() === qLower ||
+        c.handle.toLowerCase() === qLower ||
+        (c.peerId && c.peerId.toLowerCase() === qLower)
+    );
+    if (localContact) {
+        openChatWith(localContact.name, localContact.handle, 'conv_' + localContact.handle);
+        return;
+    }
+
+    // 2. Check cached directory search results
+    if (state.directorySearchResults && state.directorySearchResults.length > 0) {
+        const dirMatch = state.directorySearchResults.find(u =>
+            u.peer_id.toLowerCase() === qLower ||
+            (u.username && u.username.toLowerCase() === qLower)
+        );
+        if (dirMatch) {
+            await startDirectChatFromDirectoryUser(dirMatch.peer_id, dirMatch.username, dirMatch.display_name, dirMatch.prekey_bundle_hex);
+            return;
+        }
+    }
+
+    // 3. Search directory live
+    if (hasBackend) {
+        try {
+            const results = await tauriInvoke('search_directory', { query: qLower }) || [];
+            if (results.length > 0) {
+                const best = results[0];
+                await startDirectChatFromDirectoryUser(best.peer_id, best.username, best.display_name, best.prekey_bundle_hex);
+                return;
+            }
+        } catch (e) {
+            console.warn('startDirectChatFromQuery directory search failed', e);
+        }
+    }
+
+    // 4. Hex peer ID
+    if (/^[0-9a-fA-F]{16,}$/.test(q)) {
+        openChatWith('Pair ' + q.slice(0, 6) + '...' + q.slice(-4), q, 'conv_' + q);
+        return;
+    }
+
+    // 5. Fallback: navigate to add_contact prefilled
+    fillAddContactForm(q, q);
 }
 
 let conversationsSearchDebounceTimer = null;
@@ -6398,7 +6700,8 @@ async function addContactReal() {
         });
         await refreshContactsFromBackend();
         await refreshConversationsFromBackend();
-        navigateTo('conversations');
+        navigateTo('contacts');
+        alert(`Le contact « ${displayName} » a bien été ajouté.`);
     } catch (e) {
         alert('Impossible d\'ajouter ce contact — vérifiez que le code a été copié en entier et sans erreur. ' + e);
     }
