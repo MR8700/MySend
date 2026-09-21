@@ -329,11 +329,25 @@ async fn send_message(
     recipient_peer_id: String,
     text: String,
 ) -> Result<MessageRecord, String> {
-    state
+    let msg = state
         .engine
         .send_message(&conversation_id, &recipient_peer_id, &text)
         .await
-        .map_err(engine_err)
+        .map_err(engine_err)?;
+
+    // Immediate outbox pump so message is delivered without waiting for interval
+    let engine = state.engine.clone();
+    tokio::spawn(async move {
+        let _ = engine.pump_outbox_once().await;
+    });
+
+    Ok(msg)
+}
+
+/// Explicitly polls and drains all pending incoming messages from the fallback relay servers.
+#[tauri::command]
+async fn drain_relay(state: State<'_, AppState>) -> Result<usize, String> {
+    state.engine.drain_incoming_from_relay().await.map_err(engine_err)
 }
 
 #[tauri::command]
@@ -351,11 +365,18 @@ async fn retry_failed_message(
     recipient_peer_id: String,
     message_id: String,
 ) -> Result<MessageRecord, String> {
-    state
+    let res = state
         .engine
         .retry_failed_message(&conversation_id, &recipient_peer_id, &message_id)
         .await
-        .map_err(engine_err)
+        .map_err(engine_err)?;
+
+    let engine = state.engine.clone();
+    tokio::spawn(async move {
+        let _ = engine.pump_outbox_once().await;
+    });
+
+    Ok(res)
 }
 
 #[tauri::command]
@@ -393,11 +414,18 @@ async fn send_media(
 ) -> Result<MessageRecord, String> {
     let content_type = parse_content_type(&content_type)?;
     let bytes = base64_decode(&data_base64).map_err(|e| format!("invalid base64 payload: {e}"))?;
-    state
+    let msg = state
         .engine
         .send_media(&conversation_id, &recipient_peer_id, content_type, file_name, mime_type, bytes, caption)
         .await
-        .map_err(engine_err)
+        .map_err(engine_err)?;
+
+    let engine = state.engine.clone();
+    tokio::spawn(async move {
+        let _ = engine.pump_outbox_once().await;
+    });
+
+    Ok(msg)
 }
 
 /// Fetches one message's attachment data on demand, base64-encoded for the frontend to turn
@@ -1120,6 +1148,7 @@ pub fn run() {
             unblock_contact,
             delete_contact,
             send_message,
+            drain_relay,
             send_media,
             get_attachment_data,
             save_attachment_to_disk,

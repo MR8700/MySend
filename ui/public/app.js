@@ -1873,6 +1873,9 @@ async function navigateTo(screenKey) {
             const conversationId = state.activeContact.conversationId;
             const peerId = state.activeContact.peerId;
             messagePollInterval = setInterval(async () => {
+                try {
+                    await tauriInvoke('drain_relay');
+                } catch (_) {}
                 const newOnes = await refreshMessagesFromBackend(conversationId);
                 await refreshDiagnostics(peerId);
                 // Only touch the DOM if this conversation is still the one open
@@ -1915,6 +1918,9 @@ async function navigateTo(screenKey) {
         if (conversationsPollInterval) clearInterval(conversationsPollInterval);
         if (hasBackend) {
             conversationsPollInterval = setInterval(async () => {
+                try {
+                    await tauriInvoke('drain_relay');
+                } catch (_) {}
                 await refreshConversationsFromBackend();
                 updateGlobalUnreadBadges();
                 if (state.currentScreen === 'conversations') {
@@ -3489,6 +3495,17 @@ function registerActivityListener() {
                 lockApp();
             }
         } else {
+            if (hasBackend) {
+                tauriInvoke('drain_relay').then(async () => {
+                    if (state.currentScreen === 'conversations') {
+                        await refreshConversationsFromBackend();
+                        updateGlobalUnreadBadges();
+                        updateConversationsListDom();
+                    } else if (state.currentScreen === 'chat' && state.activeContact) {
+                        await refreshMessagesFromBackend(state.activeContact.conversationId);
+                    }
+                }).catch(() => {});
+            }
             if (state.appLock.enabled && !state.isAppLocked) {
                 const elapsed = Date.now() - (state.wentToBackgroundAt || state.lastUserInteraction);
                 const timeoutMs = (state.appLock.timeoutMin || 0) * 60 * 1000;
@@ -3498,6 +3515,20 @@ function registerActivityListener() {
             }
         }
     });
+
+    // Global background drain and badge synchronization for non-chat/non-conversations screens
+    setInterval(async () => {
+        if (!hasBackend) return;
+        if (state.currentScreen !== 'chat' && state.currentScreen !== 'conversations') {
+            try {
+                const count = await tauriInvoke('drain_relay');
+                if (count > 0) {
+                    await refreshConversationsFromBackend();
+                    updateGlobalUnreadBadges();
+                }
+            } catch (_) {}
+        }
+    }, 3500);
 
     setInterval(() => {
         if (state.activeCall && (state.activeCall.state === 'connected' || state.activeCall.state === 'ringing')) {

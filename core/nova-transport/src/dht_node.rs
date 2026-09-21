@@ -50,11 +50,9 @@ const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(6);
 const SEND_TIMEOUT: Duration = Duration::from_secs(6);
 const PRESENCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-/// How often to poll the UDP fallback relay (if configured) for anything queued for this node —
-/// see `crate::udp_fallback`. More frequent than the DHT presence heartbeat: this is this node's
-/// only way to receive anything over that path at all (unlike the DHT/QUIC path, nothing pushes
-/// to it), so responsiveness on this path depends entirely on poll frequency.
-const UDP_FALLBACK_DRAIN_INTERVAL: Duration = Duration::from_secs(2);
+/// How often to poll the fallback relay as a secondary safety net when real-time WebSocket is idle.
+/// Real-time incoming messages are delivered via the persistent WebSocket push listener.
+const UDP_FALLBACK_DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NovaMessageRequest(Vec<u8>);
@@ -593,7 +591,11 @@ impl P2PNode {
         const ATTEMPTS: u32 = 3;
         let mut last_result = Ok(None);
         for attempt in 0..ATTEMPTS {
-            last_result = self.lookup_once(nova_peer_id).await;
+            last_result = match self.lookup_once(nova_peer_id, LOOKUP_TIMEOUT).await {
+                Ok(res) => Ok(res),
+                Err(TransportError::Timeout) => Ok(None),
+                Err(e) => Err(e),
+            };
             if matches!(last_result, Ok(Some(_))) {
                 return last_result;
             }
@@ -611,16 +613,13 @@ impl P2PNode {
                     let mut addrs = Vec::new();
                     if let (Some(local_ip), Some(local_port)) = (&endpoint.local_ip, endpoint.local_port) {
                         if let Ok(addr) = format!("/ip4/{local_ip}/udp/{local_port}/quic-v1").parse::<Multiaddr>() {
-                            addrs.push(addr);
-                        }
-                    }
-                    if endpoint.public_port != 0 && !endpoint.public_ip.is_empty() && endpoint.public_ip != "0.0.0.0" {
-                        if let Ok(addr) = format!("/ip4/{}/udp/{}/quic-v1", endpoint.public_ip, endpoint.public_port).parse::<Multiaddr>() {
-                            addrs.push(addr);
+                            if crate::dial_policy::validate_outbound_dial(&addr).is_ok() {
+                                addrs.push(addr);
+                            }
                         }
                     }
                     if !addrs.is_empty() {
-                        debug!("Resolved peer {nova_peer_id} via fallback discovery pool");
+                        debug!("Resolved peer {nova_peer_id} via fallback discovery pool (LAN reachable)");
                         return Ok(Some((libp2p_peer_id, addrs)));
                     }
                 }
@@ -630,7 +629,7 @@ impl P2PNode {
         last_result
     }
 
-    async fn lookup_once(&self, nova_peer_id: &str) -> Result<Option<ResolvedPeer>, TransportError> {
+    async fn lookup_once(&self, nova_peer_id: &str, timeout: Duration) -> Result<Option<ResolvedPeer>, TransportError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(Command::Lookup {
@@ -638,7 +637,7 @@ impl P2PNode {
                 respond: tx,
             })
             .map_err(|_| TransportError::SwarmTaskGone)?;
-        tokio::time::timeout(LOOKUP_TIMEOUT, rx)
+        tokio::time::timeout(timeout, rx)
             .await
             .map_err(|_| TransportError::Timeout)?
             .map_err(|_| TransportError::SwarmTaskGone)?
@@ -757,45 +756,49 @@ impl P2PNode {
         };
 
         if let Some((peer_id, addrs)) = found {
-            let mode = connection_mode_for(&addrs);
-            if tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, self.dial(peer_id, addrs))
-                .await
-                .is_ok()
-            {
-                let request_started = tokio::time::Instant::now();
-                let mut last_outcome = DeliveryOutcome::Rejected;
-                let mut direct_ok = true;
+            let dialable_addrs: Vec<Multiaddr> = addrs
+                .into_iter()
+                .filter(|a| crate::dial_policy::validate_outbound_dial(a).is_ok())
+                .collect();
 
-                for chunk in &chunks {
-                    let (tx, rx) = oneshot::channel();
-                    if self
-                        .command_tx
-                        .send(Command::SendRequest {
-                            peer_id,
-                            bytes: chunk.clone(),
-                            respond: tx,
-                        })
-                        .is_err()
-                    {
-                        direct_ok = false;
-                        break;
-                    }
+            if !dialable_addrs.is_empty() {
+                let mode = connection_mode_for(&dialable_addrs);
+                if let Ok(Ok(())) = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, self.dial(peer_id, dialable_addrs)).await {
+                    let request_started = tokio::time::Instant::now();
+                    let mut last_outcome = DeliveryOutcome::Rejected;
+                    let mut direct_ok = true;
 
-                    match tokio::time::timeout(SEND_TIMEOUT, rx).await {
-                        Ok(Ok(Ok(outcome))) => last_outcome = outcome,
-                        _ => {
+                    for chunk in &chunks {
+                        let (tx, rx) = oneshot::channel();
+                        if self
+                            .command_tx
+                            .send(Command::SendRequest {
+                                peer_id,
+                                bytes: chunk.clone(),
+                                respond: tx,
+                            })
+                            .is_err()
+                        {
                             direct_ok = false;
                             break;
                         }
-                    }
-                }
 
-                if direct_ok {
-                    let latency_ms = request_started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-                    self.supervisor
-                        .update_peer_state(nova_peer_id.to_string(), mode, latency_ms, String::new())
-                        .await;
-                    return Ok((mode, last_outcome));
+                        match tokio::time::timeout(SEND_TIMEOUT, rx).await {
+                            Ok(Ok(Ok(outcome))) => last_outcome = outcome,
+                            _ => {
+                                direct_ok = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if direct_ok {
+                        let latency_ms = request_started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                        self.supervisor
+                            .update_peer_state(nova_peer_id.to_string(), mode, latency_ms, String::new())
+                            .await;
+                        return Ok((mode, last_outcome));
+                    }
                 }
             }
         }

@@ -12,7 +12,7 @@ use nova_storage::{
     ContactRecord, ConversationRecord, DbMessageStatus, GroupMemberRecord, GroupRecord,
     MessageRecord, StorageEngine, StorageError,
 };
-use nova_transport::{P2PNode, PeerConnectionInfo, TransportSupervisor};
+use nova_transport::{P2PNode, PeerConnectionInfo, TransportSupervisor, UdpFallbackClient};
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -263,6 +263,49 @@ impl NovaEngine {
                 interval.tick().await;
             }
         });
+    }
+
+    /// Explicitly drains pending incoming packets from the fallback relay servers,
+    /// decodes and decrypts any received messages, updates conversations and unread counts in storage.
+    /// Returns the number of successfully ingested incoming packets.
+    pub async fn drain_incoming_from_relay(&self) -> Result<usize, EngineError> {
+        let (drain_req, urls) = {
+            let id_lock = self.identity.lock().await;
+            let id = match id_lock.as_ref() {
+                Some(i) => i,
+                None => return Ok(0),
+            };
+            let net_lock = self.network.lock().await;
+            let node = match net_lock.as_ref() {
+                Some(n) => n.clone(),
+                None => return Ok(0),
+            };
+            let now_sec = chrono::Utc::now().timestamp() as u64;
+            let req = nova_protocol::SignedDrainRequest::sign(id, now_sec);
+            let urls = node.get_fallback_server_urls().await;
+            (req, urls)
+        };
+
+        if urls.is_empty() {
+            return Ok(0);
+        }
+
+        let mut all_packets = Vec::new();
+        for url in urls {
+            let client = UdpFallbackClient::new(&url);
+            if let Ok(packets) = client.drain_incoming_signed(drain_req.clone()).await {
+                all_packets.extend(packets);
+            }
+        }
+
+        let count = all_packets.len();
+        for packet_bytes in all_packets {
+            if let Err(e) = self.receive_packet(&packet_bytes).await {
+                tracing::warn!("Failed to process packet drained from relay: {e}");
+            }
+        }
+
+        Ok(count)
     }
 
     /// Attempts to deliver every currently-queued outbox entry over the attached network node,
