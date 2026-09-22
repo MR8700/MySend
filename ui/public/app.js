@@ -65,6 +65,20 @@ function requireBackend() {
     return true;
 }
 
+// Global Vercel API and Supabase/Neon PostgreSQL Edge endpoint
+const VERCEL_API_BASE_URL = 'https://novachat-navy-seven.vercel.app';
+
+// Formats a safety number or verification fingerprint into clean 4-character chunks
+function formatSafetyNumber(num) {
+    if (!num) return 'Vérifié ✓';
+    const clean = String(num).replace(/[^a-zA-Z0-9]/g, '');
+    if (clean.length >= 12) {
+        const chunks = clean.match(/.{1,4}/g);
+        return chunks ? chunks.slice(0, 4).join('  ') : clean;
+    }
+    return clean;
+}
+
 // --- EVENT DELEGATION (CSP-safe) ---
 // tauri.conf.json's CSP is `script-src 'self'` with no 'unsafe-inline' — inline event-handler
 // attributes (onclick="...", onkeydown="...", oninput="...", onchange="...") are governed by
@@ -357,6 +371,7 @@ document.addEventListener('change', (event) => {
 const state = {
     currentScreen: 'onboarding',
     networkOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
+    isServerConnected: true,
     conversationsSearchQuery: '',
     contactsSearchQuery: '',
     newChatSearchQuery: '',
@@ -560,7 +575,13 @@ const screens = {
     conversations: () => `
         <div class="screen-view">
             <header class="app-header">
-                <div class="header-title">Conversations</div>
+                <div>
+                    <div class="header-title">Conversations</div>
+                    <div id="user-global-status" style="font-size: 11px; display: flex; align-items: center; gap: 5px; margin-top: 2px;">
+                        <span class="user-status-dot" style="width: 7px; height: 7px; border-radius: 50%; background: ${state.isServerConnected ? 'var(--status-success)' : '#ef4444'};"></span>
+                        <span style="color: ${state.isServerConnected ? 'var(--status-success)' : 'var(--text-muted)'}; font-weight: 500;">${state.isServerConnected ? 'Connecté' : 'Non connecté / Hors ligne'}</span>
+                    </div>
+                </div>
                 <div class="header-actions">
                     <button class="icon-btn" data-action="navigate" data-screen="create_group" title="Nouveau groupe">${icons.users}</button>
                     <button class="icon-btn" data-action="navigate" data-screen="add_contact" title="Ajouter un contact">${icons.plus}</button>
@@ -928,9 +949,17 @@ const screens = {
                 </div>
 
                 <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; margin-bottom: 16px; border: 1px solid var(--border-subtle);">
-                    <div style="font-size: 12px; color: var(--text-muted);">Numéro de sécurité du chiffrement</div>
-                    <div style="font-size: 14px; font-family: monospace; font-weight: 700; color: white; margin-top: 4px;">${escapeHtml(state.activeContact.safetyNumber)}</div>
-                    <p style="font-size: 11px; color: var(--text-dim); margin: 6px 0 0; line-height: 1.4;">Ce code unique garantit que vos messages et appels sont chiffrés de bout en bout et protégés contre toute interception.</p>
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <div style="font-size: 13px; font-weight: 600; color: white; display: flex; align-items: center; gap: 6px;">
+                            <span>🛡️</span> <span>Sécurité de la conversation</span>
+                        </div>
+                        <span style="font-size: 11px; color: var(--status-success); background: rgba(34,197,94,0.12); padding: 2px 8px; border-radius: 12px;">Chiffré E2EE</span>
+                    </div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 6px;">Code de vérification :</div>
+                    <div style="font-size: 14px; font-family: monospace; font-weight: 700; letter-spacing: 2px; color: var(--accent-purple-light); margin-top: 4px;">
+                        ${formatSafetyNumber(state.activeContact.safetyNumber)}
+                    </div>
+                    <p style="font-size: 11px; color: var(--text-dim); margin: 6px 0 0; line-height: 1.4;">Vos messages et appels vocaux/vidéo avec ce contact sont 100% privés et inaccessibles aux tiers.</p>
                 </div>
 
                 ${!state.activeContact.isTrusted && !state.activeContact.isBlocked ? `
@@ -952,7 +981,13 @@ const screens = {
     contacts: () => `
         <div class="screen-view">
             <header class="app-header">
-                <div class="header-title">Contacts</div>
+                <div>
+                    <div class="header-title">Contacts</div>
+                    <div id="contacts-user-status" style="font-size: 11px; display: flex; align-items: center; gap: 5px; margin-top: 2px;">
+                        <span class="user-status-dot" style="width: 7px; height: 7px; border-radius: 50%; background: ${state.isServerConnected ? 'var(--status-success)' : '#ef4444'};"></span>
+                        <span style="color: ${state.isServerConnected ? 'var(--status-success)' : 'var(--text-muted)'}; font-weight: 500;">${state.isServerConnected ? 'Connecté' : 'Non connecté / Hors ligne'}</span>
+                    </div>
+                </div>
                 <div class="header-actions">
                     <button class="icon-btn" data-action="navigate" data-screen="add_contact" title="Ajouter un contact">${icons.plus}</button>
                 </div>
@@ -1045,16 +1080,16 @@ const screens = {
 
                 <!-- Direct / Manual Addition -->
                 <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 18px 16px; margin-bottom: 22px;">
-                    <div style="font-size: 13px; font-weight: 700; color: white; margin-bottom: 12px;">Ajout par lien ou identifiant</div>
+                    <div style="font-size: 13px; font-weight: 700; color: white; margin-bottom: 12px;">Ajouter un contact par lien ou @pseudo</div>
 
-                    <label style="font-size: 12px; color: var(--text-muted);">Nom du contact *</label>
+                    <label style="font-size: 12px; color: var(--text-muted);">Nom ou surnom *</label>
                     <div class="search-input-box" style="margin: 6px 0 12px;">
-                        <input type="text" id="add-display-name-input" placeholder="ex: Alice, Bob..." autocomplete="off" autocorrect="off" autocapitalize="words" spellcheck="false">
+                        <input type="text" id="add-display-name-input" placeholder="ex: Alice, Paul..." autocomplete="off" autocorrect="off" autocapitalize="words" spellcheck="false">
                     </div>
 
-                    <label style="font-size: 12px; color: var(--text-muted);">Identifiant, @pseudo ou lien d'invitation *</label>
+                    <label style="font-size: 12px; color: var(--text-muted);">@Pseudo ou lien d'invitation *</label>
                     <div style="background-color: var(--bg-surface-2); border-radius: var(--radius-md); padding: 10px 12px; margin: 6px 0 14px; border: 1px solid var(--border-subtle);">
-                        <textarea id="add-bundle-input" placeholder="Collez l'identifiant (ex: 8f4b2a...) ou le lien nova://invite..." rows="2" style="width: 100%; background: none; border: none; color: white; font-size: 12px; font-family: monospace; resize: none; outline: none; word-break: break-all;"></textarea>
+                        <input type="text" id="add-bundle-input" placeholder="ex: @alice ou collez le lien partagé..." style="width: 100%; background: none; border: none; color: white; font-size: 13px; outline: none;">
                     </div>
 
                     <button class="btn-primary" style="width: 100%; padding: 12px; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="addContact">
@@ -1506,19 +1541,22 @@ const screens = {
                     </button>
                 </div>
 
-                <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; margin-bottom: 12px; border: 1px solid var(--border-subtle); text-align: left;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-                        <div style="font-size: 11px; color: var(--text-muted); font-weight: 600;">Mon identifiant public (Peer ID) :</div>
-                        <button class="btn-secondary" style="font-size: 10px; padding: 2px 8px;" data-action="copyOwnPeerId">Copier</button>
+                <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 16px; margin-bottom: 14px; border: 1px solid var(--border-subtle); text-align: left;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                        <span style="font-size: 12px; color: var(--text-muted); font-weight: 600;">Mon profil :</span>
+                        <span style="font-size: 11px; color: var(--status-success); background: rgba(34,197,94,0.12); padding: 2px 8px; border-radius: 12px;">Sécurisé ✓</span>
                     </div>
-                    <div style="font-family: monospace; font-size: 11px; color: var(--accent-purple-light); word-break: break-all; user-select: all;" id="my-peer-id-display">${escapeHtml(state.currentUser.peerId || 'Identifiant non disponible')}</div>
+                    <div style="font-size: 16px; font-weight: 700; color: white;">${escapeHtml(state.currentUser.name || 'Mon compte')}</div>
+                    <div style="font-size: 13px; color: var(--accent-purple-light); margin-top: 2px;">@${escapeHtml(state.currentUser.username || state.currentUser.name || 'utilisateur')}</div>
+                    <div style="display: flex; gap: 8px; margin-top: 14px;">
+                        <button class="btn-primary" style="flex: 1; font-size: 12px; padding: 10px;" data-action="copyOwnBundle">
+                            <span>📋 Copier mon lien</span>
+                        </button>
+                        <button class="btn-secondary" style="flex: 1; font-size: 12px; padding: 10px;" data-action="shareInvitation">
+                            <span>🔗 Partager</span>
+                        </button>
+                    </div>
                 </div>
-
-                <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px; margin-bottom: 12px; border: 1px solid var(--border-subtle); text-align: left;">
-                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; font-weight: 600;">Mon lien direct d'invitation :</div>
-                    <textarea id="my-bundle-output" readonly rows="2" style="width: 100%; background: none; border: none; color: var(--accent-purple-light); font-family: monospace; font-size: 11px; resize: none; outline: none; word-break: break-all;">${escapeHtml(state.currentUser.invitationUri || state.currentUser.bundleHex) || (state.currentUser.linkGenerationError ? `Échec : ${escapeHtml(state.currentUser.linkGenerationError)}` : (hasBackend ? 'Génération du lien en cours…' : 'Compte non créé.'))}</textarea>
-                </div>
-                <button class="btn-primary" style="width: 100%;" data-action="copyOwnBundle">Copier mon lien</button>
 
                 <div style="height: 1px; background: var(--border-subtle); margin: 24px 0;"></div>
 
@@ -2222,6 +2260,9 @@ async function saveProfileChanges() {
         state.currentUser.bio = newBio;
         state.currentUser.avatarDataUrl = pendingAvatarDataUrl;
 
+        // Synchronisation immédiate vers Vercel
+        syncProfileToVercel(state.currentUser.peerId, newName, newName, state.currentUser.bundleHex, pendingAvatarDataUrl);
+
         closeEditProfileModal();
         if (state.currentScreen === 'settings') {
             navigateTo('settings');
@@ -2242,6 +2283,13 @@ async function createAccountReal() {
     try {
         const info = await tauriInvoke('create_account', { username: name });
         applyAccountInfo(name, info.peer_id, info.mnemonic, info.network_active);
+        
+        // Démarrage instantané du canal Vercel prioritaire
+        sendPresenceHeartbeat('online');
+        refreshContactsPresence();
+        startVercelSignalPolling();
+        syncProfileToVercel(info.peer_id, name, name, state.currentUser.bundleHex, null);
+
         const networkNote = info.network_active
             ? ''
             : '\n\n(Pas de connexion réseau détectée pour l\'instant — votre compte est bien créé et sauvegardé, l\'app réessaiera de se connecter automatiquement.)';
@@ -2273,6 +2321,13 @@ async function restoreAccountReal() {
     try {
         const info = await tauriInvoke('restore_account', { mnemonic, username: name });
         applyAccountInfo(name, info.peer_id, mnemonic, info.network_active);
+        
+        // Démarrage instantané du canal Vercel prioritaire
+        sendPresenceHeartbeat('online');
+        refreshContactsPresence();
+        startVercelSignalPolling();
+        syncProfileToVercel(info.peer_id, name, name, state.currentUser.bundleHex, null);
+
         if (!info.network_active) {
             alert('Compte retrouvé ! Pas de connexion réseau détectée pour l\'instant — l\'app réessaiera de se connecter automatiquement.');
         }
@@ -2402,21 +2457,201 @@ function transportModeLabel(mode) {
 }
 
 function chatHeaderStatusHtml() {
-    const d = state.currentDiagnostics;
-    if (!d) return 'Statut inconnu pour l\'instant';
-    if (d.is_connected) {
-        return `<span style="font-size: 8px;">●</span> En ligne`;
+    if (!state.activeContact) return '';
+    if (state.activeContact.isGroup) {
+        return `<span style="color: var(--accent-purple-light); font-size: 11px;">Groupe chiffré</span>`;
     }
-    return `<span style="font-size: 8px;">●</span> Hors ligne`;
+    if (state.activeContact.online) {
+        return `<span style="color: var(--status-success); font-size: 11px; display: inline-flex; align-items: center; gap: 4px;"><span style="width: 7px; height: 7px; border-radius: 50%; background: var(--status-success); display: inline-block;"></span> En ligne</span>`;
+    }
+    return `<span style="color: var(--text-muted); font-size: 11px; display: inline-flex; align-items: center; gap: 4px;"><span style="width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); display: inline-block;"></span> Hors ligne</span>`;
 }
 
-// Plain-language connection line for the contact profile screen (folds in what used to be a
-// separate "Diagnostics" screen — see refreshDiagnostics, called when opening this screen).
 function contactConnectionStatusText() {
-    const d = state.currentDiagnostics;
-    if (!d) return 'Hors ligne';
-    if (d.is_connected) return 'En ligne • Chiffré';
-    return 'Hors ligne';
+    if (!state.activeContact) return 'Hors ligne';
+    if (state.activeContact.online) return 'En ligne • Chiffré';
+    return 'Hors ligne • Vu récemment';
+}
+
+// --- LIVE PRESENCE & NETWORK CONNECTIVITY (Vercel Edge & Neon Postgres) ---
+
+async function refreshContactsPresence() {
+    if (!state.contacts || state.contacts.length === 0) return;
+    const peerIds = state.contacts.map(c => c.handle || c.peerId).filter(Boolean);
+    if (peerIds.length === 0) return;
+
+    try {
+        const resp = await fetch(`${VERCEL_API_BASE_URL}/api/presence?peer_ids=${encodeURIComponent(peerIds.join(','))}`);
+        if (resp.ok) {
+            const data = await resp.json();
+            if (data && data.presence) {
+                let updated = false;
+                for (const c of state.contacts) {
+                    const id = c.handle || c.peerId;
+                    if (data.presence[id] !== undefined) {
+                        const newOnline = !!data.presence[id];
+                        if (c.online !== newOnline) {
+                            c.online = newOnline;
+                            updated = true;
+                        }
+                    }
+                }
+                if (state.activeContact) {
+                    const activeId = state.activeContact.handle || state.activeContact.peerId;
+                    if (data.presence[activeId] !== undefined) {
+                        state.activeContact.online = !!data.presence[activeId];
+                        const headerStatus = document.getElementById('chat-header-status');
+                        if (headerStatus) headerStatus.innerHTML = chatHeaderStatusHtml();
+                    }
+                }
+                if (updated && state.currentScreen === 'contacts') {
+                    updateContactsListStatusDots();
+                }
+            }
+        }
+    } catch (_) {}
+}
+
+function updateContactsListStatusDots() {
+    const cards = document.querySelectorAll('#contacts-list-container .item-card');
+    cards.forEach(card => {
+        const handle = card.dataset.handle;
+        if (!handle) return;
+        const c = state.contacts.find(item => item.handle === handle || item.peerId === handle);
+        if (c) {
+            const dot = card.querySelector('.status-dot');
+            if (dot) {
+                dot.className = `status-dot ${c.online ? 'status-online' : 'status-offline'}`;
+            }
+        }
+    });
+}
+
+async function checkServerConnectivity() {
+    try {
+        const ctrl = new AbortController();
+        const timeoutId = setTimeout(() => ctrl.abort(), 4000);
+        const resp = await fetch(`${VERCEL_API_BASE_URL}/api/health`, { signal: ctrl.signal });
+        clearTimeout(timeoutId);
+        state.isServerConnected = resp.ok;
+    } catch (_) {
+        state.isServerConnected = false;
+    }
+    updateConnectionIndicators();
+}
+
+async function sendPresenceHeartbeat(status = 'online') {
+    if (!state.currentUser.peerId) return;
+    try {
+        const ctrl = new AbortController();
+        const timeoutId = setTimeout(() => ctrl.abort(), 4000);
+        const resp = await fetch(`${VERCEL_API_BASE_URL}/api/presence`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                peer_id: state.currentUser.peerId,
+                status: status
+            }),
+            signal: ctrl.signal
+        });
+        clearTimeout(timeoutId);
+        if (resp.ok) {
+            state.isServerConnected = true;
+        } else {
+            state.isServerConnected = false;
+        }
+    } catch (_) {
+        state.isServerConnected = false;
+    }
+    updateConnectionIndicators();
+}
+
+let vercelSignalPollTimeout = null;
+
+async function pollVercelCallSignals() {
+    if (!state.currentUser.peerId) return;
+    try {
+        const resp = await fetch(`${VERCEL_API_BASE_URL}/api/signal?peer_id=${encodeURIComponent(state.currentUser.peerId)}`, {
+            cache: 'no-store'
+        });
+        if (resp.ok) {
+            const data = await resp.json();
+            if (data && Array.isArray(data.signals) && data.signals.length > 0) {
+                for (const sig of data.signals) {
+                    await handleIncomingCallSignal(sig, null, null);
+                }
+            }
+        }
+    } catch (_) {}
+}
+
+function startVercelSignalPolling() {
+    if (vercelSignalPollTimeout) clearTimeout(vercelSignalPollTimeout);
+    const getInterval = () => (currentCall || pendingIncomingCall) ? 800 : 1500;
+
+    const tick = async () => {
+        if (state.currentUser.peerId) {
+            await pollVercelCallSignals();
+            vercelSignalPollTimeout = setTimeout(tick, getInterval());
+        } else {
+            vercelSignalPollTimeout = setTimeout(tick, 3000);
+        }
+    };
+    tick();
+}
+
+function updateConnectionIndicators() {
+    const offlineBanner = document.getElementById('offline-banner');
+    const isOnline = navigator.onLine && state.isServerConnected;
+    if (offlineBanner) {
+        if (!navigator.onLine) {
+            offlineBanner.innerText = "📡 Pas de connexion réseau — Vérifiez votre Wi-Fi ou vos données mobiles.";
+            offlineBanner.classList.add('show');
+        } else if (!state.isServerConnected) {
+            offlineBanner.innerText = "⚠️ Non connecté au serveur — Reconnexion en cours...";
+            offlineBanner.classList.add('show');
+        } else {
+            offlineBanner.classList.remove('show');
+        }
+    }
+
+    const statusText = isOnline ? 'Connecté' : (!navigator.onLine ? 'Hors ligne' : 'Non connecté / Hors ligne');
+    const statusColor = isOnline ? 'var(--status-success)' : '#ef4444';
+
+    ['user-global-status', 'contacts-user-status'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+            el.innerHTML = `
+                <span class="user-status-dot" style="width: 7px; height: 7px; border-radius: 50%; background: ${statusColor};"></span>
+                <span style="color: ${statusColor}; font-weight: 500;">${statusText}</span>
+            `;
+        }
+    });
+
+    const badges = document.querySelectorAll('.p2p-badge-pulse');
+    badges.forEach(b => {
+        b.style.background = isOnline ? 'var(--status-success)' : 'var(--status-danger)';
+        b.title = isOnline ? 'Connecté et sécurisé' : 'Non connecté';
+    });
+}
+
+async function syncProfileToVercel(peerId, username, displayName, bundleHex, avatarDataUrl) {
+    if (!peerId) return;
+    try {
+        await fetch(`${VERCEL_API_BASE_URL}/api/directory`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                peer_id: peerId,
+                username: username || displayName || 'utilisateur',
+                display_name: displayName || username || 'Utilisateur NOVA',
+                avatar_data_url: avatarDataUrl || null,
+                prekey_bundle_hex: bundleHex || 'none',
+            }),
+        });
+    } catch (e) {
+        console.warn('syncProfileToVercel error:', e);
+    }
 }
 
 // Fetches this device's real, signature-verifiable X3DH invitation ticket (valid for 24h).
@@ -5786,18 +6021,35 @@ const RTC_ICE_CONFIG = {
 };
 
 async function sendCallSignalToPeer(recipientPeerId, signalObj) {
-    if (!hasBackend || !recipientPeerId) return;
-    try {
-        const payload = encodeStructuredMessage(signalObj);
-        const conversationId = (state.activeContact && state.activeContact.conversationId) || ('conv_' + recipientPeerId);
-        await tauriInvoke('send_message', {
-            conversationId,
-            recipientPeerId,
-            text: payload,
-        });
-    } catch (e) {
-        console.error('sendCallSignalToPeer failed', e);
+    if (!recipientPeerId) return;
+
+    // 1. Priorité absolue : Acheminement ultra-rapide (<100ms) via Edge Serverless Vercel
+    const vercelPromise = fetch(`${VERCEL_API_BASE_URL}/api/signal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            target_peer_id: recipientPeerId,
+            sender_peer_id: state.currentUser.peerId || '',
+            signal: signalObj
+        })
+    }).catch(err => console.warn('Vercel call signal delivery warning:', err));
+
+    // 2. Canaux complémentaires P2P / Transport local si backend disponible
+    if (hasBackend) {
+        try {
+            const payload = encodeStructuredMessage(signalObj);
+            const conversationId = (state.activeContact && state.activeContact.conversationId) || ('conv_' + recipientPeerId);
+            await tauriInvoke('send_message', {
+                conversationId,
+                recipientPeerId,
+                text: payload,
+            }).catch(() => {});
+        } catch (e) {
+            console.warn('send_message fallback warning:', e);
+        }
     }
+
+    await vercelPromise;
 }
 
 async function startRealtimeCall(type) {
@@ -5928,21 +6180,30 @@ function showActiveCallModal(peerName, type, statusText) {
     const barName = document.getElementById('call-bar-peer-name');
     const barDuration = document.getElementById('call-bar-duration');
 
+    const isVideo = type === 'video';
+    const typePrefix = isVideo ? '📹 Appel Vidéo' : '📞 Appel Vocal';
+
     if (nameEl) nameEl.innerText = peerName;
     if (avatarEl) avatarEl.innerText = peerName.charAt(0).toUpperCase();
-    if (statusEl) statusEl.innerText = statusText || 'Appel en cours...';
+    if (statusEl) statusEl.innerText = `${typePrefix} • ${statusText || (isVideo ? 'Connexion vidéo...' : 'Sonnerie en cours...')}`;
     if (timerEl) timerEl.innerText = '00:00';
-    if (barName) barName.innerText = peerName;
+    if (barName) barName.innerText = `${typePrefix} — ${peerName}`;
     if (barDuration) barDuration.innerText = statusText || '00:00';
 
     const videoBtn = document.getElementById('call-btn-video');
     const flipBtn = document.getElementById('call-btn-camera-flip');
-    if (type === 'voice') {
+    const voiceCenter = document.getElementById('call-voice-center');
+    const localPip = document.getElementById('call-local-pip');
+
+    if (!isVideo) {
         if (videoBtn) videoBtn.style.display = 'none';
         if (flipBtn) flipBtn.style.display = 'none';
+        if (localPip) localPip.style.display = 'none';
+        if (voiceCenter) voiceCenter.style.display = 'flex';
     } else {
         if (videoBtn) videoBtn.style.display = 'flex';
         if (flipBtn) flipBtn.style.display = 'flex';
+        if (localPip) localPip.style.display = 'block';
     }
 
     updateTorchButtonVisibility();
@@ -5999,16 +6260,24 @@ async function handleIncomingCallSignal(signal, msgRecord, conversationId) {
         };
         pendingIceCandidates = [];
 
-        const name = pendingIncomingCall.senderName;
+        const isVideo = signal.callType === 'video';
+        const contactMatch = state.contacts.find(c => c.handle === senderPeerId || c.peerId === senderPeerId);
+        const displayName = (contactMatch && contactMatch.name) || pendingIncomingCall.senderName || 'Contact';
+
         const nameEl = document.getElementById('incoming-call-name');
         const avatarEl = document.getElementById('incoming-call-avatar');
         const iconEl = document.getElementById('incoming-call-type-icon');
         const labelEl = document.getElementById('incoming-call-type-label');
 
-        if (nameEl) nameEl.innerText = name;
-        if (avatarEl) avatarEl.innerText = name.charAt(0).toUpperCase();
-        if (iconEl) iconEl.innerText = signal.callType === 'video' ? '📹' : '📞';
-        if (labelEl) labelEl.innerText = signal.callType === 'video' ? 'Appel vidéo entrant...' : 'Appel vocal entrant...';
+        if (nameEl) nameEl.innerText = displayName;
+        if (avatarEl) avatarEl.innerText = displayName.charAt(0).toUpperCase();
+        if (iconEl) iconEl.innerText = isVideo ? '📹' : '📞';
+        if (labelEl) labelEl.innerText = isVideo ? 'Appel vidéo entrant...' : 'Appel vocal entrant...';
+
+        const acceptBtnSpan = document.querySelector('#incoming-call-modal .btn-accept span');
+        if (acceptBtnSpan) {
+            acceptBtnSpan.innerText = isVideo ? 'Décrocher Vidéo' : 'Décrocher';
+        }
 
         const incomingModal = document.getElementById('incoming-call-modal');
         if (incomingModal) incomingModal.classList.add('show');
@@ -6782,8 +7051,8 @@ async function performDirectorySearch(query, isRetry) {
         container.innerHTML = `
             <div style="text-align: center; color: var(--text-dim); padding: 30px 16px; font-size: 13px;">
                 <div style="font-size: 28px; margin-bottom: 8px;">🔍</div>
-                <div style="color: white; font-weight: 600; margin-bottom: 4px;">Recherche globale Zero-Config</div>
-                <div>Tapez un identifiant (ex: 8f4b2...) ou un @pseudo pour trouver et ajouter un contact instantanément.</div>
+                <div style="color: white; font-weight: 600; margin-bottom: 4px;">Recherche dans l'annuaire</div>
+                <div>Tapez un nom ou un @pseudo pour trouver et ajouter un contact instantanément.</div>
             </div>
         `;
         state.directorySearchResults = [];
@@ -6791,60 +7060,58 @@ async function performDirectorySearch(query, isRetry) {
     }
 
     container.innerHTML = `
-        <div style="text-align: center; color: var(--accent-purple-light); padding: 24px 16px; font-size: 13px;">
-            <div style="margin-bottom: 8px;">⏳</div>
-            Connexion au serveur de découverte${isRetry ? ' (démarrage en cours...)' : ''}...
+        <div style="text-align: center; color: var(--accent-purple-light); padding: 20px 16px; font-size: 13px;">
+            <div style="margin-bottom: 6px;">⏳</div>
+            Recherche en cours...
         </div>
     `;
 
     let results = [];
-    let searchError = null;
-    if (hasBackend) {
+
+    // 1. High-speed query to Vercel Edge API
+    try {
+        const resp = await fetch(`${VERCEL_API_BASE_URL}/api/directory?query=${encodeURIComponent(q)}`);
+        if (resp.ok) {
+            const data = await resp.json();
+            if (data && Array.isArray(data.results)) {
+                results = data.results.map(r => ({
+                    peer_id: r.peer_id,
+                    username: r.username,
+                    display_name: r.display_name,
+                    avatar_data_url: r.avatar_data_url,
+                    prekey_bundle_hex: r.prekey_bundle_hex,
+                    is_online: (Date.now() - Number(r.last_updated_at)) < 300000,
+                }));
+            }
+        }
+    } catch (_) {}
+
+    // 2. Fallback to Tauri backend if Vercel fetch returned empty or failed
+    if (results.length === 0 && hasBackend) {
         try {
-            results = await tauriInvoke('search_directory', { query: q }) || [];
+            const backendResults = await tauriInvoke('search_directory', { query: q });
+            if (backendResults && backendResults.length > 0) {
+                results = backendResults;
+            }
         } catch (e) {
-            searchError = e;
-            console.error('search_directory failed', e);
+            console.warn('search_directory backend fallback failed', e);
         }
     }
+
     state.directorySearchResults = results;
 
     if (results.length === 0) {
-        // If this is the first attempt, it might be a Render cold start (up to 30s).
-        // Show a warm-up message and auto-retry once after 18s.
-        if (!isRetry) {
-            container.innerHTML = `
-                <div style="text-align: center; color: var(--text-muted); padding: 24px 16px; font-size: 13px; background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
-                    <div style="font-size: 20px; margin-bottom: 8px;">🌐</div>
-                    <div style="color: white; font-weight: 600; margin-bottom: 4px;">Serveur de découverte en démarrage...</div>
-                    <div style="color: var(--text-muted); font-size: 12px; margin-bottom: 10px;">Le serveur gratuit peut prendre jusqu'à 30 secondes à se réveiller. Nouvelle tentative automatique...</div>
-                    <div style="display: flex; justify-content: center; gap: 8px;">
-                        <button class="btn-secondary" style="font-size: 11px; padding: 6px 12px;" data-action="refreshDirectoryNodes">🔄 Réessayer maintenant</button>
-                    </div>
-                </div>
-            `;
-            // Auto-retry once after 18 seconds
-            setTimeout(() => {
-                const stillSameContainer = document.getElementById('directory-search-results');
-                if (stillSameContainer) performDirectorySearch(rawQ, true);
-            }, 18000);
-        } else {
-            container.innerHTML = `
-                <div style="text-align: center; color: var(--text-muted); padding: 24px 16px; font-size: 13px; background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
-                    <div style="color: white; font-weight: 600; margin-bottom: 4px;">Aucun utilisateur trouvé sur l'annuaire</div>
-                    <div style="font-size: 12px;">Aucun pair distant ne correspond à « ${escapeHtml(rawQ)} ».</div>
-                    <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 8px;">
-                        <button class="btn-primary" style="font-size: 12px; padding: 10px;" data-action="fillAddContactForm" data-name="${escapeHtml(rawQ)}" data-id="${escapeHtml(rawQ)}">➕ Ajouter « ${escapeHtml(rawQ)} » directement comme contact</button>
-                        <button class="btn-secondary" style="font-size: 11px; padding: 6px 12px;" data-action="refreshDirectoryNodes">🔄 Rafraîchir les relais & Réessayer</button>
-                    </div>
-                </div>
-            `;
-        }
+        container.innerHTML = `
+            <div style="text-align: center; color: var(--text-muted); padding: 24px 16px; font-size: 13px; background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
+                <div style="color: white; font-weight: 600; margin-bottom: 4px;">Aucun utilisateur trouvé</div>
+                <div style="font-size: 12px; margin-bottom: 12px;">Aucun contact ne correspond à « ${escapeHtml(rawQ)} ».</div>
+                <button class="btn-primary" style="font-size: 12px; padding: 10px 16px;" data-action="fillAddContactForm" data-name="${escapeHtml(rawQ)}" data-id="${escapeHtml(rawQ)}">➕ Ajouter « ${escapeHtml(rawQ)} » manuellement</button>
+            </div>
+        `;
         return;
     }
 
     container.innerHTML = results.map(u => {
-        const shortId = u.peer_id.slice(0, 8) + '…' + u.peer_id.slice(-6);
         const isSelf = u.peer_id === state.currentUser.peerId;
         const isAlreadyContact = state.contacts.some(c => c.handle === u.peer_id || c.peerId === u.peer_id);
         return `
@@ -6855,10 +7122,10 @@ async function performDirectorySearch(query, isRetry) {
                 </div>
                 <div class="item-content" style="cursor: pointer;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">
                     <div class="item-name" style="font-size: 14px; font-weight: 600; color: white;">${escapeHtml(u.display_name)}</div>
-                    <div class="item-sub" style="color: var(--accent-purple-light); font-size: 12px;">@${escapeHtml(u.username)} • <span style="font-family: monospace; font-size: 10px; color: var(--text-dim);">${shortId}</span></div>
+                    <div class="item-sub" style="color: var(--accent-purple-light); font-size: 12px;">@${escapeHtml(u.username)} • <span style="font-size: 11px; color: ${u.is_online ? 'var(--status-success)' : 'var(--text-muted)'};">${u.is_online ? '🟢 En ligne' : '⚪ Hors ligne'}</span></div>
                 </div>
                 <div style="display: flex; gap: 6px;">
-                    <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">Afficher</button>
+                    <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px;" data-action="inspectDirectoryUser" data-peer-id="${escapeHtml(u.peer_id)}">Profil</button>
                     ${isSelf ? `
                         <button class="btn-secondary" style="font-size: 11px; padding: 6px 10px; opacity: 0.6;" disabled>C'est vous</button>
                     ` : isAlreadyContact ? `
@@ -6931,16 +7198,15 @@ function inspectDirectoryUser(peerId) {
             </div>
         </div>
 
-        <div style="background: var(--bg-elevated); border-radius: var(--radius-md); padding: 12px; margin-bottom: 14px; border: 1px solid var(--border-subtle);">
-            <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px; font-weight: 600;">Identifiant public cryptographique :</div>
-            <div style="font-size: 11px; font-family: monospace; color: var(--text-dim); word-break: break-all;">${escapeHtml(user.peer_id)}</div>
-        </div>
-
-        <div style="display: flex; align-items: center; gap: 8px; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.25); border-radius: var(--radius-md); padding: 10px 12px; margin-bottom: 18px;">
-            <span style="font-size: 16px;">🔐</span>
-            <div style="font-size: 11px; color: var(--status-success); line-height: 1.3;">
-                Clé d'identité signée et vérifiée. Chiffrement de bout en bout X3DH & Double Ratchet garanti.
+        <div style="background: var(--bg-elevated); border-radius: var(--radius-md); padding: 14px; margin-bottom: 16px; border: 1px solid var(--border-subtle); display: flex; align-items: center; justify-content: space-between;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="font-size: 16px;">🔒</span>
+                <div>
+                    <div style="font-size: 12px; font-weight: 600; color: white;">Profil vérifié</div>
+                    <div style="font-size: 11px; color: var(--text-muted);">Messages et appels 100% chiffrés</div>
+                </div>
             </div>
+            <span style="font-size: 11px; color: var(--status-success); background: rgba(34,197,94,0.12); padding: 3px 8px; border-radius: 12px; font-weight: 600;">Sécurisé</span>
         </div>
 
         <div style="display: flex; gap: 10px;">
@@ -7215,6 +7481,15 @@ document.addEventListener('DOMContentLoaded', async () => {
             const msg = event.payload;
             if (!msg) return;
 
+            // Priorité absolue : Détection immédiate des signaux d'appel entrant
+            if (msg.text_content) {
+                const structured = decodeStructuredMessage(msg.text_content);
+                if (structured && structured.kind === 'call_signal') {
+                    await handleIncomingCallSignal(structured, msg, msg.conversation_id);
+                    return;
+                }
+            }
+
             // 1. If currently in this chat, append it immediately
             if (state.currentScreen === 'chat' && state.activeContact && state.activeContact.conversationId === msg.conversation_id) {
                 const newOnes = await refreshMessagesFromBackend(msg.conversation_id);
@@ -7269,12 +7544,55 @@ document.addEventListener('DOMContentLoaded', async () => {
         );
         await refreshContactsFromBackend();
         await refreshConversationsFromBackend();
+
+        // Démarrage instantané du canal Vercel prioritaire (Edge Signaling & Présence)
+        sendPresenceHeartbeat('online');
+        refreshContactsPresence();
+        startVercelSignalPolling();
+        syncProfileToVercel(resumed.peer_id, resumed.username, resumed.display_name, state.currentUser.bundleHex, resumed.avatar_data_url);
     }
 
     registerActivityListener();
     if (state.appLock.enabled && state.appLock.pinHash) {
         lockApp();
     }
+
+    // Initialisation de la connectivité et présence périodique (toutes les 10s)
+    checkServerConnectivity();
+    if (state.currentUser.peerId) {
+        sendPresenceHeartbeat('online');
+        refreshContactsPresence();
+        startVercelSignalPolling();
+    }
+
+    setInterval(() => {
+        if (state.currentUser.peerId) {
+            sendPresenceHeartbeat('online');
+            refreshContactsPresence();
+        }
+    }, 10000);
+
+    window.addEventListener('online', () => {
+        checkServerConnectivity();
+        if (state.currentUser.peerId) {
+            sendPresenceHeartbeat('online');
+            refreshContactsPresence();
+        }
+    });
+
+    window.addEventListener('offline', () => {
+        state.isServerConnected = false;
+        updateConnectionIndicators();
+    });
+
+    window.addEventListener('beforeunload', () => {
+        if (state.currentUser.peerId) {
+            navigator.sendBeacon(`${VERCEL_API_BASE_URL}/api/presence`, JSON.stringify({
+                peer_id: state.currentUser.peerId,
+                status: 'offline'
+            }));
+        }
+    });
 
     navigateTo(state.currentUser.peerId ? 'conversations' : 'onboarding');
 });

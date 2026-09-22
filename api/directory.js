@@ -23,7 +23,7 @@ module.exports = async (req, res) => {
           [peerId]
         );
         if (rows.length === 0) {
-          return res.status(404).json({ error: 'Profile not found' });
+          return res.status(200).json(null);
         }
         return res.status(200).json(rows[0]);
       }

@@ -95,6 +95,15 @@ async function ensureSchema() {
           report_count INTEGER NOT NULL DEFAULT 0,
           is_automatic BOOLEAN NOT NULL DEFAULT FALSE
       );
+
+      CREATE TABLE IF NOT EXISTS call_signals (
+          id BIGSERIAL PRIMARY KEY,
+          target_peer_id VARCHAR(64) NOT NULL,
+          sender_peer_id VARCHAR(64) NOT NULL,
+          signal_payload JSONB NOT NULL,
+          created_at BIGINT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_signals_target ON call_signals (target_peer_id, created_at);
     `);
     schemaInitialized = true;
   } catch (err) {
