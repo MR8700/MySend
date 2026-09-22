@@ -1,19 +1,15 @@
-# Render "Blueprint" spec for the NOVA discovery/relay server — see server/Dockerfile and
-# server/src/service.rs for what this actually deploys and why it's WebSocket-based.
-#
-# To deploy: push this repo to GitHub (or GitLab), then in the Render dashboard use
-# "New +" -> "Blueprint" and point it at the repo. Render reads this file automatically and
-# creates the service below. Free tier: sleeps after 15 minutes idle, wakes on the next incoming
-# connection (a few seconds of extra latency on the first request after a sleep) — fine for a
-# fallback path that is not the primary transport.
 services:
   - type: web
-    name: nova-discovery
-    runtime: docker
+    name: mysend-nova-server
+    env: docker
     dockerfilePath: ./server/Dockerfile
-    dockerContext: .
     plan: free
     healthCheckPath: /health
+    autoDeploy: true
     envVars:
+      - key: PORT
+        value: 8080
       - key: RUST_LOG
         value: info
+      - key: DATABASE_URL
+        sync: false # Supabase PostgreSQL connection URI: postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres

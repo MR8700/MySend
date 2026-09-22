@@ -153,6 +153,7 @@ pub struct NovaEngine {
     /// device — exactly the honest, testable state the crypto/storage layers are verified in
     /// isolation, without silently pretending a network delivery happened.
     network: Mutex<Option<Arc<P2PNode>>>,
+    pub message_notifier: tokio::sync::broadcast::Sender<MessageRecord>,
 }
 
 impl NovaEngine {
@@ -162,6 +163,7 @@ impl NovaEngine {
         let storage = Arc::new(StorageEngine::open(db_path, storage_passphrase)?);
         let transport = Arc::new(TransportSupervisor::new());
         let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (message_notifier, _) = tokio::sync::broadcast::channel(128);
 
         Ok(Self {
             identity: Arc::new(Mutex::new(None)),
@@ -170,6 +172,7 @@ impl NovaEngine {
             sessions,
             media_reassembly: Mutex::new(HashMap::new()),
             network: Mutex::new(None),
+            message_notifier,
         })
     }
 
@@ -828,6 +831,8 @@ impl NovaEngine {
         self.storage
             .enqueue_outbox(msg_id, conversation_id, recipient_peer_id, &wrapped)?;
 
+        let _ = self.pump_outbox_once().await;
+
         Ok(msg_record)
     }
 
@@ -1000,6 +1005,8 @@ impl NovaEngine {
         let wrapped = wrap_chunks_for_outbox(&packets)?;
         self.storage
             .enqueue_outbox(msg_id, conversation_id, recipient_peer_id, &wrapped)?;
+
+        let _ = self.pump_outbox_once().await;
 
         Ok(msg_record)
     }
@@ -1307,6 +1314,7 @@ impl NovaEngine {
             attachment: None,
         };
         self.storage.save_message(&msg_record)?;
+        let _ = self.message_notifier.send(msg_record.clone());
 
         Ok(ReceiveOutcome::New(msg_record))
     }
@@ -1480,6 +1488,7 @@ impl NovaEngine {
         };
         self.storage
             .save_message_with_attachment(&msg_record, &meta.sha256_checksum, &assembled)?;
+        let _ = self.message_notifier.send(msg_record.clone());
 
         Ok(ReceiveOutcome::New(msg_record))
     }
@@ -2175,6 +2184,8 @@ impl NovaEngine {
             recipient_peer_id,
             &outbox_blob,
         )?;
+
+        let _ = self.pump_outbox_once().await;
 
         Ok(())
     }

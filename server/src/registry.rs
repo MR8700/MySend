@@ -105,6 +105,7 @@ pub struct PresenceRegistry {
     feedbacks: Arc<RwLock<Vec<FeedbackRecord>>>,
     banned_users: Arc<RwLock<HashMap<String, BannedUserRecord>>>,
     auto_ban_threshold: Arc<RwLock<usize>>,
+    pool: Option<sqlx::PgPool>,
 }
 
 impl Default for PresenceRegistry {
@@ -115,6 +116,10 @@ impl Default for PresenceRegistry {
 
 impl PresenceRegistry {
     pub fn new() -> Self {
+        Self::with_pool(None)
+    }
+
+    pub fn with_pool(pool: Option<sqlx::PgPool>) -> Self {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
             directory: Arc::new(RwLock::new(HashMap::new())),
@@ -122,12 +127,27 @@ impl PresenceRegistry {
             feedbacks: Arc::new(RwLock::new(Vec::new())),
             banned_users: Arc::new(RwLock::new(HashMap::new())),
             auto_ban_threshold: Arc::new(RwLock::new(DEFAULT_AUTO_BAN_THRESHOLD)),
+            pool,
         }
     }
 
     pub async fn is_banned(&self, peer_id: &str) -> bool {
-        let lock = self.banned_users.read().await;
-        lock.contains_key(peer_id)
+        {
+            let lock = self.banned_users.read().await;
+            if lock.contains_key(peer_id) {
+                return true;
+            }
+        }
+        if let Some(ref pool) = self.pool {
+            let res: Result<Option<String>, _> = sqlx::query_scalar("SELECT peer_id FROM banned_users WHERE peer_id = $1")
+                .bind(peer_id)
+                .fetch_optional(pool)
+                .await;
+            if let Ok(Some(_)) = res {
+                return true;
+            }
+        }
+        false
     }
 
     /// Registers (or refreshes) a peer's presence. The registration MUST be signed by the
@@ -153,6 +173,27 @@ impl PresenceRegistry {
 
         let mut endpoint = registration.endpoint;
         endpoint.public_ip = observed_addr.ip().to_string();
+
+        if let Some(ref pool) = self.pool {
+            let _ = sqlx::query(r#"
+                INSERT INTO presence_entries (peer_id, public_ip, public_port, local_ip, local_port, last_seen_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (peer_id) DO UPDATE SET
+                    public_ip = EXCLUDED.public_ip,
+                    public_port = EXCLUDED.public_port,
+                    local_ip = EXCLUDED.local_ip,
+                    local_port = EXCLUDED.local_port,
+                    last_seen_at = EXCLUDED.last_seen_at
+            "#)
+            .bind(&endpoint.peer_id)
+            .bind(&endpoint.public_ip)
+            .bind(endpoint.public_port as i32)
+            .bind(endpoint.local_ip.as_deref())
+            .bind(endpoint.local_port.map(|p| p as i32))
+            .bind(now as i64)
+            .execute(pool)
+            .await;
+        }
 
         let mut lock = self.entries.write().await;
         if !lock.contains_key(&endpoint.peer_id) && lock.len() >= MAX_TRACKED_PEERS {
@@ -187,6 +228,28 @@ impl PresenceRegistry {
 
         if self.is_banned(&entry.profile.peer_id).await {
             return Err(RegistryError::UserBanned);
+        }
+
+        if let Some(ref pool) = self.pool {
+            let _ = sqlx::query(r#"
+                INSERT INTO directory_profiles (peer_id, username, display_name, avatar_data_url, prekey_bundle_hex, registered_at, last_updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (peer_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    display_name = EXCLUDED.display_name,
+                    avatar_data_url = EXCLUDED.avatar_data_url,
+                    prekey_bundle_hex = EXCLUDED.prekey_bundle_hex,
+                    last_updated_at = EXCLUDED.last_updated_at
+            "#)
+            .bind(&entry.profile.peer_id)
+            .bind(&entry.profile.username)
+            .bind(&entry.profile.display_name)
+            .bind(entry.profile.avatar_data_url.as_deref())
+            .bind(&entry.profile.prekey_bundle_hex)
+            .bind(entry.timestamp_utc as i64)
+            .bind(now as i64)
+            .execute(pool)
+            .await;
         }
 
         let mut lock = self.directory.write().await;
@@ -256,6 +319,39 @@ impl PresenceRegistry {
             }
         }
 
+        if let Some(ref pool) = self.pool {
+            use sqlx::Row;
+            let pattern = format!("%{q}%");
+            if let Ok(rows) = sqlx::query(r#"
+                SELECT peer_id, username, display_name, avatar_data_url, prekey_bundle_hex, last_updated_at
+                FROM directory_profiles
+                WHERE LOWER(peer_id) LIKE $1 OR LOWER(username) LIKE $1 OR LOWER(display_name) LIKE $1
+                ORDER BY last_updated_at DESC LIMIT 50
+            "#)
+            .bind(&pattern)
+            .fetch_all(pool)
+            .await {
+                for r in rows {
+                    let pid: String = r.get("peer_id");
+                    if !banned_lock.contains_key(&pid) && !results.iter().any(|res| res.peer_id == pid) {
+                        let is_online = presence_lock
+                            .get(&pid)
+                            .map(|p| now.saturating_sub(p.last_seen_utc) <= DEFAULT_TTL_SECONDS)
+                            .unwrap_or(false);
+                        results.push(DirectorySearchResult {
+                            peer_id: pid,
+                            username: r.get("username"),
+                            display_name: r.get("display_name"),
+                            avatar_data_url: r.get("avatar_data_url"),
+                            prekey_bundle_hex: r.get("prekey_bundle_hex"),
+                            is_online,
+                            last_seen_utc: r.get::<i64, _>("last_updated_at") as u64,
+                        });
+                    }
+                }
+            }
+        }
+
         // Sort: exact matches first, then online peers, then alphabetical
         results.sort_by(|a, b| {
             let a_exact = a.peer_id.to_lowercase() == q || a.username.to_lowercase() == q;
@@ -278,14 +374,36 @@ impl PresenceRegistry {
             return None;
         }
         let now = now_secs();
-        let lock = self.entries.read().await;
-        lock.get(peer_id).and_then(|tracked| {
-            if now.saturating_sub(tracked.last_seen_utc) <= DEFAULT_TTL_SECONDS {
-                Some(tracked.endpoint.clone())
-            } else {
-                None
+        {
+            let lock = self.entries.read().await;
+            if let Some(tracked) = lock.get(peer_id) {
+                if now.saturating_sub(tracked.last_seen_utc) <= DEFAULT_TTL_SECONDS {
+                    return Some(tracked.endpoint.clone());
+                }
             }
-        })
+        }
+        if let Some(ref pool) = self.pool {
+            use sqlx::Row;
+            if let Ok(Some(row)) = sqlx::query(
+                "SELECT peer_id, public_ip, public_port, local_ip, local_port, last_seen_at FROM presence_entries WHERE peer_id = $1"
+            )
+            .bind(peer_id)
+            .fetch_optional(pool)
+            .await
+            {
+                let last_seen: i64 = row.get("last_seen_at");
+                if now.saturating_sub(last_seen as u64) <= DEFAULT_TTL_SECONDS {
+                    return Some(PeerEndpoint {
+                        peer_id: row.get("peer_id"),
+                        public_ip: row.get("public_ip"),
+                        public_port: row.get::<i32, _>("public_port") as u16,
+                        local_ip: row.get("local_ip"),
+                        local_port: row.get::<Option<i32>, _>("local_port").map(|p| p as u16),
+                    });
+                }
+            }
+        }
+        None
     }
 
     // ==========================================

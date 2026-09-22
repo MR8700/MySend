@@ -19,7 +19,7 @@ use nova_transport::P2PNode;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tokio::sync::Mutex;
 
 struct AppState {
@@ -1120,6 +1120,15 @@ pub fn run() {
 
             let listen_addr = std::env::var("NOVA_LISTEN_ADDR")
                 .unwrap_or_else(|_| "/ip4/0.0.0.0/udp/0/quic-v1".to_string());
+
+            let mut rx = engine.message_notifier.subscribe();
+            let app_handle = app.handle().clone();
+            tokio::spawn(async move {
+                while let Ok(msg) = rx.recv().await {
+                    let _ = app_handle.emit("nova://message-received", &msg);
+                    let _ = app_handle.emit("nova://conversation-updated", &msg.conversation_id);
+                }
+            });
 
             app.manage(AppState {
                 engine,

@@ -134,6 +134,7 @@ const CLICK_ACTIONS = {
     unblockActiveContact: (el) => runPendingAction(el, () => unblockActiveContact(el.dataset.peerId)),
     deleteContact: (el) => runPendingAction(el, () => deleteContactReal(el.dataset.peerId, el.dataset.name)),
     addContact: (el) => runPendingAction(el, addContactReal),
+    addActiveContactToContacts: (el) => runPendingAction(el, () => addActiveContactToContacts(el.dataset.peerId, el.dataset.name)),
     retryFailedMessage: (el) => runPendingAction(el, () => retryFailedMessageReal(el.dataset.msgId, el.dataset.convId, el.dataset.recipientId)),
     clearAppCache: () => clearAppCache(),
     inspectDirectoryUser: (el) => inspectDirectoryUser(el.dataset.peerId),
@@ -645,7 +646,29 @@ const screens = {
                 </div>
             </header>
 
-            ${!state.activeContact.isTrusted ? `
+            ${!state.activeContact.isGroup && !state.activeContact.isContact ? `
+                <div id="unknown-contact-banner" style="background: rgba(245, 158, 11, 0.12); border-bottom: 1px solid rgba(245, 158, 11, 0.3); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; z-index: 10;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span style="font-size: 16px;">ℹ️</span>
+                        <div style="font-size: 12px; color: #fbbf24; line-height: 1.4;">
+                            <strong>${escapeHtml(state.activeContact.name || state.activeContact.handle)}</strong> ne fait pas partie de vos contacts.
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <button class="btn-secondary" style="font-size: 11px; padding: 6px 12px; color: var(--status-danger); border-color: rgba(239, 68, 68, 0.3);" data-action="openBlockModal" data-peer-id="${escapeHtml(state.activeContact.handle)}" data-name="${escapeHtml(state.activeContact.name)}">
+                            Bloquer
+                        </button>
+                        <button class="btn-primary" style="font-size: 11px; padding: 6px 12px;" data-action="addActiveContactToContacts" data-peer-id="${escapeHtml(state.activeContact.handle)}" data-name="${escapeHtml(state.activeContact.name)}">
+                            + Ajouter aux contacts
+                        </button>
+                        ${!state.activeContact.isTrusted ? `
+                            <button class="btn-primary" style="font-size: 11px; padding: 6px 12px; background: #d97706; border-color: #f59e0b;" data-action="trustActiveContact" data-peer-id="${escapeHtml(state.activeContact.handle)}">
+                                ✓ Faire confiance
+                            </button>
+                        ` : ''}
+                    </div>
+                </div>
+            ` : (!state.activeContact.isTrusted ? `
                 <div id="trust-contact-banner" style="background: rgba(245, 158, 11, 0.12); border-bottom: 1px solid rgba(245, 158, 11, 0.3); padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 10px; z-index: 10;">
                     <div style="display: flex; align-items: center; gap: 8px; flex: 1;">
                         <span style="font-size: 16px;">⚠️</span>
@@ -662,7 +685,7 @@ const screens = {
                         </button>
                     </div>
                 </div>
-            ` : ''}
+            ` : '')}
 
             <div class="chat-body" id="chat-body">
                 <div style="text-align: center; margin: 10px 0;">
@@ -2313,19 +2336,19 @@ function openChatWith(name, handle, conversationId) {
             isBlocked: false,
             isTrusted: true,
         };
-    } else {
-        const contact = state.contacts.find(c => c.name === name || c.handle === handle);
-        const resolvedPeerId = contact ? contact.handle : peerId;
+        const contact = state.contacts.find(c => c.name === name || c.handle === handle || (c.peerId && c.peerId === handle) || (c.peerId && c.peerId === peerId) || (c.handle && c.handle === peerId));
+        const resolvedPeerId = contact ? (contact.handle || contact.peerId) : peerId;
         state.activeContact = {
             name: contact ? contact.name : name,
             handle: resolvedPeerId,
             peerId: resolvedPeerId,
             conversationId: actualConvId,
             isGroup: false,
+            isContact: !!contact,
             publicKey: (contact && contact.key) || 'Non disponible',
             safetyNumber: (contact && contact.safetyNumber) || 'Non disponible',
             isOnline: !!(contact && contact.online),
-            p2pMode: (contact && contact.p2pMode) || 'Non connecté',
+            p2pMode: (contact && contact.p2pMode) || 'Relais serveur',
             isBlocked: !!(contact && contact.isBlocked),
             isTrusted: !!(contact && contact.isTrusted),
         };
@@ -3283,18 +3306,63 @@ async function refreshContactsFromBackend() {
     }
 }
 
+async function addActiveContactToContacts(peerId, name) {
+    if (!requireBackend()) return;
+    const targetPeerId = peerId || (state.activeContact && (state.activeContact.peerId || state.activeContact.handle));
+    const targetName = name || (state.activeContact && state.activeContact.name) || 'Contact';
+    if (!targetPeerId) return;
+
+    try {
+        let bundleHex = '';
+        let username = '';
+        let displayName = targetName;
+        try {
+            const results = await tauriInvoke('search_directory', { query: targetPeerId });
+            if (results && results.length > 0) {
+                const match = results.find(u => u.peer_id.toLowerCase() === targetPeerId.toLowerCase()) || results[0];
+                bundleHex = match.prekey_bundle_hex;
+                username = match.username;
+                displayName = match.display_name || targetName;
+            }
+        } catch (_) {}
+
+        await tauriInvoke('add_contact', {
+            username: username || '',
+            displayName: displayName || 'Contact',
+            bundleHex: bundleHex || ''
+        });
+
+        await refreshContactsFromBackend();
+
+        if (state.activeContact && (state.activeContact.peerId === targetPeerId || state.activeContact.handle === targetPeerId)) {
+            state.activeContact.isContact = true;
+            state.activeContact.name = displayName;
+            const banner = document.getElementById('unknown-contact-banner') || document.getElementById('trust-contact-banner');
+            if (banner) banner.remove();
+        }
+
+        alert('« ' + displayName + ' » a été ajouté à vos contacts avec succès.');
+    } catch (e) {
+        alert('Erreur lors de l\'ajout aux contacts : ' + e);
+    }
+}
+
 async function trustActiveContact(peerId) {
     const targetPeerId = peerId || (state.activeContact && (state.activeContact.peerId || state.activeContact.handle));
+    const targetName = (state.activeContact && state.activeContact.name) || 'Contact';
     if (!targetPeerId || !requireBackend()) return;
     try {
+        if (state.activeContact && !state.activeContact.isContact) {
+            await addActiveContactToContacts(targetPeerId, targetName);
+        }
         await tauriInvoke('trust_contact', { peerId: targetPeerId });
         if (state.activeContact && (state.activeContact.peerId === targetPeerId || state.activeContact.handle === targetPeerId)) {
             state.activeContact.isTrusted = true;
-            const banner = document.getElementById('trust-contact-banner');
+            const banner = document.getElementById('unknown-contact-banner') || document.getElementById('trust-contact-banner');
             if (banner) banner.remove();
         }
         await refreshContactsFromBackend();
-        alert('Contact marqué comme de confiance avec succès.');
+        alert('Contact marqué comme de confiance.');
         if (state.currentScreen === 'contact_profile') {
             navigateTo('contact_profile');
         }
@@ -7140,6 +7208,43 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Update initial unread badges
     updateGlobalUnreadBadges();
+
+    // Real-Time Push Event Listeners from Tauri Backend
+    if (window.__TAURI__ && window.__TAURI__.event) {
+        window.__TAURI__.event.listen('nova://message-received', async (event) => {
+            const msg = event.payload;
+            if (!msg) return;
+
+            // 1. If currently in this chat, append it immediately
+            if (state.currentScreen === 'chat' && state.activeContact && state.activeContact.conversationId === msg.conversation_id) {
+                const newOnes = await refreshMessagesFromBackend(msg.conversation_id);
+                if (newOnes.length > 0) {
+                    const chatBody = document.getElementById('chat-body');
+                    const isNearBottom = chatBody ? (chatBody.scrollHeight - chatBody.scrollTop - chatBody.clientHeight < 140) : true;
+                    newOnes.forEach(appendChatMessageToBody);
+                    newOnes.filter(m => m.attachmentId && !m.url).forEach(ensureAttachmentLoaded);
+                    if (chatBody && isNearBottom) {
+                        chatBody.scrollTo({ top: chatBody.scrollHeight, behavior: 'smooth' });
+                    }
+                }
+            }
+
+            // 2. Refresh conversations and update unread badges
+            await refreshConversationsFromBackend();
+            updateGlobalUnreadBadges();
+            if (state.currentScreen === 'conversations') {
+                updateConversationsListDom();
+            }
+        });
+
+        window.__TAURI__.event.listen('nova://conversation-updated', async () => {
+            await refreshConversationsFromBackend();
+            updateGlobalUnreadBadges();
+            if (state.currentScreen === 'conversations') {
+                updateConversationsListDom();
+            }
+        });
+    }
 
     // If this device already created/restored an identity in a previous session, resume it
     // straight from local encrypted storage — a "sovereign" identity app that made you re-type

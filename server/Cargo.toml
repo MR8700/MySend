@@ -21,6 +21,7 @@ hex.workspace = true
 # proxy in front of this process; the server here only ever speaks plain `ws://` on its bound port.
 axum = { version = "0.7", features = ["ws"] }
 futures-util.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 
 [dev-dependencies]
 # For server/tests/ws_e2e.rs: axum's "ws" feature above already pulls tokio-tungstenite/

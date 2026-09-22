@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
 const PRESENCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-const SERVER_DRAIN_INTERVAL: Duration = Duration::from_secs(30);
+const SERVER_DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Application-level outcome of processing one incoming message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

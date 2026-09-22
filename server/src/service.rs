@@ -88,9 +88,35 @@ pub async fn run_server(bind_addr: &str) -> std::io::Result<()> {
 }
 
 pub async fn bind(bind_addr: &str) -> std::io::Result<(TcpListener, Arc<PresenceRegistry>, Arc<BlindRelay>)> {
-    let registry = Arc::new(PresenceRegistry::new());
-    let relay = Arc::new(BlindRelay::new());
-    info!("Presence Registry & Blind Relay initialized (In-Memory / Zero-Persistent-Storage)");
+    let db_url = std::env::var("DATABASE_URL")
+        .or_else(|_| std::env::var("POSTGRES_URL"))
+        .or_else(|_| std::env::var("POSTGRES_PRISMA_URL"))
+        .or_else(|_| std::env::var("POSTGRES_URL_NON_POOLING"))
+        .ok();
+
+    let db_pool = match db_url {
+        Some(url) if !url.trim().is_empty() => {
+            info!("PostgreSQL connection string detected, initializing Supabase / PostgreSQL connection pool...");
+            match crate::db::init_db(&url).await {
+                Ok(pool) => {
+                    info!("PostgreSQL / Supabase connection pool and automated schema initialized successfully.");
+                    Some(pool)
+                }
+                Err(e) => {
+                    warn!("Failed to initialize PostgreSQL / Supabase database: {e}. Falling back to in-memory mode.");
+                    None
+                }
+            }
+        }
+        _ => {
+            info!("No DATABASE_URL or POSTGRES_URL configured. Running in-memory mode.");
+            None
+        }
+    };
+
+    let registry = Arc::new(PresenceRegistry::with_pool(db_pool.clone()));
+    let relay = Arc::new(BlindRelay::with_pool(db_pool));
+    info!("Presence Registry & Blind Relay initialized");
 
     let reg_clone = registry.clone();
     let relay_clone = relay.clone();

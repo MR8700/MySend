@@ -36,6 +36,7 @@ pub struct OpaqueRelayPacket {
 #[derive(Clone)]
 pub struct BlindRelay {
     queues: Arc<RwLock<HashMap<String, VecDeque<OpaqueRelayPacket>>>>,
+    pool: Option<sqlx::PgPool>,
 }
 
 impl Default for BlindRelay {
@@ -46,8 +47,13 @@ impl Default for BlindRelay {
 
 impl BlindRelay {
     pub fn new() -> Self {
+        Self::with_pool(None)
+    }
+
+    pub fn with_pool(pool: Option<sqlx::PgPool>) -> Self {
         Self {
             queues: Arc::new(RwLock::new(HashMap::new())),
+            pool,
         }
     }
 
@@ -60,6 +66,15 @@ impl BlindRelay {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
+
+        if let Some(ref pool) = self.pool {
+            let _ = sqlx::query("INSERT INTO relay_queue (target_peer_id, payload, received_at) VALUES ($1, $2, $3)")
+                .bind(target_peer_id)
+                .bind(&payload)
+                .bind(now as i64)
+                .execute(pool)
+                .await;
+        }
 
         let packet = OpaqueRelayPacket {
             payload,
@@ -82,14 +97,35 @@ impl BlindRelay {
         Ok(())
     }
 
-    /// Retrieves a bounded batch of encrypted packets for the peer that fits safely in UDP datagram limits.
-    /// Remaining packets are preserved in memory for subsequent drain requests.
+    /// Retrieves a bounded batch of encrypted packets for the peer.
+    /// Remaining packets are preserved in memory / database for subsequent drain requests.
     pub async fn drain_for_peer(&self, target_peer_id: &str) -> Vec<Vec<u8>> {
+        let mut batch = Vec::new();
+        let mut total_bytes = 0;
+        const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024; // 16 MB WebSocket batch ceiling
+
+        if let Some(ref pool) = self.pool {
+            use sqlx::Row;
+            if let Ok(rows) = sqlx::query(
+                "DELETE FROM relay_queue WHERE id IN (SELECT id FROM relay_queue WHERE target_peer_id = $1 ORDER BY id ASC LIMIT 50) RETURNING payload"
+            )
+            .bind(target_peer_id)
+            .fetch_all(pool)
+            .await
+            {
+                for row in rows {
+                    let payload: Vec<u8> = row.get("payload");
+                    total_bytes += payload.len();
+                    batch.push(payload);
+                    if total_bytes >= MAX_BATCH_BYTES {
+                        break;
+                    }
+                }
+            }
+        }
+
         let mut lock = self.queues.write().await;
         if let Some(queue) = lock.get_mut(target_peer_id) {
-            let mut batch = Vec::new();
-            let mut total_bytes = 0;
-            const MAX_BATCH_BYTES: usize = 12 * 1024; // 12 KB safe datagram ceiling
             while let Some(front) = queue.front() {
                 if !batch.is_empty() && total_bytes + front.payload.len() > MAX_BATCH_BYTES {
                     break;
@@ -102,16 +138,27 @@ impl BlindRelay {
             if queue.is_empty() {
                 lock.remove(target_peer_id);
             }
-            batch
-        } else {
-            Vec::new()
         }
+
+        batch
     }
 
-    /// Returns the number of pending packets currently waiting in RAM.
+    /// Returns the number of pending packets currently waiting.
     pub async fn pending_count(&self, target_peer_id: &str) -> usize {
-        let lock = self.queues.read().await;
-        lock.get(target_peer_id).map(|q| q.len()).unwrap_or(0)
+        let mut count = {
+            let lock = self.queues.read().await;
+            lock.get(target_peer_id).map(|q| q.len()).unwrap_or(0)
+        };
+        if let Some(ref pool) = self.pool {
+            let db_count: Result<i64, _> = sqlx::query_scalar("SELECT COUNT(*) FROM relay_queue WHERE target_peer_id = $1")
+                .bind(target_peer_id)
+                .fetch_one(pool)
+                .await;
+            if let Ok(c) = db_count {
+                count += c as usize;
+            }
+        }
+        count
     }
 
     /// Housekeeping: purges packets older than expiry threshold.

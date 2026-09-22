@@ -1,3 +1,4 @@
+pub mod db;
 pub mod registry;
 pub mod relay;
 pub mod service;
