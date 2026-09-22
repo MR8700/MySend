@@ -1,29 +1,5 @@
 {
-  "version": 2,
-  "framework": null,
-  "routes": [
-    {
-      "src": "/health",
-      "dest": "/api/health.js"
-    },
-    {
-      "src": "/api/directory",
-      "dest": "/api/directory.js"
-    },
-    {
-      "src": "/api/presence",
-      "dest": "/api/presence.js"
-    },
-    {
-      "src": "/api/report",
-      "dest": "/api/report.js"
-    },
-    {
-      "src": "/api/feedback",
-      "dest": "/api/feedback.js"
-    }
-  ],
-  "env": {
-    "DATABASE_URL": "@mysend-database-url"
-  }
+  "rewrites": [
+    { "source": "/health", "destination": "/api/health" }
+  ]
 }
