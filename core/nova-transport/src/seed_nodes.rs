@@ -379,47 +379,37 @@ impl MultiFallbackPool {
         }
 
         let num_clients = self.clients.len();
-        let target_peer_id = target_peer_id.to_string();
-        let clients = self.clients.clone();
-        let mut handles = Vec::new();
-
         for (i, chunk) in chunks.into_iter().enumerate() {
             let primary_idx = (self.round_robin_counter.fetch_add(1, Ordering::Relaxed) + i) % num_clients;
-            let target = target_peer_id.clone();
-            let pool_clients = clients.clone();
-
-            handles.push(tokio::spawn(async move {
-                // Try assigned striped client first
-                let primary_client = &pool_clients[primary_idx];
-                if primary_client.relay_forward(&target, chunk.clone()).await.is_ok() {
-                    return true;
+            let primary_client = &self.clients[primary_idx];
+            let mut sent = match primary_client.relay_forward(target_peer_id, chunk.clone()).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[RELAY_FORWARD_ERR] on {}: {:?}", primary_client.server_url(), e);
+                    false
                 }
+            };
+            if !sent {
                 debug!(
                     "Striped relay_forward failed on {} — attempting failover...",
                     primary_client.server_url()
                 );
-                // Failover: try remaining clients in the pool
-                for (alt_idx, alt_client) in pool_clients.iter().enumerate() {
+                for (alt_idx, alt_client) in self.clients.iter().enumerate() {
                     if alt_idx == primary_idx {
                         continue;
                     }
-                    if alt_client.relay_forward(&target, chunk.clone()).await.is_ok() {
+                    if alt_client.relay_forward(target_peer_id, chunk.clone()).await.is_ok() {
                         debug!("Failover relay_forward succeeded on {}", alt_client.server_url());
-                        return true;
+                        sent = true;
+                        break;
                     }
                 }
-                false
-            }));
-        }
-
-        let mut all_ok = true;
-        for handle in handles {
-            match handle.await {
-                Ok(true) => {}
-                _ => all_ok = false,
+            }
+            if !sent {
+                return false;
             }
         }
-        all_ok
+        true
     }
 
     /// Queries all active relays in parallel for a peer's endpoint and returns the fastest response.

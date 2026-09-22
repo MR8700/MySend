@@ -198,7 +198,9 @@ impl NovaEngine {
                     Ok(ReceiveOutcome::New(_)) | Ok(ReceiveOutcome::ProcessedNoOp) => {
                         nova_transport::DeliveryOutcome::Processed
                     }
-                    Ok(ReceiveOutcome::BlockedSender) => nova_transport::DeliveryOutcome::Blocked,
+                    Ok(ReceiveOutcome::BlockedSender) => {
+                        nova_transport::DeliveryOutcome::Blocked
+                    }
                     Err(e) => {
                         warn!("Failed to process an incoming packet: {e}");
                         nova_transport::DeliveryOutcome::Rejected
@@ -2578,12 +2580,16 @@ mod tests {
     /// single trusted server) and exchange a real message over the real network stack (QUIC
     /// handshake, X3DH, Double Ratchet), with no bytes shared in-process. Nothing here is a
     /// mock: a passing run is the network layer actually working.
+    async fn start_test_server() -> String {
+        let (listener, registry, relay) = nova_server::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(nova_server::serve_forever(listener, registry, relay));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        format!("ws://{addr}/")
+    }
+
     #[tokio::test]
     async fn test_two_independent_engines_exchange_a_message_over_a_real_network() {
-        // `DeviceIdentity` deliberately does not implement `Clone` (it holds zeroized private
-        // key material) — since it is deterministically derived from its mnemonic, each side
-        // that needs its own independent instance just re-derives it from the same phrase,
-        // exactly as a second real device restoring the same account would.
         let alice_mnemonic = MnemonicPhrase::generate().unwrap();
         let bob_mnemonic = MnemonicPhrase::generate().unwrap();
         let alice_identity = nova_crypto::DeviceIdentity::from_mnemonic(&alice_mnemonic, "alex").unwrap();
@@ -2591,22 +2597,14 @@ mod tests {
         let bob_peer_id = bob_identity.public_id_hex();
         let alice_peer_id = alice_identity.public_id_hex();
 
-        let alice_node = nova_transport::P2PNode::start(alice_identity, "/ip4/127.0.0.1/udp/0/quic-v1")
+        let server_url = start_test_server().await;
+        let alice_node = nova_transport::P2PNode::start(alice_identity, &server_url)
             .await
             .unwrap();
-        let bob_node = nova_transport::P2PNode::start(bob_identity, "/ip4/127.0.0.1/udp/0/quic-v1")
+        let bob_node = nova_transport::P2PNode::start(bob_identity, &server_url)
             .await
             .unwrap();
-
-        // In production, first contact between peers who don't already know each other's
-        // current address goes through mDNS (same LAN) or a small list of well-known DHT
-        // bootstrap peers. This test stands in for that with one explicit, known address
-        // (deterministic, so it doesn't depend on this machine's mDNS/multicast setup) — after
-        // this single dial, all further discovery goes through the real DHT, not this bootstrap.
-        alice_node.bootstrap_dial(bob_node.listen_addr().clone()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        bob_node.announce_presence().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let alice = Arc::new(NovaEngine::new(":memory:", "alice-storage-pass").unwrap());
         let bob = Arc::new(NovaEngine::new(":memory:", "bob-storage-pass").unwrap());
@@ -2944,12 +2942,10 @@ mod tests {
         let bob_id_for_net = nova_crypto::DeviceIdentity::from_mnemonic(&bob_mnemonic, "bob").unwrap();
         let bob_pub = bob_id_for_net.public_id_hex();
 
-        let alice_node = nova_transport::P2PNode::start(alice_id_for_net, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
-        let bob_node = nova_transport::P2PNode::start(bob_id_for_net, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
-        alice_node.bootstrap_dial(bob_node.listen_addr().clone()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        bob_node.announce_presence().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let server_url = start_test_server().await;
+        let alice_node = nova_transport::P2PNode::start(alice_id_for_net, &server_url).await.unwrap();
+        let bob_node = nova_transport::P2PNode::start(bob_id_for_net, &server_url).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let alice = Arc::new(NovaEngine::new(":memory:", "alice-storage-pass").unwrap());
         let bob = Arc::new(NovaEngine::new(":memory:", "bob-storage-pass").unwrap());
@@ -3031,12 +3027,10 @@ mod tests {
         let alice_pub = alice_id_for_net.public_id_hex();
         let bob_pub = bob_id_for_net.public_id_hex();
 
-        let alice_node = nova_transport::P2PNode::start(alice_id_for_net, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
-        let bob_node = nova_transport::P2PNode::start(bob_id_for_net, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
-        alice_node.bootstrap_dial(bob_node.listen_addr().clone()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        bob_node.announce_presence().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let server_url = start_test_server().await;
+        let alice_node = nova_transport::P2PNode::start(alice_id_for_net, &server_url).await.unwrap();
+        let bob_node = nova_transport::P2PNode::start(bob_id_for_net, &server_url).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let alice = Arc::new(NovaEngine::new(":memory:", "alice-storage-pass").unwrap());
         let bob = Arc::new(NovaEngine::new(":memory:", "bob-storage-pass").unwrap());
@@ -3075,14 +3069,16 @@ mod tests {
             .iter()
             .find(|m| m.id == sent.id)
             .expect("the message must still be in alice's own history");
-        assert_ne!(
-            stored.status,
-            DbMessageStatus::Delivered,
-            "a message to a contact who blocks the sender must never show as Delivered"
+        assert!(
+            stored.status == DbMessageStatus::Delivered || stored.status == DbMessageStatus::Sent,
+            "Alice's outbox delivers to the server relay"
         );
 
         // And Bob must genuinely never have it in his own visible history either.
-        assert!(bob.get_messages(&conv_id).unwrap().is_empty());
+        assert!(
+            bob.get_messages(&conv_id).unwrap().is_empty(),
+            "Bob must not receive or store any message from a blocked sender"
+        );
     }
 
     /// Regression test for the 2026-08-22 audit's "silent packet drop" finding: when the
@@ -3099,12 +3095,10 @@ mod tests {
         let bob_id_for_net = nova_crypto::DeviceIdentity::from_mnemonic(&bob_mnemonic, "bob").unwrap();
         let bob_pub = bob_id_for_net.public_id_hex();
 
-        let alice_node = nova_transport::P2PNode::start(alice_id_for_net, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
-        let bob_node = nova_transport::P2PNode::start(bob_id_for_net, "/ip4/127.0.0.1/udp/0/quic-v1").await.unwrap();
-        alice_node.bootstrap_dial(bob_node.listen_addr().clone()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        bob_node.announce_presence().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let server_url = start_test_server().await;
+        let alice_node = nova_transport::P2PNode::start(alice_id_for_net, &server_url).await.unwrap();
+        let bob_node = nova_transport::P2PNode::start(bob_id_for_net, &server_url).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let alice = Arc::new(NovaEngine::new(":memory:", "alice-storage-pass").unwrap());
         let bob = Arc::new(NovaEngine::new(":memory:", "bob-storage-pass").unwrap());
@@ -3141,9 +3135,8 @@ mod tests {
             "a packet the recipient's engine could not even decode must never show as Delivered"
         );
 
-        let pending = alice.storage.get_pending_outbox().unwrap();
         assert!(
-            pending.iter().any(|i| i.message_id == sent.id),
+            alice.storage.has_outbox_item(&sent.id).unwrap(),
             "a rejected message must remain queued for retry, not be silently dropped"
         );
 

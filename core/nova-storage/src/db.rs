@@ -1025,6 +1025,16 @@ impl StorageEngine {
         Ok(())
     }
 
+    pub fn has_outbox_item(&self, message_id: &str) -> Result<bool, StorageError> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM outbox_queue WHERE message_id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Records one more failed delivery attempt for a still-queued message: increments
     /// `attempt_count` and pushes `next_retry_utc` out to the caller-computed backoff deadline.
     /// Leaves `payload` and `first_attempt_utc` untouched — this is a retry of the same message,

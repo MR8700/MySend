@@ -18,11 +18,13 @@ use tracing::{error, info, warn};
 /// Ceiling for control-plane datagrams and relayed media blobs (up to 1 MiB).
 pub const MAX_DATAGRAM_SIZE: usize = 1024 * 1024;
 
+static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Clone)]
 struct AppState {
     registry: Arc<PresenceRegistry>,
     relay: Arc<BlindRelay>,
-    sessions: Arc<tokio::sync::RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<ServerResponse>>>>,
+    sessions: Arc<tokio::sync::RwLock<HashMap<String, (u64, tokio::sync::mpsc::UnboundedSender<ServerResponse>)>>>,
 }
 
 #[derive(Deserialize)]
@@ -114,7 +116,7 @@ pub async fn bind(bind_addr: &str) -> std::io::Result<(TcpListener, Arc<Presence
 fn router(
     registry: Arc<PresenceRegistry>,
     relay: Arc<BlindRelay>,
-    sessions: Arc<tokio::sync::RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<ServerResponse>>>>,
+    sessions: Arc<tokio::sync::RwLock<HashMap<String, (u64, tokio::sync::mpsc::UnboundedSender<ServerResponse>)>>>,
 ) -> Router {
     Router::new()
         .route("/", get(ws_handler))
@@ -146,7 +148,9 @@ async fn ws_handler(
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let observed_ip = client_ip(&headers, peer_addr);
-    ws.on_upgrade(move |socket| handle_socket(socket, state, observed_ip))
+    ws.max_message_size(16 * 1024 * 1024)
+        .max_frame_size(16 * 1024 * 1024)
+        .on_upgrade(move |socket| handle_socket(socket, state, observed_ip))
 }
 
 fn client_ip(headers: &HeaderMap, peer_addr: SocketAddr) -> IpAddr {
@@ -293,6 +297,9 @@ async fn handle_admin_settings(
 
 async fn handle_socket(socket: WebSocket, state: AppState, observed_ip: IpAddr) {
     use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::Ordering;
+
+    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let observed_addr = SocketAddr::new(observed_ip, 0);
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<ServerResponse>();
@@ -326,7 +333,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, observed_ip: IpAddr) 
                                     ServerResponse::Error(format!("request exceeds {MAX_DATAGRAM_SIZE}-byte limit"))
                                         .to_bytes()
                                         .unwrap_or_default(),
-                                ))
+                                 ))
                                 .await;
                             continue;
                         }
@@ -339,7 +346,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, observed_ip: IpAddr) 
 
                         if let Some(peer_id) = register_peer {
                             authenticated_peer_id = Some(peer_id.clone());
-                            state.sessions.write().await.insert(peer_id.clone(), push_tx.clone());
+                            state.sessions.write().await.insert(peer_id.clone(), (session_id, push_tx.clone()));
 
                             // Instantly drain any pending packets in BlindRelay for this peer!
                             if state.relay.pending_count(&peer_id).await > 0 {
@@ -374,7 +381,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, observed_ip: IpAddr) 
     }
 
     if let Some(peer_id) = authenticated_peer_id {
-        state.sessions.write().await.remove(&peer_id);
+        let mut sessions = state.sessions.write().await;
+        if let Some((curr_id, _)) = sessions.get(&peer_id) {
+            if *curr_id == session_id {
+                sessions.remove(&peer_id);
+            }
+        }
     }
 }
 
@@ -410,7 +422,7 @@ async fn handle_request_with_state(
                 Ok(()) => {
                     // Real-Time Direct Push: if recipient is currently connected via WebSocket, deliver immediately!
                     let sessions = state.sessions.read().await;
-                    if let Some(target_tx) = sessions.get(&target_peer_id) {
+                    if let Some((_, target_tx)) = sessions.get(&target_peer_id) {
                         let pending = state.relay.drain_for_peer(&target_peer_id).await;
                         if !pending.is_empty() {
                             let _ = target_tx.send(ServerResponse::RelayDrained(pending));

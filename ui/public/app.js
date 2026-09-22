@@ -104,6 +104,7 @@ const CLICK_ACTIONS = {
     toggleCallTorch: () => toggleCallTorch(),
     hangupActiveCall: () => hangupCall(true, 'Fin de l\'appel'),
     clearConversationsSearch: () => clearConversationsSearch(),
+    clearContactsSearch: () => clearContactsSearch(),
     clearNewChatSearch: () => clearNewChatSearch(),
     startDirectChatFromQuery: (el) => startDirectChatFromQuery(el.dataset.query),
     startDirectChatFromDirectoryUser: (el) => runPendingAction(el, () => startDirectChatFromDirectoryUser(el.dataset.peerId, el.dataset.username, el.dataset.name, el.dataset.bundle)),
@@ -356,6 +357,7 @@ const state = {
     currentScreen: 'onboarding',
     networkOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
     conversationsSearchQuery: '',
+    contactsSearchQuery: '',
     newChatSearchQuery: '',
     appLock: {
         enabled: localStorage.getItem('nova_app_lock_enabled') === 'true',
@@ -479,20 +481,20 @@ const screens = {
     onboarding: () => `
         <div class="screen-view" style="justify-content: space-between; padding: 40px 24px; text-align: center; background: radial-gradient(circle at 50% 30%, #171A24 0%, #080A10 70%);">
             <div style="margin-top: 24px;">
-                <div style="font-size: 13px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 2px; font-weight: 600;">Bienvenue</div>
-                <p style="font-size: 14px; color: var(--text-muted); line-height: 1.5; max-width: 300px; margin: 12px auto 0;">Discutez en privé : vos messages vont directement à votre contact, sans passer par un serveur qui pourrait les stocker ou les lire.</p>
+                <div style="font-size: 13px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 2px; font-weight: 600;">Bienvenue sur NOVA</div>
+                <p style="font-size: 15px; color: var(--text-muted); line-height: 1.4; max-width: 280px; margin: 8px auto 0;">Messagerie privée & chiffrée de bout en bout.</p>
             </div>
 
             <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 20px auto;">
-                <img src="logo.png" alt="Logo" style="width: 128px; height: 128px; object-fit: contain; filter: drop-shadow(0 8px 30px rgba(139, 92, 246, 0.45)); margin-bottom: 18px;">
+                <img src="logo.png" alt="Logo" style="width: 120px; height: 120px; object-fit: contain; filter: drop-shadow(0 8px 30px rgba(139, 92, 246, 0.45)); margin-bottom: 16px;">
                 <div style="font-size: 12px; color: var(--accent-purple-light); font-weight: 600; display: flex; align-items: center; gap: 6px;">
-                    <div class="p2p-badge-pulse"></div> Connexion directe et privée
+                    <span>🔒</span> <span>100% Chiffré & Sécurisé</span>
                 </div>
             </div>
 
             <div>
                 <button class="btn-primary" data-action="navigate" data-screen="create_account">Créer mon compte</button>
-                <button class="btn-secondary" style="margin-top: 12px; width: 100%;" data-action="navigate" data-screen="restore_account">J'ai déjà un compte</button>
+                <button class="btn-secondary" style="margin-top: 10px; width: 100%;" data-action="navigate" data-screen="restore_account">J'ai déjà un compte</button>
             </div>
         </div>
     `,
@@ -508,16 +510,16 @@ const screens = {
 
             <div style="padding: 24px; flex: 1; display: flex; flex-direction: column; justify-content: space-between;">
                 <div>
-                    <div style="width: 64px; height: 64px; border-radius: 50%; background: rgba(139, 92, 246, 0.12); border: 1px solid var(--accent-purple); display: flex; align-items: center; justify-content: center; margin: 0 auto 20px; color: var(--accent-purple-light);">
+                    <div style="width: 56px; height: 56px; border-radius: 50%; background: rgba(139, 92, 246, 0.12); border: 1px solid var(--accent-purple); display: flex; align-items: center; justify-content: center; margin: 0 auto 16px; color: var(--accent-purple-light);">
                         ${icons.lock}
                     </div>
 
-                    <label style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Comment voulez-vous qu'on vous appelle ?</label>
-                    <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; margin: 8px 0 20px; border: 1px solid var(--border-subtle);">
+                    <label style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Votre nom ou pseudo</label>
+                    <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; margin: 8px 0 14px; border: 1px solid var(--border-subtle);">
                         <input type="text" id="account-name-input" value="${escapeHtml(state.currentUser.name)}" placeholder="Votre nom" style="background: none; border: none; color: white; font-size: 15px; width: 100%; outline: none;">
                     </div>
 
-                    <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4;">Une fois votre compte créé, on vous montrera une phrase secrète de 12 mots, une seule fois. C'est la seule façon de récupérer votre compte sur un autre appareil — notez-la sur papier et gardez-la en lieu sûr : personne ne pourra vous la redonner si vous la perdez.</p>
+                    <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4;">Une phrase secrète de 12 mots vous permettra de récupérer votre compte.</p>
                 </div>
 
                 <button class="btn-primary" data-action="createAccount">Créer mon compte</button>
@@ -536,16 +538,16 @@ const screens = {
 
             <div style="padding: 24px; flex: 1; display: flex; flex-direction: column; justify-content: space-between;">
                 <div>
-                    <label style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Comment voulez-vous qu'on vous appelle ?</label>
-                    <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; margin: 8px 0 20px; border: 1px solid var(--border-subtle);">
+                    <label style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Votre nom</label>
+                    <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; margin: 8px 0 14px; border: 1px solid var(--border-subtle);">
                         <input type="text" id="restore-name-input" placeholder="Votre nom" style="background: none; border: none; color: white; font-size: 15px; width: 100%; outline: none;">
                     </div>
 
                     <label style="font-size: 13px; color: var(--text-muted); font-weight: 500;">Vos 12 mots secrets</label>
-                    <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; margin: 8px 0 20px; border: 1px solid var(--border-subtle);">
+                    <div style="background-color: var(--bg-surface); border-radius: var(--radius-md); padding: 12px 16px; margin: 8px 0 14px; border: 1px solid var(--border-subtle);">
                         <textarea id="restore-mnemonic-input" placeholder="mot1 mot2 mot3 ..." rows="3" style="background: none; border: none; color: white; font-size: 14px; width: 100%; outline: none; resize: none; font-family: monospace;"></textarea>
                     </div>
-                    <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4;">Entrez les 12 mots exactement comme on vous les a donnés, dans le même ordre, séparés par un espace.</p>
+                    <p style="font-size: 12px; color: var(--text-muted); line-height: 1.4;">Saisissez vos 12 mots dans l'ordre, séparés par un espace.</p>
                 </div>
 
                 <button class="btn-primary" data-action="restoreAccount">Retrouver mon compte</button>
@@ -559,7 +561,6 @@ const screens = {
             <header class="app-header">
                 <div class="header-title">Conversations</div>
                 <div class="header-actions">
-                    <button class="icon-btn" data-action="navigate" data-screen="global_search" title="Recherche">${icons.search}</button>
                     <button class="icon-btn" data-action="navigate" data-screen="create_group" title="Nouveau groupe">${icons.users}</button>
                     <button class="icon-btn" data-action="navigate" data-screen="add_contact" title="Ajouter un contact">${icons.plus}</button>
                 </div>
@@ -629,7 +630,7 @@ const screens = {
                             ${escapeHtml(state.activeContact.name)}
                         </div>
                         <div id="chat-header-status" style="font-size: 11px; color: var(--accent-purple-light); font-weight: 500; display: flex; align-items: center; gap: 4px;">
-                            ${state.activeContact.isGroup ? 'Groupe souverain P2P Mesh' : chatHeaderStatusHtml()}
+                            ${state.activeContact.isGroup ? 'Groupe sécurisé (E2EE)' : chatHeaderStatusHtml()}
                         </div>
                     </div>
                 </div>
@@ -935,10 +936,10 @@ const screens = {
             </header>
 
             <div class="search-bar-wrap">
-                <div class="search-input-box" style="position: relative;">
+                <div class="search-input-box">
                     ${icons.search}
-                    <input type="text" id="contacts-search-input" inputmode="search" enterkeyhint="search" placeholder="Nom, @pseudo ou identifiant..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
-                    <button class="btn-primary" style="padding: 5px 10px; font-size: 11px; border-radius: 6px; margin-right: 2px; flex-shrink: 0;" data-action="triggerContactsSearch">Chercher</button>
+                    <input type="text" id="contacts-search-input" placeholder="Rechercher un contact..." value="${escapeHtml(state.contactsSearchQuery || '')}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                    ${state.contactsSearchQuery ? `<button style="background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 0 4px; font-size: 14px;" data-action="clearContactsSearch">✕</button>` : ''}
                 </div>
             </div>
 
@@ -995,44 +996,6 @@ const screens = {
             </header>
 
             <div style="padding: 20px 16px; overflow-y: auto; padding-bottom: 90px;">
-                <!-- Direct Contact Addition Form (Always visible & prominent) -->
-                <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 18px 16px; margin-bottom: 22px; box-shadow: 0 4px 20px rgba(0,0,0,0.25);">
-                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 14px;">
-                        <div style="width: 32px; height: 32px; border-radius: 50%; background: rgba(139, 92, 246, 0.15); display: flex; align-items: center; justify-content: center; color: var(--accent-purple-light); font-size: 16px;">
-                            ${icons.user || '👤'}
-                        </div>
-                        <div>
-                            <div style="font-size: 14px; font-weight: 700; color: white;">Ajouter directement un contact</div>
-                            <div style="font-size: 11px; color: var(--text-muted);">Saisissez le nom et l'identifiant, @pseudo ou lien de votre contact</div>
-                        </div>
-                    </div>
-
-                    <label style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Nom ou surnom du contact *</label>
-                    <div class="search-input-box" style="margin: 6px 0 12px;">
-                        <input type="text" id="add-display-name-input" placeholder="ex: Alice, Bob, Bureau..." autocomplete="off" autocorrect="off" autocapitalize="words" spellcheck="false">
-                    </div>
-
-                    <label style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Identifiant, @pseudo, clé publique ou lien reçu *</label>
-                    <div style="background-color: var(--bg-surface-2); border-radius: var(--radius-md); padding: 10px 12px; margin: 6px 0 14px; border: 1px solid var(--border-subtle);">
-                        <textarea id="add-bundle-input" placeholder="Collez l'identifiant public (ex: 8f4b2a...), le @pseudo, ou le lien nova://invite..." rows="2" style="width: 100%; background: none; border: none; color: white; font-size: 12px; font-family: monospace; resize: none; outline: none; word-break: break-all;"></textarea>
-                    </div>
-
-                    <button class="btn-primary" style="width: 100%; padding: 12px; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="addContact">
-                        ${icons.plus}
-                        <span>Ajouter ce contact</span>
-                    </button>
-                </div>
-
-                <!-- Online Search in Decentralized Directory -->
-                <div style="margin-bottom: 16px;">
-                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 6px;">Ou rechercher sur l'annuaire de découverte</div>
-                    <div class="search-input-box" style="position: relative;">
-                        ${icons.search}
-                        <input type="text" id="contact-search-query" inputmode="search" enterkeyhint="search" placeholder="Tapez un @pseudo, un nom ou un identifiant..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
-                        <button class="btn-primary" style="padding: 6px 12px; font-size: 11px; border-radius: 6px; margin-right: 2px; flex-shrink: 0;" data-action="triggerContactDirectorySearch">Chercher</button>
-                    </div>
-                </div>
-
                 <!-- Fast Actions: QR Code Scanner and Display -->
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px;">
                     <button class="btn-secondary" style="font-size: 12px; padding: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="openQrCameraScanner">
@@ -1045,13 +1008,36 @@ const screens = {
                     </button>
                 </div>
 
-                <!-- Dynamic Search Results -->
-                <div id="directory-search-results" style="margin-bottom: 24px;">
-                    <div style="text-align: center; color: var(--text-dim); padding: 20px 16px; font-size: 12px; background: rgba(255,255,255,0.02); border-radius: var(--radius-md); border: 1px dashed var(--border-subtle);">
-                        <div style="font-size: 20px; margin-bottom: 6px;">🌐</div>
-                        <div style="color: white; font-weight: 600; margin-bottom: 4px;">Recherche globale décentralisée</div>
-                        <div style="max-width: 280px; margin: 0 auto; line-height: 1.4; color: var(--text-muted);">Vous pouvez aussi rechercher des pairs connectés via leur @pseudo public.</div>
+                <!-- Online Search in Directory -->
+                <div style="margin-bottom: 20px;">
+                    <div style="font-size: 13px; font-weight: 600; color: white; margin-bottom: 8px;">Recherche dans l'annuaire</div>
+                    <div class="search-input-box">
+                        ${icons.search}
+                        <input type="text" id="contact-search-query" placeholder="Nom, @pseudo ou identifiant..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
                     </div>
+                </div>
+
+                <!-- Dynamic Search Results -->
+                <div id="directory-search-results" style="margin-bottom: 20px;"></div>
+
+                <!-- Direct / Manual Addition -->
+                <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 18px 16px; margin-bottom: 22px;">
+                    <div style="font-size: 13px; font-weight: 700; color: white; margin-bottom: 12px;">Ajout par lien ou identifiant</div>
+
+                    <label style="font-size: 12px; color: var(--text-muted);">Nom du contact *</label>
+                    <div class="search-input-box" style="margin: 6px 0 12px;">
+                        <input type="text" id="add-display-name-input" placeholder="ex: Alice, Bob..." autocomplete="off" autocorrect="off" autocapitalize="words" spellcheck="false">
+                    </div>
+
+                    <label style="font-size: 12px; color: var(--text-muted);">Identifiant, @pseudo ou lien d'invitation *</label>
+                    <div style="background-color: var(--bg-surface-2); border-radius: var(--radius-md); padding: 10px 12px; margin: 6px 0 14px; border: 1px solid var(--border-subtle);">
+                        <textarea id="add-bundle-input" placeholder="Collez l'identifiant (ex: 8f4b2a...) ou le lien nova://invite..." rows="2" style="width: 100%; background: none; border: none; color: white; font-size: 12px; font-family: monospace; resize: none; outline: none; word-break: break-all;"></textarea>
+                    </div>
+
+                    <button class="btn-primary" style="width: 100%; padding: 12px; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px;" data-action="addContact">
+                        ${icons.plus}
+                        <span>Ajouter le contact</span>
+                    </button>
                 </div>
             </div>
 
@@ -1139,9 +1125,9 @@ const screens = {
                     </div>
                 </div>
 
-                <div style="padding: 12px; background: rgba(139, 92, 246, 0.08); border-radius: var(--radius-md); border: 1px solid rgba(139, 92, 246, 0.2); margin-bottom: 20px; font-size: 11px; color: var(--text-muted); line-height: 1.4; display: flex; gap: 8px; align-items: flex-start;">
+                <div style="padding: 10px 12px; background: rgba(139, 92, 246, 0.08); border-radius: var(--radius-md); border: 1px solid rgba(139, 92, 246, 0.2); margin-bottom: 20px; font-size: 11px; color: var(--text-muted); display: flex; gap: 8px; align-items: center;">
                     <span style="color: var(--accent-purple-light); font-size: 14px;">🔒</span>
-                    <span>Ce groupe fonctionne en réseau mesh pair-à-pair décentralisé : chaque message est chiffré individuellement avec le double ratchet de chaque membre.</span>
+                    <span>Messages et fichiers chiffrés de bout en bout (E2EE).</span>
                 </div>
 
                 <button class="btn-primary" style="width: 100%; padding: 14px; font-size: 14px; font-weight: 700;" data-action="confirmCreateGroup">Créer le groupe</button>
@@ -1166,7 +1152,7 @@ const screens = {
                         ${icons.users}
                     </div>
                     <div style="font-size: 18px; font-weight: 800; color: white;">${escapeHtml(state.activeContact.name)}</div>
-                    <div style="font-size: 12px; color: var(--accent-purple-light); margin-top: 4px;">Groupe Souverain P2P Mesh</div>
+                    <div style="font-size: 12px; color: var(--accent-purple-light); margin-top: 4px;">Groupe chiffré (E2EE)</div>
                 </div>
 
                 <div style="display: flex; gap: 10px; margin-bottom: 24px;">
@@ -2320,10 +2306,10 @@ function openChatWith(name, handle, conversationId) {
             peerId: peerId,
             conversationId: actualConvId,
             isGroup: true,
-            publicKey: 'Souverain P2P',
-            safetyNumber: 'Chiffrement P2P Mesh',
+            publicKey: 'Chiffré E2EE',
+            safetyNumber: 'Chiffrement E2EE',
             isOnline: true,
-            p2pMode: 'Groupe Décentralisé',
+            p2pMode: 'Groupe chiffré',
             isBlocked: false,
             isTrusted: true,
         };
@@ -2405,9 +2391,9 @@ function chatHeaderStatusHtml() {
 // separate "Diagnostics" screen — see refreshDiagnostics, called when opening this screen).
 function contactConnectionStatusText() {
     const d = state.currentDiagnostics;
-    if (!d) return 'Statut inconnu — envoyez un message pour vérifier la connexion';
-    if (d.is_connected) return `En ligne (${transportModeLabel(d.mode)})`;
-    return 'Hors ligne pour le moment';
+    if (!d) return 'Hors ligne';
+    if (d.is_connected) return 'En ligne • Chiffré';
+    return 'Hors ligne';
 }
 
 // Fetches this device's real, signature-verifiable X3DH invitation ticket (valid for 24h).
@@ -2891,6 +2877,14 @@ function clearConversationsSearch() {
     if (container) {
         container.innerHTML = renderConversationsListHtml('');
     }
+}
+
+function clearContactsSearch() {
+    state.contactsSearchQuery = '';
+    const input = document.getElementById('contacts-search-input');
+    if (input) input.value = '';
+    filterContactsList('');
+    if (state.currentScreen === 'contacts') render();
 }
 
 function updateNetworkOnlineStatus(isOnline) {
@@ -5893,7 +5887,7 @@ function setCallConnectedState() {
     currentCall.startTime = Date.now();
 
     const statusEl = document.getElementById('active-call-status');
-    if (statusEl) statusEl.innerText = 'Connecté (P2P direct)';
+    if (statusEl) statusEl.innerText = 'Connecté (chiffré)';
 
     if (callDurationTimer) clearInterval(callDurationTimer);
     callDurationSeconds = 0;
@@ -6048,7 +6042,7 @@ async function acceptIncomingCallReal() {
         localPip.style.display = 'none';
     }
 
-    showActiveCallModal(callData.senderName, callData.callType, 'Connexion P2P...');
+    showActiveCallModal(callData.senderName, callData.callType, 'Connexion sécurisée...');
 
     try {
         await pc.setRemoteDescription(new RTCSessionDescription(callData.sdp));
@@ -6148,7 +6142,7 @@ async function hangupCall(notifyPeer = true, reason = '') {
         const callLabel = callSnapshot.type === 'video' ? 'Appel vidéo' : 'Appel vocal';
 
         if (callSnapshot.isCaller) {
-            sendStructuredCallSummary(callSnapshot.peerId, callLabel, `${durationStr} (P2P direct)`);
+            sendStructuredCallSummary(callSnapshot.peerId, callLabel, `${durationStr} (sécurisé)`);
         }
     }
 }
@@ -6938,6 +6932,7 @@ function toggleManualInviteAccordion() {
 }
 
 function filterContactsList(query) {
+    state.contactsSearchQuery = query || '';
     const container = document.getElementById('contacts-list-container');
     if (!container) return;
 
@@ -6951,7 +6946,7 @@ function filterContactsList(query) {
                 </div>
                 <div class="item-content">
                     <div class="item-name">${escapeHtml(c.name)}</div>
-                    <div class="item-sub">@${escapeHtml(c.handle)} • ${escapeHtml(c.p2pMode)}</div>
+                    <div class="item-sub">@${escapeHtml(c.handle)}</div>
                 </div>
             </div>
         `).join('') : `
@@ -6986,7 +6981,7 @@ function filterContactsList(query) {
                     </div>
                     <div class="item-content">
                         <div class="item-name">${escapeHtml(c.name)}</div>
-                        <div class="item-sub">@${escapeHtml(c.handle)} • ${escapeHtml(c.p2pMode)}</div>
+                        <div class="item-sub">@${escapeHtml(c.handle)}</div>
                     </div>
                 </div>
             `).join('')}
@@ -6996,7 +6991,7 @@ function filterContactsList(query) {
     container.innerHTML = `
         ${localHtml}
         <div id="contacts-global-dir-section" style="margin-top: 16px;">
-            <div style="font-size: 11px; font-weight: 600; color: var(--accent-purple-light); margin: 6px 0 8px 4px;">ANNUAIRE GLOBAL (RELAIS DE DÉCOUVERTE)</div>
+            <div style="font-size: 11px; font-weight: 600; color: var(--accent-purple-light); margin: 6px 0 8px 4px;">ANNUAIRE GLOBAL</div>
             <div id="contacts-global-dir-results" style="padding: 12px; text-align: center; color: var(--text-dim); font-size: 12px; background: var(--bg-surface); border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
                 Recherche de « ${escapeHtml(rawQ)} » sur l'annuaire...
             </div>

@@ -1,4 +1,4 @@
-use crate::packet::{ProtocolError, MAX_PACKET_SIZE};
+use crate::packet::ProtocolError;
 use crate::presence::{
     DirectorySearchResult, PeerEndpoint, SignedDirectoryEntry, SignedDrainRequest,
     SignedPresenceRegistration,
@@ -15,7 +15,11 @@ pub enum ServerRequest {
     Lookup { peer_id: String },
     /// Deposit an opaque, already E2E-encrypted blob for a peer who is currently unreachable
     /// directly. The server cannot decrypt or otherwise interpret `payload`.
-    RelayForward { target_peer_id: String, payload: Vec<u8> },
+    RelayForward {
+        target_peer_id: String,
+        #[serde(with = "serde_bytes")]
+        payload: Vec<u8>,
+    },
     /// Fetch and purge all packets queued for the caller. Must be signed to prove ownership of
     /// the peer_id being drained — see [`SignedDrainRequest`].
     RelayDrain(SignedDrainRequest),
@@ -25,12 +29,36 @@ pub enum ServerRequest {
     SearchDirectory { query: String },
 }
 
+mod serde_bytes_vec {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(vec: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(vec.len()))?;
+        for elem in vec {
+            seq.serialize_element(&serde_bytes::Bytes::new(elem))?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let byte_bufs: Vec<serde_bytes::ByteBuf> = Vec::deserialize(deserializer)?;
+        Ok(byte_bufs.into_iter().map(|b| b.into_vec()).collect())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerResponse {
     Registered,
     LookupResult(Option<PeerEndpoint>),
     RelayForwarded,
-    RelayDrained(Vec<Vec<u8>>),
+    RelayDrained(#[serde(with = "serde_bytes_vec")] Vec<Vec<u8>>),
     DirectoryRegistered,
     DirectorySearchResults(Vec<DirectorySearchResult>),
     Error(String),
@@ -44,7 +72,7 @@ impl ServerRequest {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        if bytes.len() > MAX_PACKET_SIZE {
+        if bytes.len() > 1024 * 1024 {
             return Err(ProtocolError::PacketTooLarge(bytes.len()));
         }
         ciborium::from_reader(bytes).map_err(|e| ProtocolError::DeserializationFailed(e.to_string()))
@@ -59,7 +87,7 @@ impl ServerResponse {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        if bytes.len() > MAX_PACKET_SIZE {
+        if bytes.len() > 16 * 1024 * 1024 {
             return Err(ProtocolError::PacketTooLarge(bytes.len()));
         }
         ciborium::from_reader(bytes).map_err(|e| ProtocolError::DeserializationFailed(e.to_string()))
