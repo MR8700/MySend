@@ -40,27 +40,31 @@ class P2pForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "chat.novachat.desktop:p2p"
-        ).apply {
-            setReferenceCounted(false)
-            acquire()
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "chat.novachat.desktop:p2p"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Throwable) {
+            // Ignored if wakeLock cannot be acquired
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            val notification = buildNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Throwable) {
+            // Ignored if startForeground is restricted
         }
-        // START_STICKY: if the system still kills this process under extreme memory pressure, ask
-        // it to recreate and restart this service (with a null Intent) once resources free up,
-        // rather than leaving the device silently unreachable until the user notices and reopens
-        // the app themselves.
         return START_STICKY
     }
 

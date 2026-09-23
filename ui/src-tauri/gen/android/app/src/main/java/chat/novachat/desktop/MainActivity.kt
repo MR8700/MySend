@@ -26,17 +26,6 @@ class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     mAppWebView = webView
-
-    // Custom WebChromeClient that automatically grants getUserMedia permissions (Microphone & Camera)
-    // for voice/video calls and the QR scanner.
-    webView.webChromeClient = object : android.webkit.WebChromeClient() {
-      override fun onPermissionRequest(request: PermissionRequest) {
-        // Run on UI thread to ensure immediate grant
-        runOnUiThread {
-          request.grant(request.resources)
-        }
-      }
-    }
   }
 
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,17 +55,20 @@ class MainActivity : TauriActivity() {
       }
     })
 
-    val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-    multicastLock = wifiManager?.createMulticastLock("nova_chat_mdns")?.apply {
-      setReferenceCounted(false)
-      acquire()
+    try {
+      val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+      multicastLock = wifiManager?.createMulticastLock("nova_chat_mdns")?.apply {
+        setReferenceCounted(false)
+        acquire()
+      }
+    } catch (e: Throwable) {
+      // Non-fatal if multicast lock is restricted
     }
 
-    // Without this, the Rust engine's P2P listener/outbox pump (running in this same process)
-    // gets suspended or killed by the OS within minutes of this Activity leaving the foreground —
-    // confirmed live on a real Huawei device, where a message sent from another phone never
-    // arrived because this process had already been stopped. See P2pForegroundService's own doc
-    // comment for why this is never explicitly stopped again.
-    ContextCompat.startForegroundService(this, Intent(this, P2pForegroundService::class.java))
+    try {
+      ContextCompat.startForegroundService(this, Intent(this, P2pForegroundService::class.java))
+    } catch (e: Throwable) {
+      // Non-fatal: on Android 14+ foreground service start restrictions must not crash the app
+    }
   }
 }
