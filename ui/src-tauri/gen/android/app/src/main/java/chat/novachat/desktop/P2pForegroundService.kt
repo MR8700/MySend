@@ -41,17 +41,15 @@ class P2pForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         try {
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
+            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            wakeLock = powerManager?.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "chat.novachat.desktop:p2p"
-            ).apply {
+            )?.apply {
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (e: Throwable) {
-            // Ignored if wakeLock cannot be acquired
-        }
+        } catch (_: Throwable) {}
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -62,9 +60,11 @@ class P2pForegroundService : Service() {
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
-        } catch (e: Throwable) {
-            // Ignored if startForeground is restricted
-        }
+        } catch (_: Throwable) {}
+        // START_STICKY: if the system still kills this process under extreme memory pressure, ask
+        // it to recreate and restart this service (with a null Intent) once resources free up,
+        // rather than leaving the device silently unreachable until the user notices and reopens
+        // the app themselves.
         return START_STICKY
     }
 

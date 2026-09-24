@@ -46,6 +46,14 @@
             </intent-filter>
         </activity>
 
+        <!-- Keeps the Rust P2P engine (mDNS/DHT listener, outbox retry pump) alive while the app
+             is backgrounded — see P2pForegroundService's doc comment. android:foregroundServiceType
+             must match the FOREGROUND_SERVICE_DATA_SYNC permission declared above and the type
+             passed to startForeground() in the service itself. -->
+        <service
+          android:name=".P2pForegroundService"
+          android:exported="false"
+          android:foregroundServiceType="dataSync" />
 
         <provider
           android:name="androidx.core.content.FileProvider"

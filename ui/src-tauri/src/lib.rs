@@ -1065,11 +1065,6 @@ async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result<(),
 pub fn run() {
     tracing_subscriber::fmt::try_init().ok();
 
-    std::panic::set_hook(Box::new(|info| {
-        tracing::error!("CRITICAL RUST PANIC: {info}");
-        eprintln!("CRITICAL RUST PANIC: {info}");
-    }));
-
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
@@ -1083,43 +1078,20 @@ pub fn run() {
                 Err(_) => app
                     .path()
                     .app_data_dir()
-                    .or_else(|_| app.path().app_local_data_dir())
-                    .or_else(|_| app.path().document_dir())
-                    .unwrap_or_else(|_| {
-                        #[cfg(target_os = "android")]
-                        {
-                            PathBuf::from("/data/data/chat.novachat.desktop/files")
-                        }
-                        #[cfg(not(target_os = "android"))]
-                        {
-                            PathBuf::from(".")
-                        }
-                    }),
+                    .expect("no app data directory available on this platform"),
             };
-            let _ = std::fs::create_dir_all(&data_dir);
+            std::fs::create_dir_all(&data_dir).expect("failed to create app data directory");
 
             let db_path = data_dir.join("nova.db");
             let passphrase = load_or_create_storage_passphrase(&data_dir.join("storage.key"));
 
-            let engine = match NovaEngine::new(
-                db_path.to_str().unwrap_or("nova.db"),
-                &passphrase,
-            ) {
-                Ok(e) => Arc::new(e),
-                Err(err) => {
-                    tracing::error!("Failed to open existing encrypted database: {err}. Re-initializing clean storage...");
-                    let backup_db = data_dir.join(format!("nova_corrupt_{}.db", chrono::Utc::now().timestamp()));
-                    let _ = std::fs::rename(&db_path, backup_db);
-                    let fresh_engine = NovaEngine::new(
-                        db_path.to_str().unwrap_or("nova.db"),
-                        &passphrase,
-                    ).unwrap_or_else(|e2| {
-                        tracing::error!("Failed to open disk database: {e2}. Falling back to memory database.");
-                        NovaEngine::new(":memory:", &passphrase).expect("in-memory db must never fail")
-                    });
-                    Arc::new(fresh_engine)
-                }
-            };
+            let engine = Arc::new(
+                NovaEngine::new(
+                    db_path.to_str().expect("app data path is not valid UTF-8"),
+                    &passphrase,
+                )
+                .expect("failed to open local encrypted storage"),
+            );
 
             let bootstrap_addr_file = data_dir.join("bootstrap_addr.txt");
             let bootstrap_addr = std::env::var("NOVA_BOOTSTRAP_ADDR")
@@ -1281,7 +1253,7 @@ fn load_or_create_storage_passphrase(path: &std::path::Path) -> String {
         let mut raw = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut raw);
         let passphrase = hex::encode(raw);
-        let _ = std::fs::write(path, &passphrase);
+        std::fs::write(path, &passphrase).expect("failed to persist local storage passphrase");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

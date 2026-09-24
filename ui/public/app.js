@@ -2146,6 +2146,7 @@ function navigateBackSafely() {
 window.handleAndroidBack = function() {
     return navigateBackSafely();
 };
+window.handleBackNavigation = window.handleAndroidBack;
 
 // Handles browser/WebView popstate events
 let handlingPopState = false;
@@ -7542,56 +7543,84 @@ document.addEventListener('DOMContentLoaded', async () => {
             resumed.bio || '',
             resumed.avatar_data_url || null
         );
-        await refreshContactsFromBackend();
-        await refreshConversationsFromBackend();
+        try {
+            await refreshContactsFromBackend();
+        } catch (e) {
+            console.warn('refreshContactsFromBackend failed', e);
+        }
+        try {
+            await refreshConversationsFromBackend();
+        } catch (e) {
+            console.warn('refreshConversationsFromBackend failed', e);
+        }
 
         // Démarrage instantané du canal Vercel prioritaire (Edge Signaling & Présence)
-        sendPresenceHeartbeat('online');
-        refreshContactsPresence();
-        startVercelSignalPolling();
-        syncProfileToVercel(resumed.peer_id, resumed.username, resumed.display_name, state.currentUser.bundleHex, resumed.avatar_data_url);
+        try {
+            sendPresenceHeartbeat('online');
+            refreshContactsPresence();
+            startVercelSignalPolling();
+            syncProfileToVercel(resumed.peer_id, resumed.username, resumed.display_name, state.currentUser.bundleHex, resumed.avatar_data_url);
+        } catch (e) {
+            console.warn('Vercel startup sync non-blocking error:', e);
+        }
     }
 
-    registerActivityListener();
-    if (state.appLock.enabled && state.appLock.pinHash) {
-        lockApp();
+    try {
+        registerActivityListener();
+        if (state.appLock && state.appLock.enabled && state.appLock.pinHash) {
+            lockApp();
+        }
+    } catch (e) {
+        console.warn('Activity/AppLock init warning:', e);
     }
 
     // Initialisation de la connectivité et présence périodique (toutes les 10s)
-    checkServerConnectivity();
-    if (state.currentUser.peerId) {
-        sendPresenceHeartbeat('online');
-        refreshContactsPresence();
-        startVercelSignalPolling();
-    }
-
-    setInterval(() => {
-        if (state.currentUser.peerId) {
-            sendPresenceHeartbeat('online');
-            refreshContactsPresence();
-        }
-    }, 10000);
-
-    window.addEventListener('online', () => {
+    try {
         checkServerConnectivity();
         if (state.currentUser.peerId) {
             sendPresenceHeartbeat('online');
             refreshContactsPresence();
+            startVercelSignalPolling();
         }
+    } catch (e) {
+        console.warn('Server connectivity init warning:', e);
+    }
+
+    setInterval(() => {
+        if (state.currentUser.peerId) {
+            try {
+                sendPresenceHeartbeat('online');
+                refreshContactsPresence();
+            } catch (_) {}
+        }
+    }, 10000);
+
+    window.addEventListener('online', () => {
+        try {
+            checkServerConnectivity();
+            if (state.currentUser.peerId) {
+                sendPresenceHeartbeat('online');
+                refreshContactsPresence();
+            }
+        } catch (_) {}
     });
 
     window.addEventListener('offline', () => {
-        state.isServerConnected = false;
-        updateConnectionIndicators();
+        try {
+            state.isServerConnected = false;
+            updateConnectionIndicators();
+        } catch (_) {}
     });
 
     window.addEventListener('beforeunload', () => {
-        if (state.currentUser.peerId) {
-            navigator.sendBeacon(`${VERCEL_API_BASE_URL}/api/presence`, JSON.stringify({
-                peer_id: state.currentUser.peerId,
-                status: 'offline'
-            }));
-        }
+        try {
+            if (state.currentUser.peerId && navigator.sendBeacon) {
+                navigator.sendBeacon(`${VERCEL_API_BASE_URL}/api/presence`, JSON.stringify({
+                    peer_id: state.currentUser.peerId,
+                    status: 'offline'
+                }));
+            }
+        } catch (_) {}
     });
 
     navigateTo(state.currentUser.peerId ? 'conversations' : 'onboarding');
