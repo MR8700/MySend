@@ -22,6 +22,7 @@ storage.key
 *.aab
 *.idsig
 *.exe
+**/jniLibs/**/*.so
 
 # Dist & caches
 ui/dist/
